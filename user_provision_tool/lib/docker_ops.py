@@ -162,3 +162,104 @@ def docker_stats_snapshot() -> list[dict[str, str]]:
                 "mem": parts[2].strip(),
             })
     return stats
+
+
+def network_list() -> list[str]:
+    """Return list of Docker network names."""
+    result = subprocess.run(
+        ["docker", "network", "ls", "--format", "{{.Name}}"],
+        text=True, capture_output=True,
+    )
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def network_inspect(network: str) -> dict | None:
+    """Inspect a Docker network. Returns parsed JSON or None."""
+    import json
+    result = subprocess.run(
+        ["docker", "network", "inspect", network],
+        text=True, capture_output=True,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        data = json.loads(result.stdout)
+        return data[0] if data else None
+    except (json.JSONDecodeError, IndexError):
+        return None
+
+
+def container_inspect(container: str) -> dict | None:
+    """Inspect a Docker container. Returns parsed JSON or None."""
+    import json
+    result = subprocess.run(
+        ["docker", "inspect", container],
+        text=True, capture_output=True,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        data = json.loads(result.stdout)
+        return data[0] if data else None
+    except (json.JSONDecodeError, IndexError):
+        return None
+
+
+def container_exists(container: str) -> bool:
+    """Check if a container exists (running or stopped)."""
+    result = subprocess.run(
+        ["docker", "inspect", container],
+        text=True, capture_output=True,
+    )
+    return result.returncode == 0
+
+
+def container_running(container: str) -> bool:
+    """Check if a container is running."""
+    info = container_inspect(container)
+    if info is None:
+        return False
+    return info.get("State", {}).get("Running", False)
+
+
+def network_connected_to_container(network: str, container: str) -> bool:
+    """Check if *container* is connected to *network*."""
+    info = network_inspect(network)
+    if info is None:
+        return False
+    containers = info.get("Containers", {})
+    for cid, cdata in containers.items():
+        if cdata.get("Name") == container:
+            return True
+    return False
+
+
+def container_logs(container: str, tail: int = 100) -> str:
+    """Get the last *tail* lines of a container's logs."""
+    result = subprocess.run(
+        ["docker", "logs", "--tail", str(tail), container],
+        text=True, capture_output=True,
+    )
+    return result.stdout
+
+
+def orphan_network_cleanup(network: str, nginx_container: str = "provision-nginx") -> bool:
+    """Clean up an orphaned network. Disconnect nginx and remove if only nginx is left.
+    Returns True if the network was removed."""
+    info = network_inspect(network)
+    if info is None:
+        return False
+
+    containers = info.get("Containers", {})
+    # Check what's connected
+    connected_names = {cdata.get("Name", "") for cdata in containers.values()}
+    
+    # If only provision-nginx is connected, clean up
+    if connected_names == {nginx_container} or len(connected_names) == 1:
+        network_disconnect(nginx_container, network)
+        result = subprocess.run(
+            ["docker", "network", "rm", network],
+            text=True, capture_output=True,
+        )
+        return result.returncode == 0
+    return False

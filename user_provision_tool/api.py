@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, field_validator
 
 # Make lib/ importable when the file sits at the project root
@@ -364,6 +365,147 @@ def rebuild_user(
 
 
 # ---------------------------------------------------------------------------
+# P5: PUT /users/{user_name}/{service_name}/{label}/password  — change password
+# ---------------------------------------------------------------------------
+
+class PasswordChangeRequest(BaseModel):
+    passwd: str
+
+@app.put("/users/{user_name}/services/{service_name}/{label}/password")
+def change_user_password(
+    user_name: str, service_name: str, label: str,
+    req: PasswordChangeRequest,
+) -> dict[str, Any]:
+    try:
+        result = provisioner.change_password(
+            user_name=user_name,
+            service_name=service_name,
+            label=label,
+            passwd=req.passwd,
+            nginx_container=NGINX_CONTAINER,
+        )
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    return {"message": "Password updated. Nginx reloaded.", **result}
+
+
+# ---------------------------------------------------------------------------
+# P3: GET /nginx/connections  — nginx connection state
+# ---------------------------------------------------------------------------
+
+@app.get("/nginx/connections")
+def get_nginx_connections() -> dict[str, Any]:
+    """Return nginx connection state:
+    (a) list of networks provision-nginx is connected to
+    (b) list of *.nginx.conf files in GENERATED_DIR
+    (c) parsed upstreams
+    """
+    from pathlib import Path
+    import re
+
+    # (a) Networks provision-nginx is connected to
+    nginx_info = docker_ops.container_inspect(NGINX_CONTAINER)
+    connected_networks = {}
+    if nginx_info:
+        connected_networks = nginx_info.get("NetworkSettings", {}).get("Networks", {})
+
+    # (b) List nginx conf files
+    conf_files = sorted(Path(GENERATED_DIR).glob("*.nginx.conf"))
+    conf_file_names = [f.name for f in conf_files]
+
+    # (c) Parse upstreams from each conf file
+    upstreams = []
+    for cf in conf_files:
+        try:
+            content = cf.read_text()
+            server_name = None
+            proxy_pass = None
+            m = re.search(r"server_name\s+([^;]+);", content)
+            if m:
+                server_name = m.group(1).strip().split()[0]
+            m = re.search(r"proxy_pass\s+(https?://[^;]+);", content)
+            if m:
+                proxy_pass = m.group(1).strip()
+            upstreams.append({
+                "conf_file": cf.name,
+                "server_name": server_name,
+                "proxy_pass": proxy_pass,
+            })
+        except Exception:
+            pass
+
+    return {
+        "nginx_container": NGINX_CONTAINER,
+        "connected_networks": list(connected_networks.keys()),
+        "conf_files": conf_file_names,
+        "upstreams": upstreams,
+    }
+
+
+# ---------------------------------------------------------------------------
+# P4: POST /nginx/reconnect-all  — reconnect nginx to all user networks
+# ---------------------------------------------------------------------------
+
+@app.post("/nginx/reconnect-all")
+def reconnect_all() -> dict[str, Any]:
+    """Iterate all entries in user_registry, reconnect provision-nginx to each
+    network (idempotent), then reload nginx."""
+    all_users = registry.get_all_users()
+    networks = set()
+    for entry in all_users:
+        net = entry.get("network_name", "")
+        if net:
+            networks.add(net)
+
+    reconnected = 0
+    for net in sorted(networks):
+        try:
+            docker_ops.network_connect(NGINX_CONTAINER, net)
+            reconnected += 1
+        except Exception:
+            pass
+
+    docker_ops.nginx_reload(NGINX_CONTAINER)
+
+    return {
+        "total_networks": len(networks),
+        "reconnected": reconnected,
+        "nginx_reloaded": True,
+    }
+
+
+# ---------------------------------------------------------------------------
+# P6: GET /users/{user}/{service}/{label}/containers/{container}/logs
+# ---------------------------------------------------------------------------
+
+@app.get("/users/{user_name}/services/{service_name}/{label}/containers/{container}/logs")
+def get_container_logs(
+    user_name: str, service_name: str, label: str, container: str,
+    tail: int = Query(100, description="Number of log lines to return"),
+) -> dict[str, Any]:
+    """Get container logs for a specific container."""
+    entry = registry.get_user_service(user_name, service_name, label)
+    if not entry:
+        raise HTTPException(404, f"No registration found for {user_name}/{service_name}/{label}.")
+    
+    prefix = template_engine.container_prefix(service_name, user_name, label)
+    full_container_name = f"{prefix}{container}"
+    
+    # Verify container exists
+    if not docker_ops.container_exists(full_container_name):
+        raise HTTPException(404, f"Container not found: {full_container_name}")
+    
+    logs = docker_ops.container_logs(full_container_name, tail=tail)
+    return {
+        "container": full_container_name,
+        "tail": tail,
+        "logs": logs.splitlines(),
+    }
+
+
+# ---------------------------------------------------------------------------
 # GET /tasks  — list all tasks in the pool
 # ---------------------------------------------------------------------------
 
@@ -401,6 +543,66 @@ def cancel_task(task_id: str) -> dict[str, Any]:
             raise HTTPException(404, f"Task not found: {task_id}")
         raise HTTPException(409, f"Task already in terminal state: {task['status']}")
     return {"task_id": task_id, "status": "cancelled"}
+
+
+# ---------------------------------------------------------------------------
+# P2: GET /tasks/{task_id}/log  — SSE build log streaming
+# ---------------------------------------------------------------------------
+
+@app.get("/tasks/{task_id}/log")
+async def stream_task_log(
+    task_id: str,
+    tail: int = Query(200, description="Number of recent lines to send first"),
+    follow: bool = Query(True, description="Keep streaming new lines"),
+):
+    """Stream build log via Server-Sent Events."""
+    import asyncio
+    from pathlib import Path
+
+    log_file = Path(os.environ.get("DOCKER_OPS_LOG", str(GENERATED_DIR / "docker_ops.log")))
+
+    async def log_generator():
+        # Send initial tail
+        if log_file.exists():
+            try:
+                lines = log_file.read_text().splitlines()
+                recent = lines[-tail:] if len(lines) > tail else lines
+                for line in recent:
+                    yield f"data: {line}\n\n"
+            except Exception:
+                pass
+
+        if not follow:
+            yield "event: done\ndata: {}\n\n"
+            return
+
+        # Poll for new lines
+        last_size = log_file.stat().st_size if log_file.exists() else 0
+        while True:
+            await asyncio.sleep(1)
+            try:
+                if log_file.exists():
+                    current_size = log_file.stat().st_size
+                    if current_size > last_size:
+                        with open(log_file, "r") as f:
+                            f.seek(last_size)
+                            new_data = f.read()
+                            for line in new_data.splitlines():
+                                if line.strip():
+                                    yield f"data: {line}\n\n"
+                        last_size = current_size
+            except Exception:
+                break
+
+    return StreamingResponse(
+        log_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

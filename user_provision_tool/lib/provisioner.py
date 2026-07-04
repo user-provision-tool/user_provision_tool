@@ -369,6 +369,13 @@ def remove_user(
             except OSError:
                 pass
 
+    # P1: Orphan network cleanup — if network still exists after compose_down, clean it up
+    if net:
+        try:
+            docker_ops.orphan_network_cleanup(net, nginx_container)
+        except Exception:
+            pass
+
     docker_ops.nginx_reload(nginx_container)
 
     with _registry_lock:
@@ -418,5 +425,72 @@ def rebuild_user(
         build_args = entry.get("build_args") or None
     docker_ops.compose_build(compose_file, no_cache=no_cache, env_file=env_file, project_name=project_name, build_args=build_args)
     docker_ops.compose_up(compose_file, env_file=env_file, project_name=project_name)
+
+    return {"user_name": user_name, "service_name": service_name, "label": label}
+
+
+# ---------------------------------------------------------------------------
+# P5: Password change
+# ---------------------------------------------------------------------------
+
+def change_password(
+    *,
+    user_name: str,
+    service_name: str,
+    label: str,
+    passwd: str,
+    nginx_container: str = "provision-nginx",
+) -> dict[str, str]:
+    """Change a user's htpasswd password and reload nginx.
+
+    Steps
+    -----
+    1. Look up registration entry.
+    2. Re-hash new password.
+    3. Re-write .htpasswd file.
+    4. Update registry entry with new hash.
+    5. Reload nginx.
+
+    Raises
+    ------
+    KeyError
+        If no registration is found.
+    FileNotFoundError
+        If the htpasswd file path is missing or the file doesn't exist.
+    """
+    import logging
+    _log = logging.getLogger(__name__)
+
+    entry = registry.get_user_service(user_name, service_name, label)
+    if not entry:
+        raise KeyError(
+            f"No registration found for {user_name}/{service_name}/{label}."
+        )
+
+    htpasswd_path = entry.get("htpasswd_path", "")
+    if not htpasswd_path:
+        raise FileNotFoundError(
+            f"No htpasswd file path in registry for {user_name}/{service_name}/{label}."
+        )
+    if not Path(htpasswd_path).exists():
+        raise FileNotFoundError(f"htpasswd file not found: {htpasswd_path}")
+
+    passwd_hash = auth.hash_password(user_name, passwd)
+    auth.write_htpasswd_file(htpasswd_path, user_name, passwd_hash)
+
+    # Update registry
+    with _registry_lock:
+        users = registry._load()
+        for u in users:
+            if (
+                u.get("user_name") == user_name
+                and u.get("service_name") == service_name
+                and str(u.get("label", "")) == str(label)
+            ):
+                u["passwd"] = passwd_hash
+                break
+        registry._save(users)
+
+    docker_ops.nginx_reload(nginx_container)
 
     return {"user_name": user_name, "service_name": service_name, "label": label}

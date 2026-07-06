@@ -2399,6 +2399,43 @@ class TestAPINewEndpoints:
         assert "count" in data
         assert "tasks" in data
 
+    # ── Reconciliation endpoints ──
+
+    def test_reconcile_endpoint(self, monkeypatch):
+        """POST /reconcile runs reconciliation and returns report."""
+        monkeypatch.setattr(self.api.docker_ops, "network_connect", lambda *a, **kw: None)
+        monkeypatch.setattr(self.api.docker_ops, "nginx_reload", lambda *a: None)
+        import subprocess as sp
+        monkeypatch.setattr(self.api.docker_ops.subprocess, "run",
+            lambda *a, **kw: sp.CompletedProcess([], 0, stdout="[]", stderr=""))
+
+        response = self.client.post("/reconcile")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["message"] == "Reconciliation completed."
+        assert "report" in data
+        report = data["report"]
+        assert "total_upstreams" in report
+        assert "reachable" in report
+        assert "unreachable" in report
+        assert "nginx_reloaded" in report
+
+    def test_reconcile_status_endpoint(self):
+        """GET /reconcile/status returns last reconciliation status."""
+        response = self.client.get("/reconcile/status")
+        assert response.status_code == 200
+        data = response.json()
+        assert "result" in data
+        assert "total_upstreams" in data["result"]
+
+    def test_nginx_state_endpoint(self):
+        """GET /nginx-state returns full state JSON."""
+        response = self.client.get("/nginx-state")
+        assert response.status_code == 200
+        data = response.json()
+        assert "version" in data
+        assert "upstreams" in data
+
     # ── Helper: register a user for dependent tests ──
 
     def _register_user(self, user_name: str, monkeypatch):

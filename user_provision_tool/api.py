@@ -34,7 +34,7 @@ from pydantic import BaseModel, field_validator
 # Make lib/ importable when the file sits at the project root
 sys.path.insert(0, str(Path(__file__).parent))
 
-from lib import docker_ops, provisioner, registry, template_engine, validation
+from lib import docker_ops, provisioner, reconciliation, registry, template_engine, validation
 from lib.compose_converter import compose_file_to_template, get_compose_service_names
 from lib.nginx_converter import nginx_file_to_template
 from lib.task_manager import task_manager
@@ -153,7 +153,30 @@ class RebuildRequest(BaseModel):
 # App
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="User Provision Tool", version="1.0.0")
+import logging
+from contextlib import asynccontextmanager
+
+_log = logging.getLogger("provision-api")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup: run nginx state recovery.  Shutdown: no-op."""
+    _log.info("provision-api starting — running nginx state recovery")
+    try:
+        result = reconciliation.recover_on_startup()
+        _log.info(
+            "Startup recovery: %d/%d networks reconnected, nginx %s",
+            result["networks_reconnected"],
+            result["networks_total"],
+            "reloaded" if result["nginx_reloaded"] else "NOT reloaded",
+        )
+    except Exception:
+        _log.exception("Startup recovery failed")
+    yield
+
+
+app = FastAPI(title="User Provision Tool", version="1.0.0", lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
@@ -629,6 +652,54 @@ def reconnect_all() -> dict[str, Any]:
         "reconnected": reconnected,
         "nginx_reloaded": True,
     }
+
+
+# ---------------------------------------------------------------------------
+# Reconciliation — nginx state recording & recovery
+# ---------------------------------------------------------------------------
+
+@app.post("/reconcile")
+def trigger_reconciliation() -> dict[str, Any]:
+    """Run a full nginx upstream reconciliation pass.
+
+    Reads all *.nginx.conf files from GENERATED_DIR, verifies each upstream
+    container is running, reconnects nginx to all user networks, reloads
+    nginx, and persists the result to provision_nginx_state.json.
+    """
+    try:
+        report = reconciliation.run_reconciliation()
+    except Exception as e:
+        raise HTTPException(500, f"Reconciliation failed: {e}")
+    return {"message": "Reconciliation completed.", "report": report}
+
+
+@app.get("/reconcile/status")
+def reconciliation_status() -> dict[str, Any]:
+    """Get the last reconciliation status from the state file."""
+    state = reconciliation.get_reconciliation_state()
+    last_run = state.get("last_updated")
+    upstreams = state.get("upstreams", [])
+
+    reachable = sum(1 for u in upstreams if u.get("reachable") is True)
+    unreachable = sum(1 for u in upstreams if u.get("reachable") is False)
+
+    return {
+        "last_run": last_run,
+        "result": {
+            "total_upstreams": len(upstreams),
+            "reachable": reachable,
+            "unreachable": unreachable,
+            "unreachable_details": [
+                u for u in upstreams if u.get("reachable") is False
+            ],
+        },
+    }
+
+
+@app.get("/nginx-state")
+def get_nginx_state() -> dict[str, Any]:
+    """Get the full nginx state JSON from provision_nginx_state.json."""
+    return reconciliation.get_reconciliation_state()
 
 
 # ---------------------------------------------------------------------------

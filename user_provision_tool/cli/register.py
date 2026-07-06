@@ -52,6 +52,33 @@ SOURCE_PROJECTS_DIR = Path(
 )
 
 
+def _validate_nginx_proxy_targets(
+    nginx_conf: Path, compose_service_names: list[str]
+) -> None:
+    """Validate that every proxy_pass host in *nginx_conf* is a compose service.
+
+    Prints an error and exits with code 1 if any host does not match.
+    """
+    import re
+    content = nginx_conf.read_text()
+    hosts: list[str] = []
+    for m in re.finditer(r'proxy_pass\s+https?://([a-zA-Z0-9_-]+)', content):
+        hosts.append(m.group(1))
+
+    compose_set = {n.lower() for n in compose_service_names}
+    unknown = [h for h in hosts if h.lower() not in compose_set]
+
+    if unknown:
+        print(
+            f"ERROR: nginx conf proxy_pass target(s) do not match any compose service name.\n"
+            f"  Compose services: {sorted(compose_service_names)}\n"
+            f"  Unknown proxy_pass host(s): {sorted(unknown)}\n"
+            f"  Update {nginx_conf.name} so every proxy_pass host matches a service key from docker-compose.yml.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Register a user and start their service containers.")
     p.add_argument("-u", "--user-name", required=True, help="User name")
@@ -228,6 +255,11 @@ def main() -> None:
         if not nginx_src.exists():
             print(f"ERROR: nginx file not found: {nginx_src}", file=sys.stderr)
             sys.exit(1)
+
+        # Validate: every proxy_pass host must reference a compose service
+        if _compose_svc_names:
+            _validate_nginx_proxy_targets(nginx_src, _compose_svc_names)
+
         template_out = str(nginx_src.parent / f"{nginx_src.name}.j2")
         try:
             nginx_file_to_template(

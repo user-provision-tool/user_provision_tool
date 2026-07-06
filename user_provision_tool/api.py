@@ -356,6 +356,11 @@ def register_user(
         src = Path(nginx_conf_file_path)
         if not src.exists():
             raise HTTPException(404, f"nginx_conf_file_path not found: {nginx_conf_file_path}")
+
+        # --- Validate: every proxy_pass host must reference a compose service ---
+        if _compose_svc_names:
+            _validate_nginx_proxy_targets(src, _compose_svc_names)
+
         template_out = str(src.parent / f"{src.name}.j2")
         try:
             nginx_file_to_template(
@@ -836,6 +841,38 @@ def get_user_status(user_name: str) -> dict[str, Any]:
     if not entries:
         raise HTTPException(404, f"No registrations found for user '{user_name}'.")
     return _compute_status(user_name)
+
+
+# ---------------------------------------------------------------------------
+# Nginx proxy_pass validation
+# ---------------------------------------------------------------------------
+
+def _validate_nginx_proxy_targets(
+    nginx_conf: Path, compose_service_names: list[str]
+) -> None:
+    """Validate that every proxy_pass host in *nginx_conf* is a compose service.
+
+    Raises :class:`HTTPException` (422) with a message listing any hosts
+    that don't match a known compose service name.
+    """
+    import re
+    content = nginx_conf.read_text()
+    hosts: list[str] = []
+    for m in re.finditer(r'proxy_pass\s+https?://([a-zA-Z0-9_-]+)', content):
+        hosts.append(m.group(1))
+
+    compose_set = {n.lower() for n in compose_service_names}
+    unknown = [h for h in hosts if h.lower() not in compose_set]
+
+    if unknown:
+        raise HTTPException(
+            422,
+            f"nginx conf proxy_pass target(s) do not match any compose service name. "
+            f"Compose services: {sorted(compose_service_names)}. "
+            f"Unknown proxy_pass host(s): {sorted(unknown)}. "
+            f"Update {nginx_conf.name} so every proxy_pass host matches a "
+            f"service key from docker-compose.yml.",
+        )
 
 
 # ---------------------------------------------------------------------------

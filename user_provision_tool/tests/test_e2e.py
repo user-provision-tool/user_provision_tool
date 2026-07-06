@@ -470,10 +470,10 @@ server {
         # The original literal host should NOT remain in the template
         assert "http://web:80" not in j2_content
 
-    def test_plain_nginx_conf_external_host_unchanged(
+    def test_plain_nginx_conf_external_host_rejected(
         self, tmp_path, mock_docker, monkeypatch,
     ):
-        """A proxy_pass to an external host (not a compose service name) is left alone."""
+        """A proxy_pass to a host not in compose services is rejected with a clear error."""
         import shutil
         import cli.register as reg_script
 
@@ -518,17 +518,14 @@ server {
             "-d", "example.com",
         ]
         with patch.object(sys, "argv", sys_argv):
-            reg_script.main()
+            with pytest.raises(SystemExit) as exc_info:
+                reg_script.main()
 
+        assert exc_info.value.code == 1
+
+        # No registry entry should be created (registration was blocked)
         entry = reg_mod.get_user_service("alice", "myapp", "0")
-        assert entry is not None
-
-        # The .j2 template should still have the literal external host
-        j2_path = tmp_path / "nginx.conf.j2"
-        assert j2_path.exists()
-        j2_content = j2_path.read_text()
-        # external-api is not a compose service → left as-is
-        assert "http://external-api:9000" in j2_content
+        assert entry is None
 
 class TestE2ERemoval:
     def test_removal_deregisters_user(self, registered_alice, mock_docker):

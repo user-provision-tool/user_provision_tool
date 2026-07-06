@@ -368,6 +368,59 @@ def rebuild_user(
 # P5: PUT /users/{user_name}/{service_name}/{label}/password  — change password
 # ---------------------------------------------------------------------------
 
+
+# ---------------------------------------------------------------------------
+# POST /users/{user_name}/services/{service_name}/{label}/up  — start containers
+# ---------------------------------------------------------------------------
+
+@app.post("/users/{user_name}/services/{service_name}/{label}/up")
+def start_user_service(
+    user_name: str, service_name: str, label: str,
+) -> dict[str, Any]:
+    """Start a user's service containers (docker compose up -d)."""
+    try:
+        provisioner.start_service(
+            user_name=user_name,
+            service_name=service_name,
+            label=label,
+        )
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+    return {"message": "Service started.", "status": "up"}
+
+
+# ---------------------------------------------------------------------------
+# POST /users/{user_name}/services/{service_name}/{label}/down  — stop containers
+# ---------------------------------------------------------------------------
+
+@app.post("/users/{user_name}/services/{service_name}/{label}/down")
+def stop_user_service(
+    user_name: str, service_name: str, label: str,
+) -> dict[str, Any]:
+    """Stop a user's service containers (docker compose stop)."""
+    try:
+        provisioner.stop_service(
+            user_name=user_name,
+            service_name=service_name,
+            label=label,
+        )
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+    return {"message": "Service stopped.", "status": "down"}
+
+
+# ---------------------------------------------------------------------------
+# P5: PUT /users/{user_name}/{service_name}/{label}/password  — change password
+# ---------------------------------------------------------------------------
+
 class PasswordChangeRequest(BaseModel):
     passwd: str
 

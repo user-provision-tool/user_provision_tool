@@ -89,6 +89,11 @@ def compose_down(compose_file: str, env_file: str | None = None, project_name: s
     _run(_compose_base(compose_file, env_file, project_name) + ["down"])
 
 
+def compose_stop(compose_file: str, env_file: str | None = None, project_name: str | None = None) -> None:
+    """Stop containers without removing them (docker compose stop)."""
+    _run(_compose_base(compose_file, env_file, project_name) + ["stop"])
+
+
 def compose_down_by_project(project_name: str) -> None:
     """Tear down a Compose project by project name alone (no compose file needed).
 

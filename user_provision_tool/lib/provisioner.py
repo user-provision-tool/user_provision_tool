@@ -433,6 +433,73 @@ def rebuild_user(
 # P5: Password change
 # ---------------------------------------------------------------------------
 
+
+# ---------------------------------------------------------------------------
+# Start / Stop service
+# ---------------------------------------------------------------------------
+
+def start_service(
+    *,
+    user_name: str,
+    service_name: str,
+    label: str,
+) -> dict[str, str]:
+    """Start a user's service containers (docker compose up -d).
+
+    Raises
+    ------
+    KeyError if no registration is found.
+    FileNotFoundError if the compose file is missing.
+    RuntimeError if docker compose up fails.
+    """
+    entry = registry.get_user_service(user_name, service_name, label)
+    if not entry:
+        raise KeyError(f"No registration found for {user_name}/{service_name}/{label}.")
+
+    compose_file = entry.get("compose_file_path", "")
+    if not compose_file or not Path(compose_file).exists():
+        raise FileNotFoundError(f"Compose file not found: {compose_file}")
+
+    env_file = entry.get("env_file_path") or None
+    project_name = entry.get("network_name")
+    docker_ops.compose_up(compose_file, env_file=env_file, project_name=project_name)
+
+    return {"user_name": user_name, "service_name": service_name, "label": label}
+
+
+def stop_service(
+    *,
+    user_name: str,
+    service_name: str,
+    label: str,
+) -> dict[str, str]:
+    """Stop a user's service containers (docker compose stop).
+
+    Raises
+    ------
+    KeyError if no registration is found.
+    FileNotFoundError if the compose file is missing.
+    RuntimeError if docker compose stop fails.
+    """
+    entry = registry.get_user_service(user_name, service_name, label)
+    if not entry:
+        raise KeyError(f"No registration found for {user_name}/{service_name}/{label}.")
+
+    compose_file = entry.get("compose_file_path", "")
+    if not compose_file or not Path(compose_file).exists():
+        raise FileNotFoundError(f"Compose file not found: {compose_file}")
+
+    env_file = entry.get("env_file_path") or None
+    project_name = entry.get("network_name")
+    docker_ops.compose_stop(compose_file, env_file=env_file, project_name=project_name)
+
+    return {"user_name": user_name, "service_name": service_name, "label": label}
+
+
+# ---------------------------------------------------------------------------
+# P5: Password change
+# ---------------------------------------------------------------------------
+
 def change_password(
     *,
     user_name: str,

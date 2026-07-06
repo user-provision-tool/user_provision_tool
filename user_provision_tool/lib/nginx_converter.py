@@ -188,15 +188,20 @@ def convert_nginx(
             port_path = m.group(3)   # ":port" and/or "/path", may be empty
             tail = m.group(4)        # ";" or whitespace terminator
 
-            # 1) Exact match against a compose service name → replace whole host
+            # 1) Exact match against a compose service name → {{ container_prefix }}<name>
+            #    This is the preferred path — it preserves the full service key
+            #    so proxy_pass targets match the actual container_name in the compose file.
             if compose_names and host.lower() in compose_names:
                 return (
                     f"proxy_pass {scheme}"
                     f"{{{{ container_prefix }}}}{host}{port_path}{tail}"
                 )
 
-            # 2) Prefix match against service_name_hint → strip hint, keep suffix
-            if hint_esc:
+            # 2) Prefix match against service_name_hint → strip hint, keep suffix.
+            #    Only applied when compose_service_names are NOT available,
+            #    because stripping the service-name prefix produces container
+            #    names that don't match the compose container_name.
+            if hint_esc and not compose_names:
                 stripped = re.sub(
                     rf'^{hint_esc}[-_]?', '', host, flags=re.IGNORECASE
                 )

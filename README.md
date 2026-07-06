@@ -174,7 +174,14 @@ curl -X POST http://localhost:8765/nginx/reconnect-all  # reconnect to all netwo
 curl http://localhost:8765/tasks/{task_id}/log   # real-time build log (SSE)
 ```
 
-**14. Register with HTTPS**
+**14. Reconciliation & nginx state**
+```bash
+curl -X POST http://localhost:8765/reconcile        # run live reconciliation
+curl http://localhost:8765/reconcile/status          # live nginx state snapshot
+curl http://localhost:8765/nginx-state               # same as above
+```
+
+**15. Register with HTTPS**
 ```bash
 # Full path — certs are copied to $PROVISION_DIR/ssl/example.com/
 curl -X POST "http://localhost:8765/users?sync=true" \

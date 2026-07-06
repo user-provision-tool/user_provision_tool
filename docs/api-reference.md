@@ -37,6 +37,9 @@ add `?sync=true` to any mutable endpoint.
 | `POST` | `/docker/nginx/reload` | Reload provision-nginx |
 | `GET` | `/nginx/connections` | Nginx connection state (networks, confs, upstreams) |
 | `POST` | `/nginx/reconnect-all` | Reconnect nginx to all user networks and reload |
+| `POST` | `/reconcile` | Run live nginx upstream reconciliation |
+| `GET` | `/reconcile/status` | Live nginx state snapshot (networks, containers, confs) |
+| `GET` | `/nginx-state` | Same as `/reconcile/status` — live state snapshot |
 
 ---
 
@@ -666,6 +669,71 @@ user network (idempotent), then reloads nginx.
 
 ---
 
+## `POST /reconcile` — Run Live Reconciliation
+
+Reads all `*.nginx.conf` files, verifies each upstream container is running,
+reconnects nginx to every network in `user_registry.yml`, reloads nginx, and
+reports per-service container health from stored `container_names`.  Nothing is
+persisted to disk — this is a live query.
+
+**Response `200`**
+```json
+{
+  "message": "Reconciliation completed.",
+  "report": {
+    "last_run": "2026-07-06T09:34:49+00:00",
+    "total_upstreams": 2,
+    "reachable": 1,
+    "unreachable": 1,
+    "unreachable_details": [{"upstream": "...", "target_container": "...", "reason": "container not found"}],
+    "networks_reconnected": 2,
+    "total_networks_in_registry": 2,
+    "nginx_reloaded": true,
+    "upstreams": [{"conf_file": "...", "server_name": "...", "proxy_pass": "...", "target_container": "...", "reachable": true}],
+    "containers_healthy": 1,
+    "containers_total": 2
+  }
+}
+```
+
+---
+
+## `GET /reconcile/status` — Live Nginx State Snapshot
+
+Returns a live snapshot derived from `user_registry.yml` + Docker queries.
+No cached state file is read — everything is queried live.
+
+**Response `200`**
+```json
+{
+  "total_users": 2,
+  "total_networks": 2,
+  "nginx_connected_networks": 2,
+  "networks": ["siyuan-user_alice-0", "siyuan-mcp-user_alice-0"],
+  "connected": ["siyuan-user_alice-0", "siyuan-mcp-user_alice-0"],
+  "disconnected": [],
+  "total_nginx_confs": 2,
+  "services": [
+    {
+      "user_name": "alice",
+      "service_name": "siyuan",
+      "label": "0",
+      "network_name": "siyuan-user_alice-0",
+      "container_names": ["siyuan-user_alice-0-siyuan"],
+      "containers": [{"name": "siyuan-user_alice-0-siyuan", "status": "running"}]
+    }
+  ]
+}
+```
+
+---
+
+## `GET /nginx-state` — Same as `/reconcile/status`
+
+Convenience alias — returns the same live state snapshot.
+
+---
+
 ## Quick Reference
 
 ```bash
@@ -705,6 +773,11 @@ curl -X PUT http://localhost:8765/users/alice/services/myapp/0/password \
 
 # Container logs
 curl "http://localhost:8765/users/alice/services/myapp/0/containers/web/logs?tail=50"
+
+# Reconciliation
+curl -X POST http://localhost:8765/reconcile
+curl http://localhost:8765/reconcile/status
+curl http://localhost:8765/nginx-state
 
 # Docker / host stats
 curl http://localhost:8765/docker/ps

@@ -3,22 +3,12 @@
 The test suite has four layers:
 
 ```
-Integration (bash)   tests/test_integration.sh     41 tests
+Integration (bash)   tests/test_integration.sh     102 tests
   └─ full Docker round-trip: build image → start API → register → rebuild → remove
-    also covers -fc / -fn plain-file conversion via the API
-    also covers passwd='' (no-auth) and default-passwd (auth enabled) paths
-    also covers async task pool (GET /tasks, GET /tasks/{id}, DELETE /tasks/{id})
-    also covers proxy build_args with MockProxy
-    also covers HTTPS registration (full paths + bare filenames)
-    also covers hyphenated usernames
-    also covers auto-HTTPS generation from plain HTTP nginx conf
-    also covers docker ps/stats/info and host stats endpoints
-    also covers up/down start/stop service endpoints
-    also covers password change endpoint
-    also covers container logs endpoint
-    also covers SSE build log streaming
-    also covers nginx connections and reconnect-all endpoints
-    also covers reconciliation helper endpoints
+    also covers up/down, password change, container logs, SSE streaming,
+    docker/host stats, nginx connections, reconnect-all, reconciliation,
+    HTTPS registration, proxy_pass compose name detection, env_file handling,
+    async task pool, project_root resolution, build_args with MockProxy
 
 E2E (pytest)         tests/test_e2e.py              40 tests
   └─ exercise CLI scripts end-to-end against real files, no Docker
@@ -31,7 +21,7 @@ Proxy Support        tests/test_proxy_support.py    38 tests
 Async Task Pool      tests/test_task_manager.py     10 tests
   └─ submit, complete, fail, cancel, list_all, uniqueness
 
-Unit (pytest)        tests/test_unit.py             180+ tests
+Unit (pytest)        tests/test_unit.py             183 tests
   └─ individual lib/ functions in isolation, all I/O mocked
     includes provisioner proxy support tests
     includes env_file render_compose rewrite + per-user copy tests
@@ -67,8 +57,9 @@ Notable patterns:
 - `TestComposeConverter` covers container_name rewriting, volume extraction, network substitution, profile filtering.
 - `TestNginxConverter` covers server_name, auth_basic, proxy_pass, htpasswd_path substitutions, and SSL certificate path conversion with `{% if https %}` block wrapping.
 - `TestProvisionerProxySupport` covers `build_args` storage in registry and rebuild fallback.
-- `TestProvisionerEnvFile` covers HTTPS: full-path cert copying, bare-filename resolution, missing-cert error handling, registry field storage, start_service, stop_service, change_password, and orphan network cleanup.
-- `TestAPINewEndpoints` covers the new API endpoints (P1-P6) using FastAPI `TestClient` with mocked docker_ops: `/docker/ps`, `/docker/stats`, `/docker/info`, `/host/stats`, reconciliation helpers, `/up`, `/down`, `/password`, `/nginx/connections`, `/nginx/reconnect-all`, `/containers/{c}/logs`, `/tasks/{id}/log` (SSE), `/health`, `/tasks`.
+- `TestProvisionerEnvFile` covers HTTPS, start_service, stop_service, change_password, orphan network cleanup, and `container_names` storage in registry.
+- `TestAPINewEndpoints` covers API endpoints using FastAPI `TestClient`: docker/ps, docker/stats, docker/info, host/stats, reconciliation helpers, up/down/password, nginx/connections, nginx/reconnect-all, container logs, task log SSE, health, tasks, reconcile, reconcile/status, nginx-state.
+- `TestNginxConverter` covers deterministic proxy_pass rewriting (exact compose service name matching, no prefix stripping), SSL certificate path replacement, auth_basic injection, and HTTPS block auto-generation.
 
 ---
 

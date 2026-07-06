@@ -216,7 +216,8 @@ The converters apply these substitutions:
 | `server_name` | `→ {{ hostname }}` |
 | `auth_basic` | `→ {{ service_name }} — {{ user_name }}` |
 | `auth_basic_user_file` | `→ {{ htpasswd_path }}` |
-| `proxy_pass` host prefixed with service name | `→ {{ container_prefix }}{suffix}` |
+| `proxy_pass` host matching a compose service name | `→ {{ container_prefix }}<name>` |
+| `proxy_pass` host NOT matching any compose service | **Rejected** — registration fails with validation error listing unknown hosts |
 | _(no `auth_basic` block present)_ | Injects `auth_basic "{{ service_name }} - {{ user_name }}";` and `auth_basic_user_file {{ htpasswd_path }};` before the first `proxy_pass` |
 
 > **Password stripping**: when `passwd` is empty (`""`), `render_nginx_conf()` strips all

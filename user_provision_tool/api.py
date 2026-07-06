@@ -854,13 +854,27 @@ def _compute_status(filter_user: str | None) -> dict[str, Any]:
     return {"user_status": [_status_for_user(name, running) for name in sorted(user_names)]}
 
 
-def _expected_services(compose_file: str) -> list[str]:
-    if not Path(compose_file).exists():
-        return []
-    import yaml
-    with open(compose_file) as f:
-        data = yaml.safe_load(f) or {}
-    return list(data.get("services", {}).keys())
+def _expected_container_names(entry: dict) -> list[str]:
+    """Return the full container names for a service — from registry or compose file."""
+    stored = entry.get("container_names")
+    if stored:
+        return stored
+
+    # Fallback: derive from compose file (backward compat with pre-container_names entries)
+    compose_file = entry.get("compose_file_path", "")
+    if compose_file and Path(compose_file).exists():
+        import yaml
+        try:
+            with open(compose_file) as f:
+                data = yaml.safe_load(f) or {}
+            prefix = template_engine.container_prefix(
+                entry["service_name"], entry["user_name"], entry["label"]
+            )
+            svc_keys = list(data.get("services", {}).keys())
+            return [f"{prefix}{k}" for k in svc_keys]
+        except Exception:
+            pass
+    return []
 
 
 def _status_for_user(user_name: str, running: dict[str, str]) -> dict[str, Any]:
@@ -869,17 +883,13 @@ def _status_for_user(user_name: str, running: dict[str, str]) -> dict[str, Any]:
 
     for entry in entries:
         compose_file = entry.get("compose_file_path", "")
-        prefix = template_engine.container_prefix(
-            entry["service_name"], entry["user_name"], entry["label"]
-        )
-        expected_keys = _expected_services(compose_file)
+        expected_names = _expected_container_names(entry)
 
         healthy: dict[str, str] = {}
         unhealthy: dict[str, str] = {}
         missing: dict[str, str] = {}
 
-        for svc_key in expected_keys:
-            cname = f"{prefix}{svc_key}"
+        for cname in expected_names:
             if cname in running:
                 status = running[cname]
                 if "unhealthy" in status.lower():
@@ -896,6 +906,7 @@ def _status_for_user(user_name: str, running: dict[str, str]) -> dict[str, Any]:
             "label": entry["label"],
             "compose_template_path": entry.get("compose_template_path", ""),
             "compose_file_path": compose_file,
+            "container_names": expected_names,
             "healthy_containers": healthy,
             "unhealthy_containers": unhealthy,
             "missing_containers": missing,

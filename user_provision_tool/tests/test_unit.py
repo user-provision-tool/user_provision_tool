@@ -2419,7 +2419,9 @@ class TestAPINewEndpoints:
         assert "reachable" in report
         assert "unreachable" in report
         assert "nginx_reloaded" in report
-        assert "total_networks_in_registry" in report  # derived from registry
+        assert "total_networks_in_registry" in report
+        assert "containers_healthy" in report
+        assert "containers_total" in report
 
     def test_reconcile_status_endpoint(self):
         """GET /reconcile/status returns live nginx state snapshot."""
@@ -2430,6 +2432,7 @@ class TestAPINewEndpoints:
         assert "total_networks" in data
         assert "nginx_connected_networks" in data
         assert "total_nginx_confs" in data
+        assert "services" in data
 
     def test_nginx_state_endpoint(self):
         """GET /nginx-state returns live nginx state snapshot."""
@@ -2440,6 +2443,7 @@ class TestAPINewEndpoints:
         assert "total_networks" in data
         assert "connected" in data
         assert "disconnected" in data
+        assert "services" in data
 
     # ── Helper: register a user for dependent tests ──
 

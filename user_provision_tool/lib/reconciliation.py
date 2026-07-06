@@ -170,6 +170,16 @@ def run_reconciliation(
         except Exception:
             pass
 
+    # --- Check container health from stored container_names ---
+    containers_healthy = 0
+    containers_total = 0
+    for entry in all_users:
+        names = entry.get("container_names") or _derive_container_names(entry)
+        for cname in names:
+            containers_total += 1
+            if docker_ops.container_running(cname):
+                containers_healthy += 1
+
     # --- Reload nginx ---
     try:
         docker_ops.nginx_reload(nginx_container)
@@ -187,14 +197,38 @@ def run_reconciliation(
         "total_networks_in_registry": len(networks),
         "nginx_reloaded": nginx_reloaded,
         "upstreams": upstreams,
+        "containers_healthy": containers_healthy,
+        "containers_total": containers_total,
     }
+
+
+def _derive_container_names(entry: dict) -> list[str]:
+    """Backward-compat: derive container names from compose file if not stored."""
+    compose_file = entry.get("compose_file_path", "")
+    if compose_file and Path(compose_file).exists():
+        try:
+            import yaml
+            from . import template_engine
+            with open(compose_file) as f:
+                data = yaml.safe_load(f) or {}
+            prefix = template_engine.container_prefix(
+                entry.get("service_name", ""),
+                entry.get("user_name", ""),
+                str(entry.get("label", "0")),
+            )
+            svc_keys = list(data.get("services", {}).keys())
+            return [f"{prefix}{k}" for k in svc_keys]
+        except Exception:
+            pass
+    return []
 
 
 def get_nginx_state() -> dict[str, Any]:
     """Return a live snapshot of nginx state — derived from registry + Docker.
 
     No state file is read; everything is queried live from the registry
-    and the Docker daemon.
+    and the Docker daemon.  Container health is checked for every stored
+    ``container_names`` entry.
     """
     all_users = registry.get_all_users()
     networks = sorted({e["network_name"] for e in all_users if e.get("network_name")})
@@ -204,6 +238,27 @@ def get_nginx_state() -> dict[str, Any]:
     for net in networks:
         if docker_ops.network_connected_to_container(net, "provision-nginx"):
             nginx_connected.append(net)
+
+    # Per-service container health (from stored container_names in registry)
+    from . import template_engine
+
+    services: list[dict[str, Any]] = []
+    for entry in all_users:
+        container_names = entry.get("container_names") or _derive_container_names(entry)
+        containers: list[dict[str, Any]] = []
+        for cname in container_names:
+            running = docker_ops.container_running(cname)
+            exists = docker_ops.container_exists(cname)
+            status = "running" if running else ("stopped" if exists else "missing")
+            containers.append({"name": cname, "status": status})
+        services.append({
+            "user_name": entry.get("user_name"),
+            "service_name": entry.get("service_name"),
+            "label": entry.get("label"),
+            "network_name": entry.get("network_name"),
+            "container_names": container_names,
+            "containers": containers,
+        })
 
     # Count upstream confs
     generated_dir = _generated_dir()
@@ -217,4 +272,5 @@ def get_nginx_state() -> dict[str, Any]:
         "connected": nginx_connected,
         "disconnected": [n for n in networks if n not in nginx_connected],
         "total_nginx_confs": len(conf_files),
+        "services": services,
     }

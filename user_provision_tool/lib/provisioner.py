@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from . import auth, docker_ops, registry, template_engine
+from .compose_converter import get_compose_service_names
 
 # Registry writes must be atomic across threads (relevant when the API handles
 # concurrent requests).
@@ -239,22 +240,29 @@ def register_user(
         env_file=env_file,
     )
 
-    # Update registry with the per-user copied env path so rebuild/remove
-    # always reference the correct file (not the original source path).
+    # --- Record container names from the rendered compose ---
+    prefix = template_engine.container_prefix(service_name, user_name, label)
+    compose_svc_names = get_compose_service_names(compose_out)
+    container_names = [f"{prefix}{svc}" for svc in compose_svc_names]
+    entry["container_names"] = container_names
+
+    # Update registry with per-user copied env path + container names
+    # so rebuild/remove/reconciliation always have the correct references.
     if copied_env:
         entry["env_file_path"] = copied_env
-        with _registry_lock:
-            # Re-save the full registry to persist the updated entry
-            users = registry._load()
-            for u in users:
-                if (
-                    u.get("user_name") == user_name
-                    and u.get("service_name") == service_name
-                    and str(u.get("label", "")) == str(label)
-                ):
+    with _registry_lock:
+        users = registry._load()
+        for u in users:
+            if (
+                u.get("user_name") == user_name
+                and u.get("service_name") == service_name
+                and str(u.get("label", "")) == str(label)
+            ):
+                if copied_env:
                     u["env_file_path"] = copied_env
-                    break
-            registry._save(users)
+                u["container_names"] = container_names
+                break
+        registry._save(users)
 
     # --- Render nginx conf + htpasswd ---
     if nginx_template and nginx_out:

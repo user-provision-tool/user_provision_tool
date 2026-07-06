@@ -772,11 +772,21 @@ async def stream_task_log(
     tail: int = Query(200, description="Number of recent lines to send first"),
     follow: bool = Query(True, description="Keep streaming new lines"),
 ):
-    """Stream build log via Server-Sent Events."""
+    """Stream per-task build log via Server-Sent Events.
+
+    Streams from the task's dedicated log file (``task-{task_id}.log``)
+    under ``TASK_LOG_DIR``.  Falls back to the global ``DOCKER_OPS_LOG``
+    if the per-task log does not exist.
+    """
     import asyncio
     from pathlib import Path
 
-    log_file = Path(os.environ.get("DOCKER_OPS_LOG", str(GENERATED_DIR / "docker_ops.log")))
+    # Try per-task log first, fall back to global log
+    task_log = task_manager.get_log_file(task_id)
+    if task_log and Path(task_log).exists():
+        log_file = Path(task_log)
+    else:
+        log_file = Path(os.environ.get("DOCKER_OPS_LOG", str(GENERATED_DIR / "docker_ops.log")))
 
     async def log_generator():
         # Send initial tail

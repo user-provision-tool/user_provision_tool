@@ -20,10 +20,12 @@ Usage::
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
+from pathlib import Path
 from typing import Any, Callable
 
 
@@ -32,10 +34,10 @@ class Task:
 
     __slots__ = (
         "task_id", "type", "status", "created_at", "updated_at",
-        "result", "error", "_future", "_cancel_event",
+        "result", "error", "_future", "_cancel_event", "log_file",
     )
 
-    def __init__(self, task_id: str, task_type: str, future: Future):
+    def __init__(self, task_id: str, task_type: str, future: Future, log_file: str = ""):
         self.task_id = task_id
         self.type = task_type          # "register" | "rebuild" | "remove"
         self.status = "pending"        # pending → running → completed | failed | cancelled
@@ -45,6 +47,7 @@ class Task:
         self.error: str | None = None
         self._future = future
         self._cancel_event = threading.Event()
+        self.log_file = log_file       # path to per-task log file
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -61,15 +64,26 @@ class Task:
 class TaskManager:
     """In-memory task pool backed by a ThreadPoolExecutor.
 
-    Tasks are stored in a dict and automatically cleaned up after
-    *max_age_seconds* (default: 1 hour).
+    Each task gets a dedicated log file under *log_dir*.  Tasks older than
+    *ttl_seconds* are cleaned up, and if the total number exceeds *max_tasks*,
+    the oldest are evicted first.  Task log files are deleted alongside their
+    task entries.
     """
 
-    def __init__(self, max_workers: int = 4, max_age_seconds: float = 3600):
+    def __init__(
+        self,
+        max_workers: int = 4,
+        ttl_seconds: float = 604800,   # 1 week
+        max_tasks: int = 1000,
+        log_dir: str = "",
+    ):
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._tasks: dict[str, Task] = {}
         self._lock = threading.Lock()
-        self._max_age = max_age_seconds
+        self._ttl = ttl_seconds
+        self._max_tasks = max_tasks
+        self._log_dir = Path(log_dir) if log_dir else Path(".")
+        self._log_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
     # Public API
@@ -83,15 +97,15 @@ class TaskManager:
         **kwargs: Any,
     ) -> str:
         """Submit *fn* for background execution.  Returns a task UUID immediately."""
-        task_id = uuid.uuid4().hex[:12]  # short enough for URLs, unique enough
-        # Create a placeholder future — the real submit happens after the task
-        # is registered so the worker thread sees it.
+        task_id = uuid.uuid4().hex[:12]
+        log_file = str(self._log_dir / f"task-{task_id}.log")
+
         future = Future()
-        task = Task(task_id, task_type, future)
+        task = Task(task_id, task_type, future, log_file=log_file)
         with self._lock:
             self._tasks[task_id] = task
+            self._cleanup_excess()
 
-        # Now submit — race is eliminated because the task is already in _tasks
         real_future = self._executor.submit(
             self._run_task, task_id, task_type, fn, *args, **kwargs
         )
@@ -107,13 +121,14 @@ class TaskManager:
             return None
         return task.to_dict()
 
-    def cancel(self, task_id: str) -> bool:
-        """Request cancellation of a pending or running task.
+    def get_log_file(self, task_id: str) -> str | None:
+        """Return the per-task log file path, or None if task not found."""
+        with self._lock:
+            task = self._tasks.get(task_id)
+        return task.log_file if task else None
 
-        Returns True if the task was found and cancellation was requested.
-        The task thread will stop at the next docker_ops call (which checks
-        the cancel event between subprocess invocations).
-        """
+    def cancel(self, task_id: str) -> bool:
+        """Request cancellation of a pending or running task."""
         with self._lock:
             task = self._tasks.get(task_id)
         if task is None:
@@ -142,15 +157,18 @@ class TaskManager:
 
     def _run_task(self, task_id: str, task_type: str, fn: Callable, *args: Any, **kwargs: Any) -> None:
         """Wrapper executed on a worker thread."""
+        # Set up thread-local task log file so docker_ops writes to it
+        from . import docker_ops
+
         with self._lock:
             task = self._tasks.get(task_id)
         if task is None:
             return
+        docker_ops.set_task_log_file(task.log_file)
 
         task.status = "running"
         task.updated_at = time.time()
 
-        # Strip internal kwargs not meant for the target function
         cancel_event = kwargs.pop("_cancel_event", None)
         if cancel_event is not None:
             task._cancel_event = cancel_event
@@ -164,22 +182,53 @@ class TaskManager:
             task.status = "failed"
         finally:
             task.updated_at = time.time()
+            docker_ops.clear_task_log_file()
 
     def _cleanup_stale(self) -> None:
-        """Remove tasks older than _max_age that have finished."""
+        """Remove finished tasks older than _ttl and delete their log files."""
         now = time.time()
         with self._lock:
             stale = [
-                tid for tid, t in self._tasks.items()
+                (tid, t) for tid, t in self._tasks.items()
                 if t.status in ("completed", "failed", "cancelled")
-                and (now - t.updated_at) > self._max_age
+                and (now - t.updated_at) > self._ttl
             ]
-            for tid in stale:
+            for tid, t in stale:
+                self._delete_task_log(t.log_file)
                 del self._tasks[tid]
+
+    def _cleanup_excess(self) -> None:
+        """Remove oldest tasks if total exceeds _max_tasks and delete their logs."""
+        if len(self._tasks) <= self._max_tasks:
+            return
+        # Sort oldest-first, remove the overflow
+        sorted_tasks = sorted(
+            self._tasks.items(),
+            key=lambda item: item[1].created_at,
+        )
+        to_remove = len(self._tasks) - self._max_tasks
+        for tid, t in sorted_tasks[:to_remove]:
+            self._delete_task_log(t.log_file)
+            del self._tasks[tid]
+
+    @staticmethod
+    def _delete_task_log(log_file: str) -> None:
+        if log_file and Path(log_file).exists():
+            try:
+                Path(log_file).unlink()
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
 # Singleton instance
 # ---------------------------------------------------------------------------
 
-task_manager = TaskManager()
+task_manager = TaskManager(
+    ttl_seconds=int(os.environ.get("TASK_TTL_SECONDS", "604800")),
+    max_tasks=int(os.environ.get("TASK_MAX_COUNT", "1000")),
+    log_dir=os.environ.get(
+        "TASK_LOG_DIR",
+        str(Path(os.environ.get("GENERATED_DIR", "./generated")) / "task_logs"),
+    ),
+)

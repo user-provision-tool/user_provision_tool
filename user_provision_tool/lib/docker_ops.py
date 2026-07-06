@@ -15,12 +15,38 @@ from pathlib import Path
 
 _LOG_FILE = os.environ.get("DOCKER_OPS_LOG", "")
 
+# Per-task log file — set by task_manager via set_task_log_file() before
+# running a task, and cleared after.  Thread-local so concurrent tasks
+# each write to their own file.
+_task_log = threading.local()
+
+
+def set_task_log_file(path: str) -> None:
+    """Set the per-task log file for the current thread."""
+    _task_log.path = path
+
+
+def clear_task_log_file() -> None:
+    """Clear the per-task log file for the current thread."""
+    _task_log.path = None
+
 
 def _write_log(text: str) -> None:
+    # Global log
     if _LOG_FILE:
         try:
             Path(_LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
             with open(_LOG_FILE, "a") as f:
+                f.write(text)
+        except Exception:
+            pass
+
+    # Per-task log (thread-local)
+    task_path = getattr(_task_log, "path", None)
+    if task_path:
+        try:
+            Path(task_path).parent.mkdir(parents=True, exist_ok=True)
+            with open(task_path, "a") as f:
                 f.write(text)
         except Exception:
             pass

@@ -914,7 +914,7 @@ def _status_for_user(user_name: str, running: dict[str, str]) -> dict[str, Any]:
 
         if not Path(compose_file).exists():
             missing_services.append(svc)
-        elif len(healthy) == len(expected_keys) and not unhealthy and not missing:
+        elif len(healthy) == len(expected_names) and not unhealthy and not missing:
             healthy_services.append(svc)
         elif not healthy and not unhealthy:
             missing_services.append(svc)

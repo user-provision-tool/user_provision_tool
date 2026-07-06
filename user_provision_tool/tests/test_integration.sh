@@ -476,18 +476,18 @@ if [ -f "$FC_NGINX_CONF" ]; then
     else
         pass "passwd='' → nginx conf has no auth_basic directives"
     fi
-    # Verify proxy_pass target was rendered with container_prefix (hint-based:
-    # "myapp-web" → "{{ container_prefix }}web" → "myapp-user_fileuser-0-web")
+    # Verify proxy_pass target was rendered with container_prefix
+    # (web matches compose service key → {{ container_prefix }}web → myapp-user_fileuser-0-web)
     if grep -q "proxy_pass.*myapp-user_fileuser-0-web:80" "$FC_NGINX_CONF"; then
-        pass "proxy_pass rendered with correct container_prefix (hint-based)"
+        pass "proxy_pass rendered with correct container_prefix (compose service name match)"
     else
-        fail "proxy_pass missing rendered container name (hint-based): $(grep proxy_pass "$FC_NGINX_CONF" || echo 'no proxy_pass found')"
+        fail "proxy_pass missing rendered container name (compose service name): $(grep proxy_pass "$FC_NGINX_CONF" || echo 'no proxy_pass found')"
     fi
-    # The raw hint-prefixed host should NOT appear in the rendered output
-    if grep -q "http://myapp-web" "$FC_NGINX_CONF"; then
-        fail "proxy_pass still has literal 'myapp-web' (not templatized)"
+    # The original host 'web' should NOT appear in the rendered output (it was templatized)
+    if grep -q "http://web:" "$FC_NGINX_CONF"; then
+        fail "proxy_pass still has literal 'web' (not templatized)"
     else
-        pass "proxy_pass does not contain literal 'myapp-web'"
+        pass "proxy_pass does not contain literal 'web'"
     fi
 else
     fail "Nginx conf not found at: $FC_NGINX_CONF"

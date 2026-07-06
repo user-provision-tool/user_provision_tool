@@ -128,6 +128,25 @@ def nginx_reload(container: str) -> None:
     _run(["docker", "exec", container, "nginx", "-s", "reload"], check=False)
 
 
+def docker_info() -> dict[str, Any]:
+    """Return docker system info including container counts."""
+    result = subprocess.run(
+        ["docker", "info", "--format", "{{json .}}"],
+        text=True, capture_output=True,
+    )
+    import json
+    try:
+        info = json.loads(result.stdout)
+        return {
+            "containers_total": info.get("Containers", 0),
+            "containers_running": info.get("ContainersRunning", 0),
+            "containers_paused": info.get("ContainersPaused", 0),
+            "containers_stopped": info.get("ContainersStopped", 0),
+        }
+    except Exception:
+        return {}
+
+
 def docker_ps() -> list[dict[str, str]]:
     """Return list of running containers as dicts with keys: name, status, image."""
     result = subprocess.run(

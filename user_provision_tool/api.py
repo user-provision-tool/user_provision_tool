@@ -166,6 +166,108 @@ def health() -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# GET /docker/ps  — list all containers
+# ---------------------------------------------------------------------------
+
+@app.get("/docker/ps")
+def docker_ps_list() -> list[dict[str, Any]]:
+    """Return all Docker containers (docker ps -a)."""
+    return docker_ops.docker_ps()
+
+
+# ---------------------------------------------------------------------------
+# GET /docker/stats  — per-container resource stats
+# ---------------------------------------------------------------------------
+
+@app.get("/docker/stats")
+def docker_stats() -> list[dict[str, Any]]:
+    """Return docker stats snapshot."""
+    return docker_ops.docker_stats_snapshot()
+
+
+# ---------------------------------------------------------------------------
+# GET /docker/info  — docker host info
+# ---------------------------------------------------------------------------
+
+@app.get("/docker/info")
+def docker_info() -> dict[str, Any]:
+    """Return docker system info (container counts, etc.)."""
+    return docker_ops.docker_info()
+
+
+# ---------------------------------------------------------------------------
+# GET /host/stats  — host-level CPU/memory/disk
+# ---------------------------------------------------------------------------
+
+@app.get("/host/stats")
+def host_stats() -> dict[str, Any]:
+    """Return host-level CPU, memory, and disk usage."""
+    import shutil, re
+    stats: dict[str, Any] = {}
+
+    # Memory
+    try:
+        with open("/proc/meminfo") as f:
+            mem = {}
+            for line in f:
+                parts = line.split(":")
+                if len(parts) == 2:
+                    mem[parts[0].strip()] = int(parts[1].strip().split()[0])
+        total = mem.get("MemTotal", 1)
+        available = mem.get("MemAvailable", mem.get("MemFree", 0))
+        stats["mem_percent"] = round((1 - available / total) * 100, 1)
+        stats["mem_total_kb"] = total
+        stats["mem_used_kb"] = total - available
+    except Exception:
+        stats["mem_percent"] = 0
+
+    # CPU
+    try:
+        with open("/proc/stat") as f:
+            cpu_line = f.readline()
+        parts = [int(x) for x in cpu_line.split()[1:]]
+        idle = parts[3]
+        total_cpu = sum(parts)
+        stats["cpu_percent"] = round((1 - idle / total_cpu) * 100, 1) if total_cpu > 0 else 0
+    except Exception:
+        stats["cpu_percent"] = 0
+
+    # Disk
+    try:
+        usage = shutil.disk_usage("/")
+        stats["disk_percent"] = round((1 - usage.free / usage.total) * 100, 1)
+        stats["disk_total_gb"] = round(usage.total / (1024**3), 1)
+        stats["disk_free_gb"] = round(usage.free / (1024**3), 1)
+    except Exception:
+        stats["disk_percent"] = 0
+
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# Reconciliation helpers (called by gateway)
+# ---------------------------------------------------------------------------
+
+@app.get("/docker/container/{container}/exists")
+def container_exists_ep(container: str) -> dict[str, Any]:
+    return {"exists": docker_ops.container_exists(container)}
+
+@app.get("/docker/container/{container}/running")
+def container_running_ep(container: str) -> dict[str, Any]:
+    return {"running": docker_ops.container_running(container)}
+
+@app.post("/docker/network/{network}/connect/{container}")
+def network_connect_ep(network: str, container: str) -> dict[str, Any]:
+    docker_ops.network_connect(container, network)
+    return {"connected": True}
+
+@app.post("/docker/nginx/reload")
+def nginx_reload_ep(container: str = "provision-nginx") -> dict[str, Any]:
+    docker_ops.nginx_reload(container)
+    return {"reloaded": True}
+
+
+# ---------------------------------------------------------------------------
 # POST /users  — register (async by default; ?sync=true to block)
 # ---------------------------------------------------------------------------
 

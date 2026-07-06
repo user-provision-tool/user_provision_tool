@@ -1247,16 +1247,16 @@ class TestNginxConverter:
         out = convert_nginx(_SAMPLE_NGINX_CONF)
         assert "auth_basic_user_file {{ htpasswd_path }};" in out
 
-    def test_convert_proxy_pass_with_hint(self):
+    def test_convert_proxy_pass_with_compose_names(self):
+        """proxy_pass is rewritten when host matches a compose service name."""
         from lib.nginx_converter import convert_nginx
-        out = convert_nginx(_SAMPLE_NGINX_CONF, service_name_hint="myapp")
-        assert "proxy_pass http://{{ container_prefix }}web:80;" in out
-        assert "myapp-web" not in out
+        out = convert_nginx(_SAMPLE_NGINX_CONF, compose_service_names=["myapp-web"])
+        assert "proxy_pass http://{{ container_prefix }}myapp-web:80;" in out
 
-    def test_convert_proxy_pass_without_hint(self):
+    def test_convert_proxy_pass_without_compose_names(self):
+        """Without compose_service_names, proxy_pass is left as-is."""
         from lib.nginx_converter import convert_nginx
         out = convert_nginx(_SAMPLE_NGINX_CONF)
-        # Without a service_name_hint, proxy_pass target is not rewritten
         assert "proxy_pass http://myapp-web:80;" in out
 
     def test_convert_preserves_proxy_headers(self):

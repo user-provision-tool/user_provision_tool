@@ -7,8 +7,8 @@ directive           before                              after
 server_name         server_name example.com;            server_name {{ hostname }};
 auth_basic          auth_basic "My App";                auth_basic "{{ service_name }} - {{ user_name }}";
 auth_basic_user_file auth_basic_user_file /etc/...;     auth_basic_user_file {{ htpasswd_path }};
-proxy_pass          proxy_pass http://myapp-web:80;     proxy_pass http://{{ container_prefix }}web:80;
-                    (only when service_name_hint given and prefix matches)
+proxy_pass          proxy_pass http://web:80;           proxy_pass http://{{ container_prefix }}web:80;
+                    (only when host matches a compose service name exactly)
 
 All other content is preserved verbatim.  ${ENV_VAR} expressions are left
 untouched — they are resolved by nginx at runtime via environment substitution.
@@ -35,10 +35,10 @@ _HEADER_TPL = """\
 #   {{{{ ssl_certificate_path }}}}      /provision/ssl/{{{{ domain_name }}}}/fullchain.pem
 #   {{{{ ssl_certificate_key_path }}}}  /provision/ssl/{{{{ domain_name }}}}/privkey.pem
 #
-# NOTE: proxy_pass targets have been rewritten where possible:
-#   • Hosts matching a compose service name → {{{{ container_prefix }}}}<name>
-#   • Hosts starting with the service name hint → {{{{ container_prefix }}}}<suffix>
-#   Review and adjust any remaining literal container names manually.
+# NOTE: proxy_pass targets that exactly match a compose service name have
+#   been rewritten to {{{{ container_prefix }}}}<name>.  Any host that does
+#   not match a compose service name is left unchanged — review and adjust
+#   remaining literal container names manually.
 #
 # NOTE: ssl_certificate and ssl_certificate_key paths have been replaced with
 #   template variables.  Wrap HTTPS server blocks in {{% if https %}}...{{% endif %}}
@@ -57,13 +57,16 @@ def convert_nginx(
     Parameters
     ----------
     service_name_hint:
-        Provision service name used as a prefix hint to rewrite proxy_pass
-        targets (e.g. ``myapp-web`` → ``{{ container_prefix }}web``).
+        Provision service name (used only for the generated header comment).
     compose_service_names:
-        Service keys from the companion docker-compose.yml.  When a proxy_pass
-        host matches one of these names exactly, the entire host is replaced
-        with ``{{ container_prefix }}<name>`` so it resolves to the actual
+        Service keys from the companion docker-compose.yml.  This is the
+        **only** input used to rewrite proxy_pass targets.  Each host that
+        exactly matches a compose service name is replaced with
+        ``{{ container_prefix }}<name>`` so it resolves to the actual
         deployed container name at render time.
+
+        If empty or ``None``, proxy_pass targets are left unchanged — the
+        caller should review and adjust container names manually.
     """
 
     # server_name — replace all name tokens after the keyword
@@ -178,9 +181,11 @@ def convert_nginx(
                 out.append(p["text"])
         text = ''.join(out)
 
-    # proxy_pass — rewrite host part when it references a service or matches hint
-    if service_name_hint or compose_names:
-        hint_esc = re.escape(service_name_hint) if service_name_hint else None
+    # proxy_pass — rewrite host to {{ container_prefix }}<name> when it
+    # exactly matches a compose service name.  This is deterministic: the
+    # original docker-compose.yml defines the service names, and the
+    # original nginx.conf references them.  No heuristics, no prefix stripping.
+    if compose_names:
 
         def _repl_proxy(m: re.Match) -> str:
             scheme = m.group(1)      # "http://" or "https://"
@@ -188,29 +193,11 @@ def convert_nginx(
             port_path = m.group(3)   # ":port" and/or "/path", may be empty
             tail = m.group(4)        # ";" or whitespace terminator
 
-            # 1) Exact match against a compose service name → {{ container_prefix }}<name>
-            #    This is the preferred path — it preserves the full service key
-            #    so proxy_pass targets match the actual container_name in the compose file.
-            if compose_names and host.lower() in compose_names:
+            if host.lower() in compose_names:
                 return (
                     f"proxy_pass {scheme}"
                     f"{{{{ container_prefix }}}}{host}{port_path}{tail}"
                 )
-
-            # 2) Prefix match against service_name_hint → strip hint, keep suffix.
-            #    Only applied when compose_service_names are NOT available,
-            #    because stripping the service-name prefix produces container
-            #    names that don't match the compose container_name.
-            if hint_esc and not compose_names:
-                stripped = re.sub(
-                    rf'^{hint_esc}[-_]?', '', host, flags=re.IGNORECASE
-                )
-                if stripped != host:
-                    return (
-                        f"proxy_pass {scheme}"
-                        f"{{{{ container_prefix }}}}{stripped}{port_path}{tail}"
-                    )
-
             return m.group(0)
 
         text = re.sub(

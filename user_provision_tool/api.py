@@ -161,12 +161,12 @@ _log = logging.getLogger("provision-api")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: run nginx state recovery.  Shutdown: no-op."""
-    _log.info("provision-api starting — running nginx state recovery")
+    """Startup: reconnect nginx to all user networks from registry."""
+    _log.info("provision-api starting — running nginx network recovery")
     try:
         result = reconciliation.recover_on_startup()
         _log.info(
-            "Startup recovery: %d/%d networks reconnected, nginx %s",
+            "Recovery: %d/%d networks reconnected, nginx %s",
             result["networks_reconnected"],
             result["networks_total"],
             "reloaded" if result["nginx_reloaded"] else "NOT reloaded",
@@ -655,16 +655,16 @@ def reconnect_all() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Reconciliation — nginx state recording & recovery
+# Reconciliation — live nginx state (derived from user_registry.yml + Docker)
 # ---------------------------------------------------------------------------
 
 @app.post("/reconcile")
 def trigger_reconciliation() -> dict[str, Any]:
-    """Run a full nginx upstream reconciliation pass.
+    """Run a live nginx upstream reconciliation pass.
 
-    Reads all *.nginx.conf files from GENERATED_DIR, verifies each upstream
-    container is running, reconnects nginx to all user networks, reloads
-    nginx, and persists the result to provision_nginx_state.json.
+    Reads all *.nginx.conf files, verifies each upstream container is
+    running, reconnects nginx to every network in the registry, and
+    reloads nginx.  Returns a live report — nothing is persisted to disk.
     """
     try:
         report = reconciliation.run_reconciliation()
@@ -675,31 +675,17 @@ def trigger_reconciliation() -> dict[str, Any]:
 
 @app.get("/reconcile/status")
 def reconciliation_status() -> dict[str, Any]:
-    """Get the last reconciliation status from the state file."""
-    state = reconciliation.get_reconciliation_state()
-    last_run = state.get("last_updated")
-    upstreams = state.get("upstreams", [])
+    """Get a live snapshot of nginx network/upstream state.
 
-    reachable = sum(1 for u in upstreams if u.get("reachable") is True)
-    unreachable = sum(1 for u in upstreams if u.get("reachable") is False)
-
-    return {
-        "last_run": last_run,
-        "result": {
-            "total_upstreams": len(upstreams),
-            "reachable": reachable,
-            "unreachable": unreachable,
-            "unreachable_details": [
-                u for u in upstreams if u.get("reachable") is False
-            ],
-        },
-    }
+    Derived from user_registry.yml + live Docker queries — no cached state file.
+    """
+    return reconciliation.get_nginx_state()
 
 
 @app.get("/nginx-state")
 def get_nginx_state() -> dict[str, Any]:
-    """Get the full nginx state JSON from provision_nginx_state.json."""
-    return reconciliation.get_reconciliation_state()
+    """Get a live snapshot of nginx network/upstream state."""
+    return reconciliation.get_nginx_state()
 
 
 # ---------------------------------------------------------------------------

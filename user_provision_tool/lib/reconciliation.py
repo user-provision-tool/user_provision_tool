@@ -1,11 +1,13 @@
-"""Nginx state reconciliation — verifies upstreams and recovers on startup.
+"""Nginx network recovery and reconciliation.
 
-Runs inside provision-api (same filesystem as PROVISION_DIR).
+Runs inside provision-api.  All state comes from ``user_registry.yml`` —
+no separate state file needed.  The registry already records ``network_name``
+for every registered user/service/label, which is the single source of truth
+for reconnecting ``provision-nginx`` to user networks on startup.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
@@ -17,11 +19,6 @@ from . import docker_ops, registry
 
 _log = logging.getLogger(__name__)
 
-# Default location — same as provision-gateway used
-DEFAULT_STATE_FILE = Path(
-    os.environ.get("PROVISION_DIR", "/srv/provision")
-) / "provision_nginx_state.json"
-
 
 def _generated_dir() -> Path:
     """Return GENERATED_DIR from env or default."""
@@ -31,84 +28,35 @@ def _generated_dir() -> Path:
 
 
 # ---------------------------------------------------------------------------
-# State file helpers
-# ---------------------------------------------------------------------------
-
-
-def _read_state(state_file: Path) -> dict[str, Any]:
-    """Read the cached nginx state file. Returns empty dict if not found."""
-    if state_file.exists():
-        try:
-            return json.loads(state_file.read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {"version": 1, "upstreams": [], "networks": {}}
-
-
-def _write_state(report: dict[str, Any], state_file: Path) -> None:
-    """Persist reconciliation report to state file."""
-    state = {
-        "version": 1,
-        "last_updated": report["last_run"],
-        "networks": report.get("networks", {}),
-        "upstreams": report.get("upstreams", []),
-    }
-    try:
-        state_file.parent.mkdir(parents=True, exist_ok=True)
-        state_file.write_text(json.dumps(state, indent=2))
-    except Exception:
-        _log.exception("Failed to write nginx state file %s", state_file)
-
-
-# ---------------------------------------------------------------------------
-# Startup recovery
+# Startup recovery  (reads user_registry.yml only)
 # ---------------------------------------------------------------------------
 
 
 def recover_on_startup(
-    state_file: Path | None = None,
     nginx_container: str = "provision-nginx",
 ) -> dict[str, Any]:
-    """Run on provision-api startup: reconnect nginx to all user networks.
+    """Reconnect nginx to every user network listed in the registry.
 
-    Reads the user registry (not the state file) to find all known networks,
-    reconnects provision-nginx to each one idempotently, and reloads nginx.
-    Also updates the state file with current upstream metadata.
-
-    Parameters
-    ----------
-    state_file:
-        Path to provision_nginx_state.json.  Defaults to
-        ``$PROVISION_DIR/provision_nginx_state.json``.
-    nginx_container:
-        Name of the nginx container.
+    Called automatically on provision-api boot.  Idempotent — networks
+    already connected are silently skipped by ``docker network connect``.
 
     Returns
     -------
-    dict with keys: ``networks_reconnected``, ``networks_total``, ``nginx_reloaded``.
+    dict with ``networks_reconnected``, ``networks_total``, ``nginx_reloaded``.
     """
-    if state_file is None:
-        state_file = DEFAULT_STATE_FILE
+    _log.info("nginx recovery: reconnecting to all user networks from registry")
 
-    _log.info("Starting nginx state recovery on provision-api startup")
-
-    # Reconnect to all networks listed in the registry
     all_users = registry.get_all_users()
-    networks = set()
-    for entry in all_users:
-        net = entry.get("network_name", "")
-        if net:
-            networks.add(net)
+    networks = sorted({e["network_name"] for e in all_users if e.get("network_name")})
 
     reconnected = 0
-    for net in sorted(networks):
+    for net in networks:
         try:
             docker_ops.network_connect(nginx_container, net)
             reconnected += 1
         except Exception:
-            _log.warning("Failed to reconnect %s to network %s", nginx_container, net)
+            _log.warning("Failed to connect %s to network %s", nginx_container, net)
 
-    # Reload nginx
     try:
         docker_ops.nginx_reload(nginx_container)
         nginx_reloaded = True
@@ -116,25 +64,8 @@ def recover_on_startup(
         _log.warning("Failed to reload %s", nginx_container)
         nginx_reloaded = False
 
-    # Run a full reconciliation to update the state file
-    try:
-        report = run_reconciliation(state_file=state_file, nginx_container=nginx_container)
-    except Exception:
-        _log.exception("Reconciliation during startup recovery failed")
-        report = {
-            "last_run": datetime.now(timezone.utc).isoformat(),
-            "total_upstreams": 0,
-            "reachable": 0,
-            "unreachable": 0,
-            "unreachable_details": [],
-            "networks_reconnected": reconnected,
-            "nginx_reloaded": nginx_reloaded,
-            "upstreams": [],
-        }
-        _write_state(report, state_file)
-
     _log.info(
-        "Startup recovery complete: %d/%d networks reconnected, nginx %s",
+        "nginx recovery complete: %d/%d networks reconnected, nginx %s",
         reconnected, len(networks),
         "reloaded" if nginx_reloaded else "NOT reloaded",
     )
@@ -147,38 +78,25 @@ def recover_on_startup(
 
 
 # ---------------------------------------------------------------------------
-# Reconciliation
+# Reconciliation  (live — no state file)
 # ---------------------------------------------------------------------------
 
 
 def run_reconciliation(
-    state_file: Path | None = None,
     nginx_container: str = "provision-nginx",
 ) -> dict[str, Any]:
-    """Run a full reconciliation pass.
+    """Run a live reconciliation pass.
 
-    Reads all *.nginx.conf files from GENERATED_DIR, checks whether each
-    upstream container is running, reconnects nginx to all user networks,
-    reloads nginx, and writes the result to the state file.
-
-    Parameters
-    ----------
-    state_file:
-        Path to provision_nginx_state.json.  Defaults to
-        ``$PROVISION_DIR/provision_nginx_state.json``.
-    nginx_container:
-        Name of the nginx container to reload.
+    Parses all ``*.nginx.conf`` files, checks whether each upstream container
+    is running, reconnects nginx to every network in the registry, and reloads
+    nginx.  Returns a report — nothing is persisted to disk.
 
     Returns
     -------
-    dict report with keys:
-        ``last_run``, ``total_upstreams``, ``reachable``, ``unreachable``,
-        ``unreachable_details``, ``networks_reconnected``, ``nginx_reloaded``,
-        ``upstreams``.
+    dict with ``last_run``, ``total_upstreams``, ``reachable``,
+    ``unreachable``, ``unreachable_details``, ``networks_reconnected``,
+    ``nginx_reloaded``, ``upstreams``.
     """
-    if state_file is None:
-        state_file = DEFAULT_STATE_FILE
-
     generated_dir = _generated_dir()
     conf_files = sorted(generated_dir.glob("*.nginx.conf"))
 
@@ -242,14 +160,10 @@ def run_reconciliation(
 
     # --- Reconnect nginx to all networks from registry ---
     all_users = registry.get_all_users()
-    networks = set()
-    for entry in all_users:
-        net = entry.get("network_name", "")
-        if net:
-            networks.add(net)
+    networks = sorted({e["network_name"] for e in all_users if e.get("network_name")})
 
     networks_reconnected = 0
-    for net in sorted(networks):
+    for net in networks:
         try:
             docker_ops.network_connect(nginx_container, net)
             networks_reconnected += 1
@@ -263,24 +177,44 @@ def run_reconciliation(
     except Exception:
         nginx_reloaded = False
 
-    # --- Build and persist report ---
-    report = {
+    return {
         "last_run": datetime.now(timezone.utc).isoformat(),
         "total_upstreams": len(upstreams),
         "reachable": reachable,
         "unreachable": unreachable,
         "unreachable_details": unreachable_details,
         "networks_reconnected": networks_reconnected,
+        "total_networks_in_registry": len(networks),
         "nginx_reloaded": nginx_reloaded,
         "upstreams": upstreams,
     }
 
-    _write_state(report, state_file)
-    return report
 
+def get_nginx_state() -> dict[str, Any]:
+    """Return a live snapshot of nginx state — derived from registry + Docker.
 
-def get_reconciliation_state(state_file: Path | None = None) -> dict[str, Any]:
-    """Return the current cached state from provision_nginx_state.json."""
-    if state_file is None:
-        state_file = DEFAULT_STATE_FILE
-    return _read_state(state_file)
+    No state file is read; everything is queried live from the registry
+    and the Docker daemon.
+    """
+    all_users = registry.get_all_users()
+    networks = sorted({e["network_name"] for e in all_users if e.get("network_name")})
+
+    # Check which networks nginx is actually connected to
+    nginx_connected: list[str] = []
+    for net in networks:
+        if docker_ops.network_connected_to_container(net, "provision-nginx"):
+            nginx_connected.append(net)
+
+    # Count upstream confs
+    generated_dir = _generated_dir()
+    conf_files = sorted(generated_dir.glob("*.nginx.conf"))
+
+    return {
+        "total_users": len(all_users),
+        "total_networks": len(networks),
+        "nginx_connected_networks": len(nginx_connected),
+        "networks": networks,
+        "connected": nginx_connected,
+        "disconnected": [n for n in networks if n not in nginx_connected],
+        "total_nginx_confs": len(conf_files),
+    }

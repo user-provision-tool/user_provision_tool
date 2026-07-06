@@ -2402,7 +2402,7 @@ class TestAPINewEndpoints:
     # ── Reconciliation endpoints ──
 
     def test_reconcile_endpoint(self, monkeypatch):
-        """POST /reconcile runs reconciliation and returns report."""
+        """POST /reconcile runs live reconciliation and returns report."""
         monkeypatch.setattr(self.api.docker_ops, "network_connect", lambda *a, **kw: None)
         monkeypatch.setattr(self.api.docker_ops, "nginx_reload", lambda *a: None)
         import subprocess as sp
@@ -2419,22 +2419,27 @@ class TestAPINewEndpoints:
         assert "reachable" in report
         assert "unreachable" in report
         assert "nginx_reloaded" in report
+        assert "total_networks_in_registry" in report  # derived from registry
 
     def test_reconcile_status_endpoint(self):
-        """GET /reconcile/status returns last reconciliation status."""
+        """GET /reconcile/status returns live nginx state snapshot."""
         response = self.client.get("/reconcile/status")
         assert response.status_code == 200
         data = response.json()
-        assert "result" in data
-        assert "total_upstreams" in data["result"]
+        assert "total_users" in data
+        assert "total_networks" in data
+        assert "nginx_connected_networks" in data
+        assert "total_nginx_confs" in data
 
     def test_nginx_state_endpoint(self):
-        """GET /nginx-state returns full state JSON."""
+        """GET /nginx-state returns live nginx state snapshot."""
         response = self.client.get("/nginx-state")
         assert response.status_code == 200
         data = response.json()
-        assert "version" in data
-        assert "upstreams" in data
+        assert "total_users" in data
+        assert "total_networks" in data
+        assert "connected" in data
+        assert "disconnected" in data
 
     # ── Helper: register a user for dependent tests ──
 

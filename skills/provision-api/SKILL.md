@@ -409,6 +409,11 @@ The `proxy_pass` target must use the **service name** (the Docker Compose servic
 which Docker's internal DNS resolves to the container IP.  The provision tool's converter
 will prefix it with `{{ container_prefix }}`.
 
+> ⚠️ **Critical**: Every `proxy_pass` host **must exactly match** a service key from
+> `docker-compose.yml`.  Registration will be **rejected** if any host does not match —
+> the error message lists the unknown hosts so you can fix them.  Do NOT use made-up
+> names like `myapp-web` — read the actual service keys from the compose file.
+
 ### Nginx conf template
 
 Copy this template and fill in the placeholders for the specific service:
@@ -444,17 +449,18 @@ template variables and wraps `listen 443 ssl` server blocks in `{% if https %}` 
 | Placeholder | What to put | Converter does |
 |---|---|---|
 | `{service_name}_hostname` | E.g. `myapp_hostname` | Replaced with `{{ hostname }}` → `{service}-{user}-{label}.{domain}` |
-| `{service_name}` | **Service name from compose file** (the key under `services:`), e.g. `mcp-server` — read directly from `docker-compose.yml` | Prefixed with `{{ container_prefix }}` → `mcp_server_for_remote_graphiti-user_alice-0-mcp-server` |
+| `{service_name}` | **Compose service key** — read directly from the `services:` section of `docker-compose.yml`. Must be an exact match (case-insensitive). E.g. `web`, `mcp-server`, `db`. Do NOT add prefixes like `myapp-` — use the raw key. | Validated against compose service names; rejected if no match. Matching hosts become `{{ container_prefix }}<name>`. |
 | `{internal_port}` | The internal port the service listens on, e.g. `8000` — from `expose:` or the Dockerfile | Left as-is |
 
 ### Converter behavior (what happens automatically)
 
-- **`proxy_pass` service-name detection** — the converter reads the companion
-  `docker-compose.yml` and automatically detects when a `proxy_pass` host matches a
-  compose service name.  Those hosts are rewritten to `{{ container_prefix }}<name>`
-  so they resolve to the actual deployed container name at render time.  You can
-  simply write `proxy_pass http://<compose-service-name>:<port>;` and the converter
-  handles the rest.
+- **`proxy_pass` service-name validation** — the converter reads the companion
+  `docker-compose.yml` and checks that every `proxy_pass` host matches a compose
+  service name.  **Hosts that do NOT match a compose service are rejected with an
+  error** — you must update the nginx conf so each proxy_pass target is the exact
+  service key from `services:` in `docker-compose.yml`.  Matching hosts are
+  rewritten to `{{ container_prefix }}<name>` so they resolve to the actual
+  deployed container name at render time.
 
 - **`auth_basic` injection** — if the source conf has no `auth_basic` directives, the
   converter automatically injects `auth_basic "{{ service_name }} - {{ user_name }}";`

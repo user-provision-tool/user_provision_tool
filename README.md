@@ -169,9 +169,21 @@ curl http://localhost:8765/nginx/connections     # nginx networks + upstreams
 curl -X POST http://localhost:8765/nginx/reconnect-all  # reconnect to all networks
 ```
 
-**13. SSE build log streaming**
+**13. SSE build log streaming (per-task isolated logs)**
+
 ```bash
-curl http://localhost:8765/tasks/{task_id}/log   # real-time build log (SSE)
+# Each async task writes to its own isolated log file at:
+#   $TASK_LOG_DIR/task-{task_id}.log
+# Stream the log via SSE while the task runs:
+curl http://localhost:8765/tasks/{task_id}/log?tail=20&follow=true
+
+# Configuration (optional environment variables):
+#   TASK_LOG_DIR       — where per-task .log files are stored
+#                         (default: $GENERATED_DIR/task_logs)
+#   TASK_TTL_SECONDS   — how long finished tasks + logs are kept
+#                         (default: 604800 = 7 days)
+#   TASK_MAX_COUNT     — max tasks in memory; oldest evicted when exceeded
+#                         (default: 1000)
 ```
 
 **14. Reconciliation & nginx state**

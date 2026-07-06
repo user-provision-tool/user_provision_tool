@@ -19,6 +19,9 @@ services:
       - REGISTRY_FILE=${PROVISION_DIR}/generated/user_registry.yml
       - NGINX_CONTAINER=provision-nginx
       - DOCKER_OPS_LOG=${PROVISION_DIR}/generated/docker_ops.log
+      - TASK_LOG_DIR=${PROVISION_DIR}/generated/task_logs
+      - TASK_TTL_SECONDS=${TASK_TTL_SECONDS:-604800}
+      - TASK_MAX_COUNT=${TASK_MAX_COUNT:-1000}
       - SSL_DIR=${PROVISION_DIR}/ssl
     restart: unless-stopped
 

@@ -895,6 +895,40 @@ class TestDockerOps:
             lambda *a, **kw: sp.CompletedProcess([], 1, stdout="", stderr=""))
         assert docker_ops.orphan_network_cleanup("ghost-net") is False
 
+    # ── Thread-local task log file ──
+
+    def test_set_clear_task_log_file(self, tmp_path):
+        """set_task_log_file and clear_task_log_file manage thread-local state."""
+        log_path = str(tmp_path / "task-abc.log")
+        docker_ops.set_task_log_file(log_path)
+        assert docker_ops._task_log.path == log_path
+        docker_ops.clear_task_log_file()
+        assert getattr(docker_ops._task_log, "path", None) is None
+
+    def test_task_log_writes_to_file(self, tmp_path):
+        """_write_log writes to the task-specific log when set."""
+        log_path = str(tmp_path / "task-xyz.log")
+        docker_ops.set_task_log_file(log_path)
+        docker_ops._write_log("test log line\n")
+        docker_ops.clear_task_log_file()
+
+        from pathlib import Path
+        content = Path(log_path).read_text()
+        assert "test log line" in content
+
+    def test_task_log_does_not_leak_between_threads(self, tmp_path):
+        """clear_task_log_file stops writing to the task log."""
+        log_path = str(tmp_path / "task-leak.log")
+        docker_ops.set_task_log_file(log_path)
+        docker_ops._write_log("before clear\n")
+        docker_ops.clear_task_log_file()
+        docker_ops._write_log("after clear\n")
+
+        from pathlib import Path
+        content = Path(log_path).read_text()
+        assert "before clear" in content
+        assert "after clear" not in content  # not written after clear
+
 
 # ---------------------------------------------------------------------------
 # compose_converter
@@ -2444,6 +2478,41 @@ class TestAPINewEndpoints:
         assert "connected" in data
         assert "disconnected" in data
         assert "services" in data
+
+    # ── Task log SSE streaming ──
+
+    def test_task_log_sse_streams_from_task_file(self, tmp_path, monkeypatch):
+        """SSE streams from per-task log file when it exists."""
+        from pathlib import Path
+
+        # Create a per-task log file
+        log_dir = tmp_path / "task_logs"
+        log_dir.mkdir()
+        task_log = log_dir / "task-test123.log"
+        task_log.write_text("line 1\nline 2\nline 3\n")
+
+        # Mock task_manager to return our log file path
+        monkeypatch.setattr(self.api.task_manager, "get_log_file",
+            lambda tid: str(task_log) if tid == "test123" else None)
+
+        response = self.client.get("/tasks/test123/log?tail=10&follow=false")
+        assert response.status_code == 200
+        assert "text/event-stream" in response.headers["content-type"]
+
+        body = response.text
+        assert "data: line 1" in body
+        assert "data: line 2" in body
+        assert "data: line 3" in body
+        assert "event: done" in body
+
+    def test_task_log_sse_falls_back_to_global(self, monkeypatch):
+        """SSE falls back to global DOCKER_OPS_LOG when task log not found."""
+        monkeypatch.setattr(self.api.task_manager, "get_log_file",
+            lambda tid: None)
+
+        response = self.client.get("/tasks/nonexistent/log?tail=5&follow=false")
+        assert response.status_code == 200
+        assert "text/event-stream" in response.headers["content-type"]
 
     # ── Helper: register a user for dependent tests ──
 

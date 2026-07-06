@@ -3,12 +3,13 @@
 The test suite has four layers:
 
 ```
-Integration (bash)   tests/test_integration.sh     102 tests
+Integration (bash)   tests/test_integration.sh     107 tests
   └─ full Docker round-trip: build image → start API → register → rebuild → remove
-    also covers up/down, password change, container logs, SSE streaming,
+    also covers up/down, password change, container logs, SSE per-task log streaming,
     docker/host stats, nginx connections, reconnect-all, reconciliation,
     HTTPS registration, proxy_pass compose name detection, env_file handling,
-    async task pool, project_root resolution, build_args with MockProxy
+    async task pool, project_root resolution, build_args with MockProxy,
+    per-task isolated log files (creation, content, SSE streaming)
 
 E2E (pytest)         tests/test_e2e.py              40 tests
   └─ exercise CLI scripts end-to-end against real files, no Docker
@@ -18,10 +19,11 @@ E2E (pytest)         tests/test_e2e.py              40 tests
 Proxy Support        tests/test_proxy_support.py    38 tests
   └─ docker_ops, provisioner, API models, CLI parsing, MockProxy lifecycle
 
-Async Task Pool      tests/test_task_manager.py     10 tests
-  └─ submit, complete, fail, cancel, list_all, uniqueness
+Async Task Pool      tests/test_task_manager.py     14 tests
+  └─ submit, complete, fail, cancel, list_all, uniqueness, per-task log file,
+    TTL cleanup, max-count eviction
 
-Unit (pytest)        tests/test_unit.py             183 tests
+Unit (pytest)        tests/test_unit.py             186 tests
   └─ individual lib/ functions in isolation, all I/O mocked
     includes provisioner proxy support tests
     includes env_file render_compose rewrite + per-user copy tests
@@ -29,7 +31,7 @@ Unit (pytest)        tests/test_unit.py             183 tests
       SSL block wrapping, provisioner cert copying + bare filenames
     includes docker_ops: compose_stop, docker_info, container_exists/running,
       container_inspect, network_list/inspect, network_connected_to_container,
-      container_logs, orphan_network_cleanup
+      container_logs, orphan_network_cleanup, thread-local task log
     includes provisioner: start_service, stop_service, change_password,
       orphan network cleanup on remove
     includes api (FastAPI TestClient): up/down/password endpoints, docker/ps,
@@ -162,10 +164,10 @@ bash tests/test_integration.sh
 ### Run all tests
 
 ```bash
-# All pytest-based tests (220 tests, no Docker needed)
+# All pytest-based tests (278 tests, no Docker needed)
 uv run pytest tests/test_unit.py tests/test_e2e.py tests/test_proxy_support.py tests/test_task_manager.py -v
 
-# Full integration (29 tests, requires Docker)
+# Full integration (107 tests, requires Docker)
 sudo bash tests/test_integration.sh
 ```
 
@@ -184,7 +186,7 @@ uv sync
 python -m pytest tests/test_unit.py tests/test_e2e.py -v
 ```
 
-Expected: **220 passed** (132 unit + 40 e2e + 38 proxy + 10 task_manager).
+Expected: **278 passed** (186 unit + 40 e2e + 38 proxy + 14 task_manager).
 
 ---
 

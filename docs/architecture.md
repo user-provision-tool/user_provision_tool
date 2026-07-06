@@ -76,6 +76,8 @@ user_provision_tool/
 │
 ├── generated/                     # GENERATED_DIR = $PROVISION_DIR/generated (auto-created)
 │   ├── user_registry.yml          # Managed state file
+│   ├── task_logs/                 # Per-task isolated log files (TASK_LOG_DIR)
+│   │   └── task-{task_id}.log     # task output, streamed via SSE
 │   ├── {svc}.user-{user}-{label}.nginx.conf
 │   └── {svc}.user-{user}-{label}.htpasswd
 │
@@ -104,11 +106,11 @@ user_provision_tool/
 | `registry.py` | Load/save `user_registry.yml`; add/remove/query entries by user+service+label |
 | `template_engine.py` | Extract template volumes; render compose and nginx files via Jinja2; copy `.env` as per-user file + rewrite `env_file:` refs |
 | `auth.py` | `getpass` prompt; bcrypt hash via `passlib.hash.bcrypt`; write `.htpasswd` file |
-| `docker_ops.py` | `compose_up`, `compose_down`, `compose_stop`, `compose_build`, `docker_ps`, `docker_stats_snapshot`, `docker_info`, `network_connect`, `network_disconnect`, `network_list`, `network_inspect`, `nginx_reload`, `container_inspect`, `container_exists`, `container_running`, `network_connected_to_container`, `container_logs`, `orphan_network_cleanup` wrappers; real-time stdout/stderr via `subprocess.Popen` + threading; supports `--build-arg` for proxy; writes to `DOCKER_OPS_LOG` file when env var is set |
+| `docker_ops.py` | `compose_up`, `compose_down`, `compose_stop`, `compose_build`, `docker_ps`, `docker_stats_snapshot`, `docker_info`, `network_connect`, `network_disconnect`, `network_list`, `network_inspect`, `nginx_reload`, `container_inspect`, `container_exists`, `container_running`, `network_connected_to_container`, `container_logs`, `orphan_network_cleanup` wrappers; real-time stdout/stderr via `subprocess.Popen` + threading; supports `--build-arg` for proxy; writes to `DOCKER_OPS_LOG` file when env var is set; thread-local per-task log file support (`set_task_log_file` / `clear_task_log_file`) |
 | `provisioner.py` | Shared workflow for register/remove/rebuild/start_service/stop_service/change_password; supports `build_args` (proxy) passed through to docker_ops; orphan network cleanup on remove; both `api.py` and `cli/` delegate here |
 | `compose_converter.py` | Parse a plain `docker-compose.yml` and emit a Jinja2 `.yml.j2` template; services with named profiles are excluded; `profiles:` key is stripped from kept services; Docker socket paths (`/var/run/docker.sock`, `/run/docker.sock`) are preserved as literal host paths — never converted to per-user volume variables |
 | `nginx_converter.py` | Apply regex substitutions to a plain nginx conf and emit a `.j2` template; injects `auth_basic` + `auth_basic_user_file` directives before the first `proxy_pass` if none are already present; detects when a `proxy_pass` host matches a compose service name and rewrites it to `{{ container_prefix }}<name>` |
-| `task_manager.py` | In-memory async task pool (`ThreadPoolExecutor`); submit → status → cancel lifecycle; powers `GET /tasks`, `GET /tasks/{id}`, `DELETE /tasks/{id}` endpoints |
+| `task_manager.py` | In-memory async task pool (`ThreadPoolExecutor`); submit → status → cancel lifecycle; powers `GET /tasks`, `GET /tasks/{id}`, `DELETE /tasks/{id}` endpoints; each task writes to an isolated per-task log file at `$TASK_LOG_DIR/task-{task_id}.log`; configurable TTL (`TASK_TTL_SECONDS`, default 7 days) and max count (`TASK_MAX_COUNT`, default 1000) with automatic eviction of oldest tasks |
 | `yaml_utils.py` | Shared `IndentedDumper` class (extends `yaml.Dumper`) that always indents sequence items under their parent key; used by `compose_converter` and `template_engine` for consistent YAML serialisation |
 
 ---
@@ -117,6 +119,7 @@ user_provision_tool/
 
 ```
   api.py                →  task_manager → provisioner → validation, registry, template_engine, auth, docker_ops
+  api.py (SSE /log)     →  task_manager (reads task-{id}.log from TASK_LOG_DIR)
   cli/register.py       →  provisioner  →  (same)
   cli/remove.py         →  provisioner  →  registry, docker_ops
   cli/rebuild.py        →  provisioner  →  registry, docker_ops

@@ -1851,6 +1851,100 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Test 40: Per-task isolated log file — created and contains output
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- Test 40: Per-task log file created and contains output ---"
+
+mkdir -p "${PROVISION_DIR}/user-data/taskloguser/app" "${PROVISION_DIR}/user-data/taskloguser/db"
+TASKLOG_BODY=$(cat <<EOF
+{
+  "user_name": "taskloguser",
+  "service_name": "myapp",
+  "compose_template_path": "${PROVISION_DIR}/templates/docker-compose.template.yml.j2",
+  "label": "0",
+  "domain": "localhost",
+  "passwd": "",
+  "volumes": {
+    "app_data": "${PROVISION_DIR}/user-data/taskloguser/app",
+    "db_data":  "${PROVISION_DIR}/user-data/taskloguser/db"
+  }
+}
+EOF
+)
+
+# Submit async — get task_id
+tasklog_resp=$(curl -sf -X POST "$API_URL/users" \
+    -H "Content-Type: application/json" \
+    -d "$TASKLOG_BODY")
+tasklog_tid=$(echo "$tasklog_resp" | python3 -c "import sys,json; print(json.load(sys.stdin)['task_id'])" 2>/dev/null || echo "")
+
+if [ -n "$tasklog_tid" ]; then
+    pass "Async register returned task_id=$tasklog_tid"
+else
+    fail "Async register did not return task_id: $tasklog_resp"
+fi
+
+# Poll until completed
+tasklog_done=0
+for i in $(seq 1 60); do
+    tstat=$(curl -sf "$API_URL/tasks/$tasklog_tid")
+    ts=$(echo "$tstat" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])" 2>/dev/null || echo "")
+    if [ "$ts" = "completed" ]; then
+        tasklog_done=1
+        pass "Per-task log test: task $tasklog_tid completed after ${i}s"
+        break
+    elif [ "$ts" = "failed" ]; then
+        err=$(echo "$tstat" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error',''))" 2>/dev/null || echo "")
+        fail "Per-task log test: task $tasklog_tid failed: $err"
+        break
+    fi
+    sleep 1
+done
+
+# Verify per-task log file exists and contains docker compose output
+TASK_LOG_FILE="${PROVISION_DIR}/generated/task_logs/task-${tasklog_tid}.log"
+if [ -f "$TASK_LOG_FILE" ]; then
+    pass "Per-task log file exists: task-${tasklog_tid}.log"
+    # Should contain docker compose commands
+    if grep -q "docker compose" "$TASK_LOG_FILE"; then
+        pass "Per-task log contains docker compose output"
+        echo ""
+        echo "  ┌─ Per-task log file content (${TASK_LOG_FILE}) ─────────────────┐"
+        cat "$TASK_LOG_FILE" | while IFS= read -r line; do echo "  │ $line"; done
+        echo "  └──────────────────────────────────────────────────────────────────┘"
+    else
+        fail "Per-task log missing docker compose output: $(head -5 "$TASK_LOG_FILE")"
+    fi
+else
+    fail "Per-task log file not found at: $TASK_LOG_FILE"
+fi
+
+# Verify SSE stream returns content from the per-task log
+tasklog_sse=$(curl -s "$API_URL/tasks/$tasklog_tid/log?tail=5&follow=false" 2>/dev/null || echo "")
+if echo "$tasklog_sse" | grep -q "data:"; then
+    pass "Per-task log SSE stream returns data lines"
+    echo ""
+    echo "  ┌─ SSE streamed log (tail=5, follow=false) ────────────────────────┐"
+    echo "$tasklog_sse" | while IFS= read -r line; do echo "  │ $line"; done
+    echo "  └──────────────────────────────────────────────────────────────────┘"
+else
+    fail "Per-task log SSE stream empty or malformed: $(echo "$tasklog_sse" | head -3)"
+fi
+
+# Also print the full SSE stream (tail=50, follow=false) to show all content
+tasklog_sse_full=$(curl -s "$API_URL/tasks/$tasklog_tid/log?tail=50&follow=false" 2>/dev/null || echo "")
+if echo "$tasklog_sse_full" | grep -q "data:"; then
+    echo ""
+    echo "  ┌─ SSE streamed log (tail=50, follow=false — full) ────────────────┐"
+    echo "$tasklog_sse_full" | while IFS= read -r line; do echo "  │ $line"; done
+    echo "  └──────────────────────────────────────────────────────────────────┘"
+fi
+
+# Clean up tasklog user
+curl -sf -X DELETE "$API_URL/users/taskloguser/services/myapp/0" >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
 # Results
 # ---------------------------------------------------------------------------
 echo ""

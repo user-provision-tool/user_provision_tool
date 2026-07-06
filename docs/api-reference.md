@@ -505,8 +505,11 @@ Returns the last N lines of a container's logs. The `{container}` path parameter
 
 ## `GET /tasks/{task_id}/log` — SSE Build Log Streaming
 
-Streams the build log via Server-Sent Events. Used by the dashboard to show real-time
-progress during register/rebuild tasks.
+Streams the per-task build log via Server-Sent Events. Each task writes its own
+isolated log file at `$TASK_LOG_DIR/task-{task_id}.log`. The SSE endpoint reads
+from that file and streams lines as `data:` events.
+
+Used by the dashboard to show real-time progress during register/rebuild/remove tasks.
 
 **Query parameters**
 
@@ -518,14 +521,25 @@ progress during register/rebuild tasks.
 **Response** — `Content-Type: text/event-stream`
 
 ```
-data: line from log file
-data: another line
+data: + docker compose -f ... up -d
+data: + docker network connect myapp-user_alice-0 provision-nginx
+data: + docker exec provision-nginx nginx -s reload
 event: done
 data: {}
 ```
 
-The log file defaults to `$GENERATED_DIR/docker_ops.log`; override with the
-`DOCKER_OPS_LOG` environment variable.
+Per-task log files are stored in `$TASK_LOG_DIR` (default: `$GENERATED_DIR/task_logs`).
+Finished tasks are cleaned up after `TASK_TTL_SECONDS` (default 7 days), along with
+their log files. At most `TASK_MAX_COUNT` tasks are retained (default 1000); the
+oldest are evicted when the limit is exceeded.
+
+**Environment variables**
+
+| Variable | Default | Description |
+|---|---|---|
+| `TASK_LOG_DIR` | `$GENERATED_DIR/task_logs` | Directory for per-task `.log` files |
+| `TASK_TTL_SECONDS` | `604800` (7 days) | How long finished tasks + logs are kept |
+| `TASK_MAX_COUNT` | `1000` | Maximum number of tasks retained in memory |
 
 ---
 

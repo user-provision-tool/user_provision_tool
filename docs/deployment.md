@@ -52,6 +52,9 @@ Set these before running `docker compose up`.
 | `NGINX_HTTPS_PORT` | — | `443` | Host port for provision-nginx HTTPS (default `443`) |
 | `NGINX_CONTAINER` | — | `provision-nginx` | Name of the nginx container to connect/reload on registration (default `provision-nginx`) |
 | `DOCKER_OPS_LOG` | — | `${PROVISION_DIR}/generated/docker_ops.log` | If set, all docker command stdout/stderr is appended here for debugging |
+| `TASK_LOG_DIR` | — | `${PROVISION_DIR}/generated/task_logs` | Directory for per-task isolated `.log` files (one file per async task) |
+| `TASK_TTL_SECONDS` | — | `604800` (7 days) | How long finished tasks and their log files are retained before automatic cleanup |
+| `TASK_MAX_COUNT` | — | `1000` | Maximum number of tasks retained in memory; oldest completed tasks are evicted when exceeded |
 | `SSL_DIR` | — | `${PROVISION_DIR}/ssl` | Base directory for SSL certificates (default `${PROVISION_DIR}/ssl`). Created automatically. |
 
 ---
@@ -76,6 +79,9 @@ services:
       - REGISTRY_FILE=${PROVISION_DIR}/generated/user_registry.yml
       - NGINX_CONTAINER=provision-nginx          # which container to connect/reload
       - DOCKER_OPS_LOG=${PROVISION_DIR}/generated/docker_ops.log  # optional debug log
+      - TASK_LOG_DIR=${PROVISION_DIR}/generated/task_logs          # per-task isolated logs
+      - TASK_TTL_SECONDS=604800                                     # keep finished tasks 7 days
+      - TASK_MAX_COUNT=1000                                         # max tasks in memory
       - SSL_DIR=${PROVISION_DIR}/ssl              # base directory for TLS certificates
     restart: unless-stopped
 

@@ -12,11 +12,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from lib import docker_ops, registry
+from lib import docker_ops, registry, template_engine
 
 
 def parse_args() -> argparse.Namespace:
@@ -25,31 +23,40 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _expected_services_from_compose(compose_file: str) -> list[str]:
-    """Parse service names from a generated compose file."""
-    if not Path(compose_file).exists():
-        return []
-    with open(compose_file) as f:
-        data = yaml.safe_load(f) or {}
-    return list(data.get("services", {}).keys())
+def _expected_container_names(entry: dict) -> list[str]:
+    """Return full container names — from registry or compose file fallback."""
+    stored = entry.get("container_names")
+    if stored:
+        return stored
 
-
-def _container_name_for_service(entry: dict, svc_key: str) -> str:
-    """Derive the expected container name: {service_name}-user_{user_name}-{label}-{svc_key}."""
-    prefix = f"{entry['service_name']}-user_{entry['user_name']}-{entry['label']}-"
-    return f"{prefix}{svc_key}"
+    # Backward compat: derive from compose file
+    compose_file = entry.get("compose_file_path", "")
+    if compose_file and Path(compose_file).exists():
+        try:
+            import yaml
+            with open(compose_file) as f:
+                data = yaml.safe_load(f) or {}
+            prefix = template_engine.container_prefix(
+                entry.get("service_name", ""),
+                entry.get("user_name", ""),
+                str(entry.get("label", "0")),
+            )
+            svc_keys = list(data.get("services", {}).keys())
+            return [f"{prefix}{k}" for k in svc_keys]
+        except Exception:
+            pass
+    return []
 
 
 def _build_service_status(entry: dict, running: dict[str, str]) -> dict[str, Any]:
     compose_file = entry.get("compose_file_path", "")
-    expected_keys = _expected_services_from_compose(compose_file)
+    expected_names = _expected_container_names(entry)
 
     healthy: dict[str, str] = {}
     unhealthy: dict[str, str] = {}
     missing: dict[str, str] = {}
 
-    for svc_key in expected_keys:
-        cname = _container_name_for_service(entry, svc_key)
+    for cname in expected_names:
         if cname in running:
             status = running[cname]
             # Docker status strings containing "healthy" or "Up" (without "unhealthy") are healthy
@@ -63,7 +70,7 @@ def _build_service_status(entry: dict, running: dict[str, str]) -> dict[str, Any
         else:
             missing[cname] = "not running"
 
-    is_healthy = len(healthy) == len(expected_keys) and not unhealthy and not missing
+    is_healthy = len(healthy) == len(expected_names) and not unhealthy and not missing
 
     return {
         "service_name": entry.get("service_name", ""),

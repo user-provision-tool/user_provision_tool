@@ -679,6 +679,222 @@ class TestDockerOps:
         assert "HTTP_PROXY=http://proxy:3128" in cmd
         assert "HTTPS_PROXY=http://proxy:3129" in cmd
 
+    def test_compose_stop_command(self, monkeypatch):
+        """compose_stop runs docker compose stop."""
+        calls = self._mock_run(monkeypatch)
+        docker_ops.compose_stop("/tmp/dc.yml")
+        assert calls[-1] == [
+            "docker", "compose", "-f", "/tmp/dc.yml", "stop"
+        ]
+
+    def test_compose_stop_with_env_file(self, monkeypatch):
+        """compose_stop with env file passes --env-file flag."""
+        calls = self._mock_run(monkeypatch)
+        docker_ops.compose_stop("/tmp/dc.yml", env_file="/tmp/.env.test")
+        assert "--env-file" in calls[-1]
+        assert "/tmp/.env.test" in calls[-1]
+
+    def test_compose_stop_with_project_name(self, monkeypatch):
+        """compose_stop with project_name passes --project-name flag."""
+        calls = self._mock_run(monkeypatch)
+        docker_ops.compose_stop("/tmp/dc.yml", project_name="myproj")
+        assert "--project-name" in calls[-1]
+        assert "myproj" in calls[-1]
+
+    # ── docker_info ──
+
+    def test_docker_info_parses_json(self, monkeypatch):
+        """docker_info returns container counts from docker info JSON."""
+        import subprocess as sp
+        fake_json = '{"Containers":10,"ContainersRunning":3,"ContainersPaused":1,"ContainersStopped":6}'
+        fake_result = sp.CompletedProcess([], 0, stdout=fake_json, stderr="")
+        monkeypatch.setattr(docker_ops.subprocess, "run", lambda *a, **kw: fake_result)
+        info = docker_ops.docker_info()
+        assert info["containers_total"] == 10
+        assert info["containers_running"] == 3
+        assert info["containers_paused"] == 1
+        assert info["containers_stopped"] == 6
+
+    def test_docker_info_handles_bad_json(self, monkeypatch):
+        """docker_info returns empty dict on invalid JSON."""
+        import subprocess as sp
+        fake_result = sp.CompletedProcess([], 0, stdout="not json", stderr="")
+        monkeypatch.setattr(docker_ops.subprocess, "run", lambda *a, **kw: fake_result)
+        assert docker_ops.docker_info() == {}
+
+    # ── container inspection helpers ──
+
+    def test_container_exists_true(self, monkeypatch):
+        """container_exists returns True when docker inspect succeeds."""
+        import subprocess as sp
+        monkeypatch.setattr(docker_ops.subprocess, "run",
+            lambda *a, **kw: sp.CompletedProcess([], 0, stdout="", stderr=""))
+        assert docker_ops.container_exists("mycontainer") is True
+
+    def test_container_exists_false(self, monkeypatch):
+        """container_exists returns False when docker inspect fails."""
+        import subprocess as sp
+        monkeypatch.setattr(docker_ops.subprocess, "run",
+            lambda *a, **kw: sp.CompletedProcess([], 1, stdout="", stderr=""))
+        assert docker_ops.container_exists("nonexistent") is False
+
+    def test_container_running_true(self, monkeypatch):
+        """container_running returns True when State.Running is true."""
+        fake_json = '[{"State": {"Running": true}}]'
+        import subprocess as sp
+        monkeypatch.setattr(docker_ops.subprocess, "run",
+            lambda *a, **kw: sp.CompletedProcess([], 0, stdout=fake_json, stderr=""))
+        assert docker_ops.container_running("running-container") is True
+
+    def test_container_running_false(self, monkeypatch):
+        """container_running returns False when State.Running is false."""
+        fake_json = '[{"State": {"Running": false}}]'
+        import subprocess as sp
+        monkeypatch.setattr(docker_ops.subprocess, "run",
+            lambda *a, **kw: sp.CompletedProcess([], 0, stdout=fake_json, stderr=""))
+        assert docker_ops.container_running("stopped-container") is False
+
+    def test_container_running_nonexistent(self, monkeypatch):
+        """container_running returns False when container doesn't exist."""
+        import subprocess as sp
+        monkeypatch.setattr(docker_ops.subprocess, "run",
+            lambda *a, **kw: sp.CompletedProcess([], 1, stdout="", stderr=""))
+        assert docker_ops.container_running("ghost") is False
+
+    def test_container_inspect_returns_dict(self, monkeypatch):
+        """container_inspect returns parsed JSON dict."""
+        fake_json = '[{"Id": "abc123", "Name": "/test-container"}]'
+        import subprocess as sp
+        monkeypatch.setattr(docker_ops.subprocess, "run",
+            lambda *a, **kw: sp.CompletedProcess([], 0, stdout=fake_json, stderr=""))
+        info = docker_ops.container_inspect("test-container")
+        assert info is not None
+        assert info["Id"] == "abc123"
+
+    def test_container_inspect_returns_none_on_failure(self, monkeypatch):
+        """container_inspect returns None when docker inspect fails."""
+        import subprocess as sp
+        monkeypatch.setattr(docker_ops.subprocess, "run",
+            lambda *a, **kw: sp.CompletedProcess([], 1, stdout="", stderr=""))
+        assert docker_ops.container_inspect("nope") is None
+
+    def test_container_inspect_returns_none_on_bad_json(self, monkeypatch):
+        """container_inspect returns None on invalid JSON."""
+        import subprocess as sp
+        monkeypatch.setattr(docker_ops.subprocess, "run",
+            lambda *a, **kw: sp.CompletedProcess([], 0, stdout="garbage", stderr=""))
+        assert docker_ops.container_inspect("bad") is None
+
+    # ── network helpers ──
+
+    def test_network_list_returns_names(self, monkeypatch):
+        """network_list returns list of network names."""
+        import subprocess as sp
+        monkeypatch.setattr(docker_ops.subprocess, "run",
+            lambda *a, **kw: sp.CompletedProcess([], 0, stdout="bridge\nhost\nmyapp-user_alice-0\n", stderr=""))
+        nets = docker_ops.network_list()
+        assert "myapp-user_alice-0" in nets
+        assert len(nets) == 3
+
+    def test_network_inspect_returns_dict(self, monkeypatch):
+        """network_inspect returns parsed JSON dict."""
+        fake_json = '[{"Name": "test-net", "Containers": {}}]'
+        import subprocess as sp
+        monkeypatch.setattr(docker_ops.subprocess, "run",
+            lambda *a, **kw: sp.CompletedProcess([], 0, stdout=fake_json, stderr=""))
+        info = docker_ops.network_inspect("test-net")
+        assert info is not None
+        assert info["Name"] == "test-net"
+
+    def test_network_inspect_returns_none_on_failure(self, monkeypatch):
+        """network_inspect returns None when docker network inspect fails."""
+        import subprocess as sp
+        monkeypatch.setattr(docker_ops.subprocess, "run",
+            lambda *a, **kw: sp.CompletedProcess([], 1, stdout="", stderr=""))
+        assert docker_ops.network_inspect("ghost-net") is None
+
+    def test_network_connected_to_container_positive(self, monkeypatch):
+        """network_connected_to_container returns True when container is in network."""
+        fake_json = '[{"Name": "test-net", "Containers": {"abc": {"Name": "provision-nginx"}, "def": {"Name": "myapp-web"}}}]'
+        import subprocess as sp
+        monkeypatch.setattr(docker_ops.subprocess, "run",
+            lambda *a, **kw: sp.CompletedProcess([], 0, stdout=fake_json, stderr=""))
+        assert docker_ops.network_connected_to_container("test-net", "provision-nginx") is True
+
+    def test_network_connected_to_container_negative(self, monkeypatch):
+        """network_connected_to_container returns False when container is not in network."""
+        fake_json = '[{"Name": "test-net", "Containers": {"abc": {"Name": "other-container"}}}]'
+        import subprocess as sp
+        monkeypatch.setattr(docker_ops.subprocess, "run",
+            lambda *a, **kw: sp.CompletedProcess([], 0, stdout=fake_json, stderr=""))
+        assert docker_ops.network_connected_to_container("test-net", "provision-nginx") is False
+
+    # ── container_logs ──
+
+    def test_container_logs_returns_stdout(self, monkeypatch):
+        """container_logs returns stdout from docker logs."""
+        import subprocess as sp
+        monkeypatch.setattr(docker_ops.subprocess, "run",
+            lambda *a, **kw: sp.CompletedProcess([], 0, stdout="line1\nline2\nline3\n", stderr=""))
+        logs = docker_ops.container_logs("test-container", tail=50)
+        assert logs == "line1\nline2\nline3\n"
+
+    def test_container_logs_default_tail(self, monkeypatch):
+        """container_logs defaults to tail=100."""
+        calls: list[list[str]] = []
+        import subprocess as sp
+        def capture_run(args, **kw):
+            calls.append(list(args))
+            return sp.CompletedProcess([], 0, stdout="", stderr="")
+        monkeypatch.setattr(docker_ops.subprocess, "run", capture_run)
+        docker_ops.container_logs("test-container")
+        cmd = calls[0]
+        assert "--tail" in cmd
+        assert "100" in cmd
+
+    # ── orphan_network_cleanup ──
+
+    def test_orphan_network_cleanup_removes_when_only_nginx(self, monkeypatch):
+        """orphan_network_cleanup removes network when only nginx is connected."""
+        import subprocess as sp
+        call_args: list[list[str]] = []
+
+        def capture_run(args, **kw):
+            call_args.append(list(args))
+            if "inspect" in args:
+                return sp.CompletedProcess([], 0,
+                    stdout='[{"Name":"orphan-net","Containers":{"abc":{"Name":"provision-nginx"}}}]',
+                    stderr="")
+            return sp.CompletedProcess([], 0, stdout="", stderr="")
+
+        monkeypatch.setattr(docker_ops.subprocess, "run", capture_run)
+        # Mock network_disconnect to be a no-op
+        monkeypatch.setattr(docker_ops, "network_disconnect", lambda *a: None)
+
+        result = docker_ops.orphan_network_cleanup("orphan-net", "provision-nginx")
+        assert result is True
+        # Should have run docker network rm
+        rm_calls = [c for c in call_args if "rm" in c and "network" in c]
+        assert len(rm_calls) >= 1
+
+    def test_orphan_network_cleanup_keeps_when_other_containers(self, monkeypatch):
+        """orphan_network_cleanup does not remove network when other containers are connected."""
+        import subprocess as sp
+        fake_json = '[{"Name":"shared-net","Containers":{"abc":{"Name":"provision-nginx"},"def":{"Name":"myapp-web"}}}]'
+        monkeypatch.setattr(docker_ops.subprocess, "run",
+            lambda *a, **kw: sp.CompletedProcess([], 0, stdout=fake_json, stderr=""))
+        monkeypatch.setattr(docker_ops, "network_disconnect", lambda *a: None)
+
+        result = docker_ops.orphan_network_cleanup("shared-net", "provision-nginx")
+        assert result is False
+
+    def test_orphan_network_cleanup_nonexistent_network(self, monkeypatch):
+        """orphan_network_cleanup returns False for nonexistent network."""
+        import subprocess as sp
+        monkeypatch.setattr(docker_ops.subprocess, "run",
+            lambda *a, **kw: sp.CompletedProcess([], 1, stdout="", stderr=""))
+        assert docker_ops.orphan_network_cleanup("ghost-net") is False
+
 
 # ---------------------------------------------------------------------------
 # compose_converter
@@ -1635,6 +1851,140 @@ class TestProvisionerEnvFile:
         assert entry.get("ssl_certificate_path") == ""
         assert entry.get("ssl_certificate_key_path") == ""
 
+    # ── start_service / stop_service ──
+
+    def test_start_service_calls_compose_up(self):
+        """start_service looks up registry entry and calls compose_up."""
+        # Register a user first
+        provisioner.register_user(
+            user_name="upuser",
+            service_name="myapp",
+            label="0",
+            compose_template=COMPOSE_TEMPLATE,
+            output_dir=self.tmp_path,
+            user_data_dir=self.user_data_dir,
+        )
+        self.calls.clear()
+
+        result = provisioner.start_service(
+            user_name="upuser",
+            service_name="myapp",
+            label="0",
+        )
+        assert result["user_name"] == "upuser"
+        up_calls = [c for c in self.calls if "up" in c]
+        assert len(up_calls) >= 1, "Expected compose_up to be called"
+
+    def test_start_service_missing_registry_raises_keyerror(self):
+        """start_service raises KeyError when no registration exists."""
+        with pytest.raises(KeyError, match="No registration"):
+            provisioner.start_service(
+                user_name="ghost",
+                service_name="myapp",
+                label="0",
+            )
+
+    def test_stop_service_calls_compose_stop(self):
+        """stop_service looks up registry entry and calls compose_stop."""
+        provisioner.register_user(
+            user_name="downuser",
+            service_name="myapp",
+            label="0",
+            compose_template=COMPOSE_TEMPLATE,
+            output_dir=self.tmp_path,
+            user_data_dir=self.user_data_dir,
+        )
+        self.calls.clear()
+
+        result = provisioner.stop_service(
+            user_name="downuser",
+            service_name="myapp",
+            label="0",
+        )
+        assert result["user_name"] == "downuser"
+        stop_calls = [c for c in self.calls if "stop" in c]
+        assert len(stop_calls) >= 1, "Expected compose_stop to be called"
+
+    def test_stop_service_missing_registry_raises_keyerror(self):
+        """stop_service raises KeyError when no registration exists."""
+        with pytest.raises(KeyError, match="No registration"):
+            provisioner.stop_service(
+                user_name="ghost",
+                service_name="myapp",
+                label="0",
+            )
+
+    # ── change_password ──
+
+    def test_change_password_updates_registry_and_htpasswd(self):
+        """change_password re-hashes password, updates htpasswd file and registry."""
+        provisioner.register_user(
+            user_name="pwuser",
+            service_name="myapp",
+            label="0",
+            compose_template=COMPOSE_TEMPLATE,
+            nginx_template=NGINX_TEMPLATE,
+            output_dir=self.tmp_path,
+            nginx_output_dir=self.tmp_path,
+            user_data_dir=self.user_data_dir,
+            passwd="oldpass",
+        )
+        entry_before = registry.get_user_service("pwuser", "myapp", "0")
+        old_hash = entry_before.get("passwd", "")
+
+        result = provisioner.change_password(
+            user_name="pwuser",
+            service_name="myapp",
+            label="0",
+            passwd="newpass",
+            nginx_container="provision-nginx",
+        )
+        assert result["user_name"] == "pwuser"
+
+        entry_after = registry.get_user_service("pwuser", "myapp", "0")
+        new_hash = entry_after.get("passwd", "")
+        assert new_hash != old_hash, "Password hash should change"
+        assert new_hash.startswith("$2"), "Should be bcrypt hash"
+
+        # htpasswd file should contain new hash
+        htpasswd_path = entry_after.get("htpasswd_path", "")
+        assert htpasswd_path, "htpasswd_path should be set"
+        content = Path(htpasswd_path).read_text()
+        assert "pwuser:" in content
+
+    def test_change_password_missing_registry_raises_keyerror(self):
+        """change_password raises KeyError when no registration exists."""
+        with pytest.raises(KeyError, match="No registration"):
+            provisioner.change_password(
+                user_name="ghost",
+                service_name="myapp",
+                label="0",
+                passwd="secret",
+            )
+
+    # ── remove_user orphan network cleanup ──
+
+    def test_remove_user_includes_compose_down(self):
+        """remove_user calls compose_down to tear down containers."""
+        provisioner.register_user(
+            user_name="orphanuser",
+            service_name="myapp",
+            label="0",
+            compose_template=COMPOSE_TEMPLATE,
+            output_dir=self.tmp_path,
+            user_data_dir=self.user_data_dir,
+        )
+        self.calls.clear()
+
+        provisioner.remove_user(
+            user_name="orphanuser",
+            service_name="myapp",
+            label="0",
+            nginx_container="provision-nginx",
+        )
+        down_calls = [c for c in self.calls if "down" in c]
+        assert len(down_calls) >= 1, "Expected compose_down to be called during removal"
+
 
 # ---------------------------------------------------------------------------
 # api — project_root bare-name resolution
@@ -1741,3 +2091,335 @@ class TestAPIProjectRoot:
             passwd="secret",
         )
         assert result["status"] == "registered"
+
+
+# ---------------------------------------------------------------------------
+# api — FastAPI TestClient tests for new endpoints (P1-P6)
+# ---------------------------------------------------------------------------
+
+
+class TestAPINewEndpoints:
+    """Test new API endpoints using FastAPI TestClient with mocked docker_ops."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, tmp_path, monkeypatch):
+        """Set up TestClient with mocked docker/provisioner dependencies."""
+        import api
+        from lib import registry as reg_mod, docker_ops, provisioner
+        from fastapi.testclient import TestClient
+
+        gen_dir = tmp_path / "generated"
+        ud_dir = tmp_path / "user_data"
+        sp_dir = tmp_path / "source_projects"
+        ssl_dir = tmp_path / "ssl"
+        gen_dir.mkdir()
+        ud_dir.mkdir()
+        sp_dir.mkdir()
+        ssl_dir.mkdir()
+
+        monkeypatch.setattr(api, "GENERATED_DIR", gen_dir)
+        monkeypatch.setattr(api, "USER_DATA_DIR", ud_dir)
+        monkeypatch.setattr(api, "SOURCE_PROJECTS_DIR", sp_dir)
+        monkeypatch.setattr(api, "SSL_DIR", ssl_dir)
+        monkeypatch.setattr(reg_mod, "REGISTRY_FILE", tmp_path / "user_registry.yml")
+
+        # Mock docker_ops subprocess.Popen
+        class _FakeProc:
+            def __init__(self, args, **kwargs):
+                self.returncode = 0
+                self.stdout = io.StringIO("")
+                self.stderr = io.StringIO("")
+            def wait(self): pass
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+
+        monkeypatch.setattr(docker_ops.subprocess, "Popen", _FakeProc)
+
+        # Track calls for later assertions
+        self.mock_calls: list[list[str]] = []
+
+        def fake_run(args, **kwargs):
+            self.mock_calls.append(list(args))
+            import subprocess as sp
+            return sp.CompletedProcess(args, 0, stdout="[]", stderr="")
+
+        self._fake_run = fake_run
+
+        self.client = TestClient(api.app)
+        self.tmp_path = tmp_path
+        self.gen_dir = gen_dir
+        self.api = api
+
+    # ── GET /docker/ps ──
+
+    def test_docker_ps_returns_list(self, monkeypatch):
+        """GET /docker/ps returns container list."""
+        import subprocess as sp
+        monkeypatch.setattr(self.api.docker_ops.subprocess, "run", self._fake_run)
+        response = self.client.get("/docker/ps")
+        assert response.status_code == 200
+        assert isinstance(response.json(), list)
+
+    # ── GET /docker/stats ──
+
+    def test_docker_stats_returns_list(self, monkeypatch):
+        """GET /docker/stats returns stats list."""
+        import subprocess as sp
+        monkeypatch.setattr(self.api.docker_ops.subprocess, "run", self._fake_run)
+        response = self.client.get("/docker/stats")
+        assert response.status_code == 200
+        assert isinstance(response.json(), list)
+
+    # ── GET /docker/info ──
+
+    def test_docker_info_endpoint(self, monkeypatch):
+        """GET /docker/info returns docker system info."""
+        import subprocess as sp
+        fake_json = '{"Containers":5,"ContainersRunning":2,"ContainersPaused":0,"ContainersStopped":3}'
+        monkeypatch.setattr(self.api.docker_ops.subprocess, "run",
+            lambda *a, **kw: sp.CompletedProcess([], 0, stdout=fake_json, stderr=""))
+        response = self.client.get("/docker/info")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["containers_total"] == 5
+        assert data["containers_running"] == 2
+
+    # ── GET /host/stats ──
+
+    def test_host_stats_returns_dict(self):
+        """GET /host/stats returns host resource usage."""
+        response = self.client.get("/host/stats")
+        assert response.status_code == 200
+        data = response.json()
+        assert "mem_percent" in data
+        assert "cpu_percent" in data
+        assert "disk_percent" in data
+
+    # ── Reconciliation helpers ──
+
+    def test_container_exists_endpoint(self, monkeypatch):
+        """GET /docker/container/{c}/exists returns exists bool."""
+        import subprocess as sp
+        monkeypatch.setattr(self.api.docker_ops.subprocess, "run",
+            lambda *a, **kw: sp.CompletedProcess([], 0, stdout="", stderr=""))
+        response = self.client.get("/docker/container/test-container/exists")
+        assert response.status_code == 200
+        assert response.json()["exists"] is True
+
+    def test_container_running_endpoint(self, monkeypatch):
+        """GET /docker/container/{c}/running returns running bool."""
+        import subprocess as sp
+        fake_json = '[{"State": {"Running": true}}]'
+        monkeypatch.setattr(self.api.docker_ops.subprocess, "run",
+            lambda *a, **kw: sp.CompletedProcess([], 0, stdout=fake_json, stderr=""))
+        response = self.client.get("/docker/container/test-container/running")
+        assert response.status_code == 200
+        assert response.json()["running"] is True
+
+    def test_network_connect_endpoint(self, monkeypatch):
+        """POST /docker/network/{n}/connect/{c} returns connected=True."""
+        monkeypatch.setattr(self.api.docker_ops, "network_connect", lambda *a, **kw: None)
+        response = self.client.post("/docker/network/testnet/connect/provision-nginx")
+        assert response.status_code == 200
+        assert response.json()["connected"] is True
+
+    def test_nginx_reload_endpoint(self, monkeypatch):
+        """POST /docker/nginx/reload returns reloaded=True."""
+        monkeypatch.setattr(self.api.docker_ops, "nginx_reload", lambda *a: None)
+        response = self.client.post("/docker/nginx/reload")
+        assert response.status_code == 200
+        assert response.json()["reloaded"] is True
+
+    # ── POST /users/.../up ──
+
+    def test_up_endpoint_success(self, monkeypatch):
+        """POST /users/{u}/services/{s}/{l}/up returns 200 on success."""
+        # First register a user
+        self._register_user("upuser", monkeypatch)
+
+        # Mock start_service to succeed
+        monkeypatch.setattr(self.api.provisioner, "start_service",
+            lambda **kw: {"user_name": kw["user_name"], "service_name": kw["service_name"], "label": kw["label"]})
+
+        response = self.client.post("/users/upuser/services/myapp/0/up")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "up"
+        assert "Service started" in data["message"]
+
+    def test_up_endpoint_not_found(self, monkeypatch):
+        """POST /users/{u}/services/{s}/{l}/up returns 404 when not registered."""
+        monkeypatch.setattr(self.api.provisioner, "start_service",
+            lambda **kw: (_ for _ in ()).throw(KeyError("No registration found")))
+        response = self.client.post("/users/ghost/services/myapp/0/up")
+        assert response.status_code == 404
+
+    # ── POST /users/.../down ──
+
+    def test_down_endpoint_success(self, monkeypatch):
+        """POST /users/{u}/services/{s}/{l}/down returns 200 on success."""
+        self._register_user("downuser", monkeypatch)
+
+        monkeypatch.setattr(self.api.provisioner, "stop_service",
+            lambda **kw: {"user_name": kw["user_name"], "service_name": kw["service_name"], "label": kw["label"]})
+
+        response = self.client.post("/users/downuser/services/myapp/0/down")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "down"
+        assert "Service stopped" in data["message"]
+
+    def test_down_endpoint_not_found(self, monkeypatch):
+        """POST /users/{u}/services/{s}/{l}/down returns 404 when not registered."""
+        monkeypatch.setattr(self.api.provisioner, "stop_service",
+            lambda **kw: (_ for _ in ()).throw(KeyError("No registration found")))
+        response = self.client.post("/users/ghost/services/myapp/0/down")
+        assert response.status_code == 404
+
+    # ── PUT /users/.../password ──
+
+    def test_password_endpoint_success(self, monkeypatch):
+        """PUT /users/{u}/services/{s}/{l}/password returns 200 on success."""
+        self._register_user("pwuser", monkeypatch)
+
+        monkeypatch.setattr(self.api.provisioner, "change_password",
+            lambda **kw: {"user_name": kw["user_name"], "service_name": kw["service_name"], "label": kw["label"]})
+
+        response = self.client.put(
+            "/users/pwuser/services/myapp/0/password",
+            json={"passwd": "newsecret"},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert "Password updated" in data["message"]
+
+    def test_password_endpoint_not_found(self, monkeypatch):
+        """PUT /users/{u}/services/{s}/{l}/password returns 404 when not registered."""
+        monkeypatch.setattr(self.api.provisioner, "change_password",
+            lambda **kw: (_ for _ in ()).throw(KeyError("No registration found")))
+        response = self.client.put(
+            "/users/ghost/services/myapp/0/password",
+            json={"passwd": "secret"},
+        )
+        assert response.status_code == 404
+
+    # ── GET /nginx/connections ──
+
+    def test_nginx_connections_endpoint(self, monkeypatch):
+        """GET /nginx/connections returns nginx connection state."""
+        import subprocess as sp
+        # Mock container_inspect to return empty networks
+        fake_json = '[{"NetworkSettings": {"Networks": {}}}]'
+        monkeypatch.setattr(self.api.docker_ops.subprocess, "run",
+            lambda *a, **kw: sp.CompletedProcess([], 0, stdout=fake_json, stderr=""))
+        response = self.client.get("/nginx/connections")
+        assert response.status_code == 200
+        data = response.json()
+        assert "nginx_container" in data
+        assert "connected_networks" in data
+        assert "conf_files" in data
+        assert "upstreams" in data
+
+    # ── POST /nginx/reconnect-all ──
+
+    def test_nginx_reconnect_all_endpoint(self, monkeypatch):
+        """POST /nginx/reconnect-all returns reconnect results."""
+        monkeypatch.setattr(self.api.docker_ops, "network_connect", lambda *a, **kw: None)
+        monkeypatch.setattr(self.api.docker_ops, "nginx_reload", lambda *a: None)
+        response = self.client.post("/nginx/reconnect-all")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["nginx_reloaded"] is True
+        assert "total_networks" in data
+
+    # ── GET /users/.../containers/{c}/logs ──
+
+    def test_container_logs_endpoint(self, monkeypatch):
+        """GET /users/{u}/services/{s}/{l}/containers/{c}/logs returns logs."""
+        self._register_user("loguser", monkeypatch)
+
+        import subprocess as sp
+        monkeypatch.setattr(self.api.docker_ops.subprocess, "run",
+            lambda *a, **kw: sp.CompletedProcess([], 0, stdout="line1\nline2\n", stderr=""))
+
+        response = self.client.get("/users/loguser/services/myapp/0/containers/web/logs?tail=50")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["tail"] == 50
+        assert "logs" in data
+        assert data["container"].endswith("web")
+
+    def test_container_logs_endpoint_not_found(self, monkeypatch):
+        """GET /users/.../containers/{c}/logs returns 404 when user not registered."""
+        response = self.client.get("/users/ghost/services/myapp/0/containers/web/logs")
+        assert response.status_code == 404
+
+    # ── GET /tasks/{task_id}/log (SSE) ──
+
+    def test_task_log_endpoint_returns_sse(self, monkeypatch):
+        """GET /tasks/{task_id}/log returns SSE stream."""
+        import subprocess as sp
+        # First, submit a task to get a valid task_id
+        monkeypatch.setattr(self.api.docker_ops.subprocess, "run", self._fake_run)
+        monkeypatch.setattr(self.api.docker_ops, "network_connect", lambda *a, **kw: None)
+        monkeypatch.setattr(self.api.docker_ops, "nginx_reload", lambda *a: None)
+        monkeypatch.setattr(self.api.provisioner, "register_user",
+            lambda **kw: {"entry": {"user_name": kw["user_name"]}, "volume_warnings": {}})
+
+        # Submit async registration
+        resp = self.client.post("/users", json={
+            "user_name": "sseloguser",
+            "service_name": "myapp",
+            "compose_template_path": COMPOSE_TEMPLATE,
+            "label": "0",
+        })
+        assert resp.status_code == 202
+        task_id = resp.json()["task_id"]
+
+        # Poll the SSE log endpoint (follow=false for test)
+        response = self.client.get(f"/tasks/{task_id}/log?follow=false")
+        assert response.status_code == 200
+        assert "text/event-stream" in response.headers["content-type"]
+
+    # ── GET /health ──
+
+    def test_health_endpoint(self):
+        """GET /health returns ok."""
+        response = self.client.get("/health")
+        assert response.status_code == 200
+        assert response.json()["status"] == "ok"
+
+    # ── GET /tasks ──
+
+    def test_tasks_list_endpoint(self):
+        """GET /tasks returns task list."""
+        response = self.client.get("/tasks")
+        assert response.status_code == 200
+        data = response.json()
+        assert "count" in data
+        assert "tasks" in data
+
+    # ── Helper: register a user for dependent tests ──
+
+    def _register_user(self, user_name: str, monkeypatch):
+        """Helper to register a user via the API (sync mode)."""
+        from lib import registry as reg_mod
+
+        # Mock docker/provisioner for registration
+        monkeypatch.setattr(self.api.docker_ops, "network_connect", lambda *a, **kw: None)
+        monkeypatch.setattr(self.api.docker_ops, "nginx_reload", lambda *a: None)
+
+        import subprocess as sp
+        monkeypatch.setattr(self.api.docker_ops.subprocess, "run",
+            lambda *a, **kw: sp.CompletedProcess([], 0, stdout="[]", stderr=""))
+
+        response = self.client.post(f"/users?sync=true", json={
+            "user_name": user_name,
+            "service_name": "myapp",
+            "compose_template_path": COMPOSE_TEMPLATE,
+            "label": "0",
+            "domain": "localhost",
+            "passwd": "secret",
+        })
+        assert response.status_code == 202, f"Register {user_name} failed: {response.text}"
+        return response.json()

@@ -32,4 +32,4 @@ _ref/
 .github/
 example/
 */tests/fixtures/docker-compose.user-*
-
+_ignore/

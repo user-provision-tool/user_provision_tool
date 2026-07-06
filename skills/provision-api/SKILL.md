@@ -164,6 +164,69 @@ curl -X DELETE http://localhost:8765/users/alice/services/myapp/0
 # → 202 {"task_id": "b2c3d4e5f6a7", "status": "pending", "type": "remove"}
 ```
 
+### Start / Stop a service
+
+```bash
+# Start (docker compose up -d)
+curl -X POST http://localhost:8765/users/alice/services/myapp/0/up
+# → 200 {"message": "Service started.", "status": "up"}
+
+# Stop (docker compose stop)
+curl -X POST http://localhost:8765/users/alice/services/myapp/0/down
+# → 200 {"message": "Service stopped.", "status": "down"}
+```
+
+### Change password
+
+```bash
+curl -X PUT http://localhost:8765/users/alice/services/myapp/0/password \
+  -H 'Content-Type: application/json' \
+  -d '{"passwd": "newsecret"}'
+# → 200 {"message": "Password updated. Nginx reloaded.", ...}
+```
+
+### Container logs
+
+```bash
+curl "http://localhost:8765/users/alice/services/myapp/0/containers/web/logs?tail=50"
+# → 200 {"container": "myapp-user_alice-0-web", "tail": 50, "logs": [...]}
+```
+
+### Docker / host monitoring
+
+```bash
+curl http://localhost:8765/docker/ps          # all containers
+curl http://localhost:8765/docker/stats        # per-container resource stats
+curl http://localhost:8765/docker/info         # docker host info (container counts)
+curl http://localhost:8765/host/stats          # host CPU/memory/disk
+```
+
+### Nginx state management
+
+```bash
+# View nginx connections and upstreams
+curl http://localhost:8765/nginx/connections
+
+# Reconnect provision-nginx to all user networks + reload
+curl -X POST http://localhost:8765/nginx/reconnect-all
+```
+
+### SSE build log streaming
+
+```bash
+# Stream real-time build logs (Server-Sent Events)
+curl http://localhost:8765/tasks/{task_id}/log
+```
+
+### Reconciliation helpers (used by provision-gateway)
+
+```bash
+curl http://localhost:8765/docker/container/provision-nginx/exists
+curl http://localhost:8765/docker/container/provision-nginx/running
+curl -X POST http://localhost:8765/docker/network/mynet/connect/provision-nginx
+curl -X POST http://localhost:8765/docker/nginx/reload
+```
+
 ---
 
 ## Request Parameters
@@ -197,10 +260,23 @@ curl -X DELETE http://localhost:8765/users/alice/services/myapp/0
 | `POST /users` | `202` → `task_id` | `404`, `422` |
 | `DELETE /users/...` | `202` → `task_id` | `404` |
 | `POST .../rebuild` | `202` → `task_id` | `404` |
+| `POST .../up` | `200` | `404`, `500` |
+| `POST .../down` | `200` | `404`, `500` |
+| `PUT .../password` | `200` | `404` |
+| `GET .../containers/{c}/logs` | `200` | `404` |
 | `GET /users`, `GET /users/{name}` | `200` | `404` |
 | `GET /tasks` | `200` | — |
 | `GET /tasks/{id}` | `200` | `404` |
+| `GET /tasks/{id}/log` | `200` (SSE) | — |
 | `DELETE /tasks/{id}` | `200` | `404`, `409` |
+| `GET /docker/ps`, `/stats`, `/info` | `200` | — |
+| `GET /host/stats` | `200` | — |
+| `GET /docker/container/{c}/exists` | `200` | — |
+| `GET /docker/container/{c}/running` | `200` | — |
+| `POST /docker/network/{n}/connect/{c}` | `200` | — |
+| `POST /docker/nginx/reload` | `200` | — |
+| `GET /nginx/connections` | `200` | — |
+| `POST /nginx/reconnect-all` | `200` | — |
 
 ## Task Lifecycle
 

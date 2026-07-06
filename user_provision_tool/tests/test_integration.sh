@@ -1509,6 +1509,348 @@ curl -sf -X DELETE "$API_URL/users/autohttps/services/myapp/0" >/dev/null 2>&1 |
 rm -f "$AUTOHTTPS_CERT_SRC" "$AUTOHTTPS_KEY_SRC"
 
 # ---------------------------------------------------------------------------
+# Test 28: GET /docker/ps — list all containers
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- Test 28: GET /docker/ps ---"
+docker_ps_resp=$(curl -sf "$API_URL/docker/ps")
+docker_ps_count=$(echo "$docker_ps_resp" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "0")
+if [ "$docker_ps_count" -ge 1 ]; then
+    pass "GET /docker/ps returned $docker_ps_count container(s)"
+else
+    fail "GET /docker/ps returned 0 containers: $docker_ps_resp"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 29: GET /docker/stats — per-container resource stats
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- Test 29: GET /docker/stats ---"
+docker_stats_resp=$(curl -sf "$API_URL/docker/stats")
+docker_stats_count=$(echo "$docker_stats_resp" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "0")
+# May be 0 if docker stats snapshot doesn't have data, just check no error
+stats_http=$(curl -s -o /dev/null -w "%{http_code}" "$API_URL/docker/stats")
+if [ "$stats_http" = "200" ]; then
+    pass "GET /docker/stats returned HTTP 200 ($docker_stats_count container stats)"
+else
+    fail "GET /docker/stats returned HTTP $stats_http"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 30: GET /docker/info — docker host info
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- Test 30: GET /docker/info ---"
+docker_info_resp=$(curl -sf "$API_URL/docker/info")
+dc_total=$(echo "$docker_info_resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('containers_total',0))" 2>/dev/null || echo "0")
+if [ "$dc_total" -ge 1 ]; then
+    pass "GET /docker/info reports containers_total=$dc_total"
+else
+    fail "GET /docker/info returned unexpected: $docker_info_resp"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 31: GET /host/stats — host-level CPU/memory/disk
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- Test 31: GET /host/stats ---"
+host_stats_resp=$(curl -sf "$API_URL/host/stats")
+host_cpu=$(echo "$host_stats_resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('cpu_percent',-1))" 2>/dev/null || echo "-1")
+host_mem=$(echo "$host_stats_resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('mem_percent',-1))" 2>/dev/null || echo "-1")
+host_disk=$(echo "$host_stats_resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('disk_percent',-1))" 2>/dev/null || echo "-1")
+if [ "$host_cpu" != "-1" ] && [ "$host_mem" != "-1" ] && [ "$host_disk" != "-1" ]; then
+    pass "GET /host/stats returned cpu=$host_cpu%, mem=$host_mem%, disk=$host_disk%"
+else
+    fail "GET /host/stats missing fields: $host_stats_resp"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 32: Reconciliation helpers — container exists / running
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- Test 32: Reconciliation helpers ---"
+# Check that a known container (provision-nginx) exists and is running
+nginx_exists=$(curl -sf "$API_URL/docker/container/provision-nginx/exists" | python3 -c "import sys,json; print(json.load(sys.stdin)['exists'])" 2>/dev/null || echo "false")
+nginx_running=$(curl -sf "$API_URL/docker/container/provision-nginx/running" | python3 -c "import sys,json; print(json.load(sys.stdin)['running'])" 2>/dev/null || echo "false")
+
+if [ "$nginx_exists" = "True" ]; then
+    pass "GET /docker/container/provision-nginx/exists → exists=True"
+else
+    fail "GET /docker/container/provision-nginx/exists → exists=$nginx_exists"
+fi
+
+if [ "$nginx_running" = "True" ]; then
+    pass "GET /docker/container/provision-nginx/running → running=True"
+else
+    fail "GET /docker/container/provision-nginx/running → running=$nginx_running"
+fi
+
+# Nonexistent container should return false
+ghost_exists=$(curl -sf "$API_URL/docker/container/ghost_nonexistent_12345/exists" | python3 -c "import sys,json; print(json.load(sys.stdin)['exists'])" 2>/dev/null || echo "error")
+if [ "$ghost_exists" = "False" ]; then
+    pass "GET /docker/container/ghost/exists → exists=False"
+else
+    fail "GET /docker/container/ghost/exists → exists=$ghost_exists"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 33: POST /docker/nginx/reload
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- Test 33: POST /docker/nginx/reload ---"
+reload_resp=$(curl -sf -X POST "$API_URL/docker/nginx/reload" -H "Content-Type: application/json")
+reload_ok=$(echo "$reload_resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('reloaded',False))" 2>/dev/null || echo "false")
+if [ "$reload_ok" = "True" ]; then
+    pass "POST /docker/nginx/reload → reloaded=True"
+else
+    fail "POST /docker/nginx/reload failed: $reload_resp"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 34: POST /nginx/reconnect-all
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- Test 34: POST /nginx/reconnect-all ---"
+reconnect_resp=$(curl -sf -X POST "$API_URL/nginx/reconnect-all" -H "Content-Type: application/json")
+reconnect_ok=$(echo "$reconnect_resp" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('nginx_reloaded',False))" 2>/dev/null || echo "false")
+reconnect_total=$(echo "$reconnect_resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total_networks',-1))" 2>/dev/null || echo "-1")
+if [ "$reconnect_ok" = "True" ]; then
+    pass "POST /nginx/reconnect-all → nginx_reloaded=True, total_networks=$reconnect_total"
+else
+    fail "POST /nginx/reconnect-all failed: $reconnect_resp"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 35: GET /nginx/connections
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- Test 35: GET /nginx/connections ---"
+nginx_conn_resp=$(curl -sf "$API_URL/nginx/connections")
+nginx_conn_container=$(echo "$nginx_conn_resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('nginx_container',''))" 2>/dev/null || echo "")
+nginx_conn_nets=$(echo "$nginx_conn_resp" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('connected_networks',[])))" 2>/dev/null || echo "0")
+nginx_conn_confs=$(echo "$nginx_conn_resp" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('conf_files',[])))" 2>/dev/null || echo "0")
+if [ -n "$nginx_conn_container" ]; then
+    pass "GET /nginx/connections → container=$nginx_conn_container, networks=$nginx_conn_nets, conf_files=$nginx_conn_confs"
+else
+    fail "GET /nginx/connections failed: $nginx_conn_resp"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 36: POST /users/.../up and /users/.../down — start/stop service
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- Test 36: up / down endpoints ---"
+
+# Register a temp user for up/down testing
+mkdir -p "${PROVISION_DIR}/user-data/updownuser/app" "${PROVISION_DIR}/user-data/updownuser/db"
+UP_BODY=$(cat <<EOF
+{
+  "user_name": "updownuser",
+  "service_name": "myapp",
+  "compose_template_path": "${PROVISION_DIR}/templates/docker-compose.template.yml.j2",
+  "label": "0",
+  "domain": "localhost",
+  "passwd": "",
+  "volumes": {
+    "app_data": "${PROVISION_DIR}/user-data/updownuser/app",
+    "db_data":  "${PROVISION_DIR}/user-data/updownuser/db"
+  }
+}
+EOF
+)
+up_reg=$(curl -sf -X POST "$API_URL/users?sync=true" \
+    -H "Content-Type: application/json" \
+    -d "$UP_BODY")
+up_reg_status=$(echo "$up_reg" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])" 2>/dev/null || echo "")
+if [ "$up_reg_status" = "registered" ]; then
+    pass "up/down test: user registered"
+else
+    fail "up/down test: registration failed: $up_reg"
+fi
+
+# Stop the service
+down_resp=$(curl -sf -X POST "$API_URL/users/updownuser/services/myapp/0/down" -H "Content-Type: application/json")
+down_status=$(echo "$down_resp" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])" 2>/dev/null || echo "")
+if [ "$down_status" = "down" ]; then
+    pass "POST .../down returned status=down"
+else
+    fail "POST .../down failed: $down_resp"
+fi
+
+# Verify containers are stopped
+sleep 2
+EXPECTED_UP_WEB="myapp-user_updownuser-0-web"
+web_running=$(docker ps --format '{{.Names}}' | grep -c "$EXPECTED_UP_WEB" || true)
+if [ "$web_running" -eq 0 ]; then
+    pass "Container $EXPECTED_UP_WEB is stopped after /down"
+else
+    fail "Container $EXPECTED_UP_WEB still running after /down"
+fi
+
+# Start the service again
+up_resp=$(curl -sf -X POST "$API_URL/users/updownuser/services/myapp/0/up" -H "Content-Type: application/json")
+up_status=$(echo "$up_resp" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])" 2>/dev/null || echo "")
+if [ "$up_status" = "up" ]; then
+    pass "POST .../up returned status=up"
+else
+    fail "POST .../up failed: $up_resp"
+fi
+
+# Verify containers are running again
+for i in $(seq 1 15); do
+    running=$(docker ps --format '{{.Names}}')
+    web_back=$(echo "$running" | grep -c "$EXPECTED_UP_WEB" || true)
+    if [ "$web_back" -ge 1 ]; then
+        break
+    fi
+    sleep 2
+done
+if [ "$web_back" -ge 1 ]; then
+    pass "Container $EXPECTED_UP_WEB is running again after /up"
+else
+    fail "Container $EXPECTED_UP_WEB not running after /up"
+fi
+
+# Clean up
+curl -sf -X DELETE "$API_URL/users/updownuser/services/myapp/0" >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
+# Test 37: PUT /users/.../password — change password
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- Test 37: Password change ---"
+
+# Register a user with default password
+PWD_REG_BODY=$(cat <<EOF
+{
+  "user_name": "pwduser",
+  "service_name": "myapp",
+  "compose_template_path": "${PROVISION_DIR}/templates/docker-compose.template.yml.j2",
+  "nginx_conf_template_path": "${PROVISION_DIR}/templates/myapp.template.nginx.conf.j2",
+  "label": "0",
+  "domain": "localhost",
+  "passwd": "oldpass"
+}
+EOF
+)
+pwd_reg=$(curl -sf -X POST "$API_URL/users?sync=true" \
+    -H "Content-Type: application/json" \
+    -d "$PWD_REG_BODY")
+pwd_reg_status=$(echo "$pwd_reg" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])" 2>/dev/null || echo "")
+if [ "$pwd_reg_status" = "registered" ]; then
+    pass "password test: user registered"
+else
+    fail "password test: registration failed: $pwd_reg"
+fi
+
+# Read current htpasswd hash
+PWD_HTPASSWD_FILE="${PROVISION_DIR}/generated/myapp.user-pwduser.0.htpasswd"
+old_hash=""
+if [ -f "$PWD_HTPASSWD_FILE" ]; then
+    old_hash=$(head -1 "$PWD_HTPASSWD_FILE")
+fi
+
+# Change password
+pwd_change_resp=$(curl -sf -X PUT "$API_URL/users/pwduser/services/myapp/0/password" \
+    -H "Content-Type: application/json" \
+    -d '{"passwd": "newpass456"}')
+pwd_change_msg=$(echo "$pwd_change_resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('message',''))" 2>/dev/null || echo "")
+if echo "$pwd_change_msg" | grep -q "Password updated"; then
+    pass "PUT .../password returned message='$pwd_change_msg'"
+else
+    fail "PUT .../password failed: $pwd_change_resp"
+fi
+
+# Verify htpasswd file changed
+if [ -f "$PWD_HTPASSWD_FILE" ]; then
+    new_hash=$(head -1 "$PWD_HTPASSWD_FILE")
+    if [ "$new_hash" != "$old_hash" ]; then
+        pass "Password change: htpasswd hash updated (old ≠ new)"
+    else
+        fail "Password change: htpasswd hash did NOT change"
+    fi
+    # Should start with pwduser:$2 (bcrypt)
+    if echo "$new_hash" | grep -qE "^pwduser:\\\$2"; then
+        pass "Password change: htpasswd has bcrypt hash"
+    else
+        fail "Password change: htpasswd hash malformed: $new_hash"
+    fi
+else
+    fail "htpasswd file not found at: $PWD_HTPASSWD_FILE"
+fi
+
+# Clean up
+curl -sf -X DELETE "$API_URL/users/pwduser/services/myapp/0" >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
+# Test 38: GET /users/.../containers/.../logs — container logs
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- Test 38: Container logs ---"
+
+# Register a user
+LOG_REG_BODY=$(cat <<EOF
+{
+  "user_name": "loguser",
+  "service_name": "myapp",
+  "compose_template_path": "${PROVISION_DIR}/templates/docker-compose.template.yml.j2",
+  "label": "0",
+  "domain": "localhost",
+  "passwd": "",
+  "volumes": {
+    "app_data": "${PROVISION_DIR}/user-data/updownuser/app",
+    "db_data":  "${PROVISION_DIR}/user-data/updownuser/db"
+  }
+}
+EOF
+)
+log_reg=$(curl -sf -X POST "$API_URL/users?sync=true" \
+    -H "Content-Type: application/json" \
+    -d "$LOG_REG_BODY")
+log_reg_status=$(echo "$log_reg" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])" 2>/dev/null || echo "")
+if [ "$log_reg_status" = "registered" ]; then
+    pass "log test: user registered"
+else
+    fail "log test: registration failed: $log_reg"
+fi
+
+# Get container logs for the web container
+LOG_WEB="myapp-user_loguser-0-web"
+log_resp=$(curl -sf "$API_URL/users/loguser/services/myapp/0/containers/web/logs?tail=10")
+log_container=$(echo "$log_resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('container',''))" 2>/dev/null || echo "")
+log_lines=$(echo "$log_resp" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('logs',[])))" 2>/dev/null || echo "0")
+if [ "$log_container" = "$LOG_WEB" ]; then
+    pass "GET container logs → container=$log_container, lines=$log_lines"
+else
+    fail "GET container logs failed: $log_resp"
+fi
+
+# 404 for nonexistent container
+log_404=$(curl -s -o /dev/null -w "%{http_code}" "$API_URL/users/loguser/services/myapp/0/containers/ghost/logs")
+if [ "$log_404" = "404" ]; then
+    pass "GET container logs for nonexistent container returns 404"
+else
+    fail "Expected 404 for nonexistent container logs, got: $log_404"
+fi
+
+# Clean up
+curl -sf -X DELETE "$API_URL/users/loguser/services/myapp/0" >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
+# Test 39: GET /tasks/{task_id}/log — SSE build log streaming
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- Test 39: SSE build log streaming ---"
+# The log endpoint should return SSE content-type
+SSE_LOG_URL="$API_URL/tasks/fake-task-id/log?follow=false"
+sse_content_type=$(curl -s -o /dev/null -w "%{content_type}" "$SSE_LOG_URL" 2>/dev/null || echo "")
+if echo "$sse_content_type" | grep -q "text/event-stream"; then
+    pass "GET /tasks/{id}/log returns Content-Type: $sse_content_type"
+else
+    fail "GET /tasks/{id}/log Content-Type was '$sse_content_type', expected text/event-stream"
+fi
+
+# ---------------------------------------------------------------------------
 # Results
 # ---------------------------------------------------------------------------
 echo ""

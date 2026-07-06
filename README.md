@@ -138,7 +138,43 @@ curl -X POST "http://localhost:8765/users/alice/services/myapp/0/rebuild?sync=tr
 curl -X DELETE "http://localhost:8765/users/alice/services/myapp/0?sync=true"
 ```
 
-**8. Register with HTTPS**
+**8. Start / stop a service**
+```bash
+curl -X POST http://localhost:8765/users/alice/services/myapp/0/up
+curl -X POST http://localhost:8765/users/alice/services/myapp/0/down
+```
+
+**9. Change password**
+```bash
+curl -X PUT http://localhost:8765/users/alice/services/myapp/0/password \
+  -H 'Content-Type: application/json' -d '{"passwd": "newsecret"}'
+```
+
+**10. Container logs**
+```bash
+curl "http://localhost:8765/users/alice/services/myapp/0/containers/web/logs?tail=50"
+```
+
+**11. Docker / host monitoring**
+```bash
+curl http://localhost:8765/docker/ps          # list all containers
+curl http://localhost:8765/docker/stats        # per-container resource stats
+curl http://localhost:8765/docker/info         # docker host info
+curl http://localhost:8765/host/stats          # host CPU/memory/disk
+```
+
+**12. Nginx state**
+```bash
+curl http://localhost:8765/nginx/connections     # nginx networks + upstreams
+curl -X POST http://localhost:8765/nginx/reconnect-all  # reconnect to all networks
+```
+
+**13. SSE build log streaming**
+```bash
+curl http://localhost:8765/tasks/{task_id}/log   # real-time build log (SSE)
+```
+
+**14. Register with HTTPS**
 ```bash
 # Full path — certs are copied to $PROVISION_DIR/ssl/example.com/
 curl -X POST "http://localhost:8765/users?sync=true" \

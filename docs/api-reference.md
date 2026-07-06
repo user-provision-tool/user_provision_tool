@@ -19,9 +19,24 @@ add `?sync=true` to any mutable endpoint.
 | `GET` | `/users/{user_name}` | Status of one user |
 | `DELETE` | `/users/{user_name}/services/{service_name}/{label}` | Stop and deregister a service (async → `task_id`) |
 | `POST` | `/users/{user_name}/services/{service_name}/{label}/rebuild` | Rebuild and restart containers (async → `task_id`) |
+| `POST` | `/users/{user_name}/services/{service_name}/{label}/up` | Start a service's containers |
+| `POST` | `/users/{user_name}/services/{service_name}/{label}/down` | Stop a service's containers |
+| `PUT` | `/users/{user_name}/services/{service_name}/{label}/password` | Change a user's password |
+| `GET` | `/users/{user_name}/services/{service_name}/{label}/containers/{container}/logs` | Get container logs |
 | `GET` | `/tasks` | List all tasks in the pool |
 | `GET` | `/tasks/{task_id}` | Query task status / result |
+| `GET` | `/tasks/{task_id}/log` | SSE stream of build log output |
 | `DELETE` | `/tasks/{task_id}` | Cancel a pending or running task |
+| `GET` | `/docker/ps` | List all Docker containers |
+| `GET` | `/docker/stats` | Per-container resource stats snapshot |
+| `GET` | `/docker/info` | Docker host info (container counts) |
+| `GET` | `/host/stats` | Host-level CPU/memory/disk usage |
+| `GET` | `/docker/container/{container}/exists` | Check if container exists |
+| `GET` | `/docker/container/{container}/running` | Check if container is running |
+| `POST` | `/docker/network/{network}/connect/{container}` | Connect container to network |
+| `POST` | `/docker/nginx/reload` | Reload provision-nginx |
+| `GET` | `/nginx/connections` | Nginx connection state (networks, confs, upstreams) |
+| `POST` | `/nginx/reconnect-all` | Reconnect nginx to all user networks and reload |
 
 ---
 
@@ -394,6 +409,263 @@ A service is **missing** when its compose file does not exist (e.g. was deleted 
 
 ---
 
+## `POST /users/{user_name}/services/{service_name}/{label}/up` — Start Service
+
+Starts a stopped service's containers (`docker compose up -d`).
+
+**Response `200`**
+```json
+{ "message": "Service started.", "status": "up" }
+```
+
+**Error codes**
+
+| Code | Cause |
+|---|---|
+| `404` | No registration found, or compose file missing |
+| `500` | `docker compose up` failed |
+
+---
+
+## `POST /users/{user_name}/services/{service_name}/{label}/down` — Stop Service
+
+Stops a service's containers without removing them (`docker compose stop`).
+
+**Response `200`**
+```json
+{ "message": "Service stopped.", "status": "down" }
+```
+
+**Error codes**
+
+| Code | Cause |
+|---|---|
+| `404` | No registration found, or compose file missing |
+| `500` | `docker compose stop` failed |
+
+---
+
+## `PUT /users/{user_name}/services/{service_name}/{label}/password` — Change Password
+
+Re-hashes the password, updates the `.htpasswd` file and registry, then reloads nginx.
+
+**Request body**
+```json
+{ "passwd": "newsecret" }
+```
+
+**Response `200`**
+```json
+{
+  "message": "Password updated. Nginx reloaded.",
+  "user_name": "alice",
+  "service_name": "myapp",
+  "label": "0"
+}
+```
+
+**Error codes**
+
+| Code | Cause |
+|---|---|
+| `404` | No registration found, or htpasswd file missing |
+
+---
+
+## `GET /users/{user_name}/services/{service_name}/{label}/containers/{container}/logs` — Container Logs
+
+Returns the last N lines of a container's logs. The `{container}` path parameter is the
+**short service name** from the compose file (e.g., `web`, `db`), not the full container name.
+
+**Query parameters**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `tail` | int | `100` | Number of log lines to return |
+
+**Response `200`**
+```json
+{
+  "container": "myapp-user_alice-0-web",
+  "tail": 100,
+  "logs": ["line1", "line2", "..."]
+}
+```
+
+**Error codes**
+
+| Code | Cause |
+|---|---|
+| `404` | No registration found, or container does not exist |
+
+---
+
+## `GET /tasks/{task_id}/log` — SSE Build Log Streaming
+
+Streams the build log via Server-Sent Events. Used by the dashboard to show real-time
+progress during register/rebuild tasks.
+
+**Query parameters**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `tail` | int | `200` | Number of recent lines to send first |
+| `follow` | bool | `true` | Keep streaming new lines (set `false` for one-shot) |
+
+**Response** — `Content-Type: text/event-stream`
+
+```
+data: line from log file
+data: another line
+event: done
+data: {}
+```
+
+The log file defaults to `$GENERATED_DIR/docker_ops.log`; override with the
+`DOCKER_OPS_LOG` environment variable.
+
+---
+
+## `GET /docker/ps` — List Containers
+
+Returns all Docker containers (`docker ps -a`).
+
+**Response `200`**
+```json
+[
+  { "name": "provision-nginx", "status": "Up 3 hours", "image": "nginx:alpine" },
+  { "name": "myapp-user_alice-0-web", "status": "Up 2 hours", "image": "myapp:latest" }
+]
+```
+
+---
+
+## `GET /docker/stats` — Container Resource Stats
+
+Returns a snapshot of per-container CPU/memory usage (`docker stats --no-stream`).
+
+**Response `200`**
+```json
+[
+  { "name": "provision-nginx", "cpu": "0.05%", "mem": "10.5MiB / 1.94GiB" }
+]
+```
+
+---
+
+## `GET /docker/info` — Docker Host Info
+
+Returns container counts from `docker info`.
+
+**Response `200`**
+```json
+{
+  "containers_total": 10,
+  "containers_running": 3,
+  "containers_paused": 1,
+  "containers_stopped": 6
+}
+```
+
+---
+
+## `GET /host/stats` — Host Resource Usage
+
+Returns host-level CPU, memory, and disk usage (reads `/proc/meminfo`, `/proc/stat`, and `shutil.disk_usage`).
+
+**Response `200`**
+```json
+{
+  "cpu_percent": 12.3,
+  "mem_percent": 45.6,
+  "mem_total_kb": 8192000,
+  "mem_used_kb": 3735552,
+  "disk_percent": 32.1,
+  "disk_total_gb": 100.0,
+  "disk_free_gb": 67.9
+}
+```
+
+---
+
+## Reconciliation Helpers
+
+These endpoints are called by the provision-gateway to reconcile state.
+
+### `GET /docker/container/{container}/exists`
+
+```json
+{ "exists": true }
+```
+
+### `GET /docker/container/{container}/running`
+
+```json
+{ "running": true }
+```
+
+### `POST /docker/network/{network}/connect/{container}`
+
+```json
+{ "connected": true }
+```
+
+### `POST /docker/nginx/reload`
+
+Reloads provision-nginx (default) or a named container.
+
+**Query parameters**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `container` | string | `provision-nginx` | Nginx container to reload |
+
+**Response `200`**
+```json
+{ "reloaded": true }
+```
+
+---
+
+## `GET /nginx/connections` — Nginx Connection State
+
+Returns the current nginx routing state: networks nginx is connected to,
+all generated `.nginx.conf` files, and parsed upstreams from each conf.
+
+**Response `200`**
+```json
+{
+  "nginx_container": "provision-nginx",
+  "connected_networks": ["myapp-user_alice-0", "myapp-user_bob-0"],
+  "conf_files": ["myapp.user-alice.0.nginx.conf", "myapp.user-bob.0.nginx.conf"],
+  "upstreams": [
+    {
+      "conf_file": "myapp.user-alice.0.nginx.conf",
+      "server_name": "myapp-alice-0.localhost",
+      "proxy_pass": "http://myapp-user_alice-0-web:80"
+    }
+  ]
+}
+```
+
+---
+
+## `POST /nginx/reconnect-all` — Reconnect Nginx to All Networks
+
+Iterates all entries in `user_registry.yml`, reconnects `provision-nginx` to each
+user network (idempotent), then reloads nginx.
+
+**Response `200`**
+```json
+{
+  "total_networks": 5,
+  "reconnected": 5,
+  "nginx_reloaded": true
+}
+```
+
+---
+
 ## Quick Reference
 
 ```bash
@@ -410,6 +682,9 @@ curl http://localhost:8765/tasks
 # Cancel a task
 curl -X DELETE http://localhost:8765/tasks/a1b2c3d4e5f6
 
+# SSE build log stream
+curl http://localhost:8765/tasks/a1b2c3d4e5f6/log
+
 # Sync register (blocking — backward compatible)
 curl -X POST "http://localhost:8765/users?sync=true" -H 'Content-Type: application/json' -d '{...}'
 
@@ -419,6 +694,33 @@ curl -X POST "http://localhost:8765/users/alice/services/myapp/0/rebuild?sync=tr
 
 # Sync remove
 curl -X DELETE "http://localhost:8765/users/alice/services/myapp/0?sync=true"
+
+# Start / stop service
+curl -X POST http://localhost:8765/users/alice/services/myapp/0/up
+curl -X POST http://localhost:8765/users/alice/services/myapp/0/down
+
+# Change password
+curl -X PUT http://localhost:8765/users/alice/services/myapp/0/password \
+  -H 'Content-Type: application/json' -d '{"passwd": "newsecret"}'
+
+# Container logs
+curl "http://localhost:8765/users/alice/services/myapp/0/containers/web/logs?tail=50"
+
+# Docker / host stats
+curl http://localhost:8765/docker/ps
+curl http://localhost:8765/docker/stats
+curl http://localhost:8765/docker/info
+curl http://localhost:8765/host/stats
+
+# Reconciliation helpers
+curl http://localhost:8765/docker/container/provision-nginx/exists
+curl http://localhost:8765/docker/container/provision-nginx/running
+curl -X POST http://localhost:8765/docker/network/mynet/connect/provision-nginx
+curl -X POST http://localhost:8765/docker/nginx/reload
+
+# Nginx state
+curl http://localhost:8765/nginx/connections
+curl -X POST http://localhost:8765/nginx/reconnect-all
 ```
 
 ---

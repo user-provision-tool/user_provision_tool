@@ -3,9 +3,10 @@
 The test suite has four layers:
 
 ```
-Integration (bash)   tests/test_integration.sh     107 tests
+Integration (bash)   tests/test_integration.sh     120 tests
   └─ full Docker round-trip: build image → start API → register → rebuild → remove
-    also covers up/down, password change, container logs, SSE per-task log streaming,
+    also covers container-stats, service-stats, nginx resilience (missing upstreams),
+    up/down, password change, container logs, SSE per-task log streaming,
     docker/host stats, nginx connections, reconnect-all, reconciliation,
     HTTPS registration, proxy_pass compose name detection, env_file handling,
     async task pool, project_root resolution, build_args with MockProxy,
@@ -164,10 +165,10 @@ bash tests/test_integration.sh
 ### Run all tests
 
 ```bash
-# All pytest-based tests (278 tests, no Docker needed)
+# All pytest-based tests (292 tests, no Docker needed)
 uv run pytest tests/test_unit.py tests/test_e2e.py tests/test_proxy_support.py tests/test_task_manager.py -v
 
-# Full integration (107 tests, requires Docker)
+# Full integration (120 tests, requires Docker)
 sudo bash tests/test_integration.sh
 ```
 
@@ -186,7 +187,7 @@ uv sync
 python -m pytest tests/test_unit.py tests/test_e2e.py -v
 ```
 
-Expected: **278 passed** (186 unit + 40 e2e + 38 proxy + 14 task_manager).
+Expected: **292 passed** (192 unit + 40 e2e + 38 proxy + 14 task_manager + 8 api).
 
 ---
 

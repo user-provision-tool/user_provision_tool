@@ -980,3 +980,139 @@ def _status_for_user(user_name: str, running: dict[str, str]) -> dict[str, Any]:
         "unhealthy_services": unhealthy_services,
         "missing_services": missing_services,
     }
+
+
+# ---------------------------------------------------------------------------
+# GET /container-stats  —  container-level statistics (registry only)
+# ---------------------------------------------------------------------------
+
+@app.get("/container-stats")
+def get_container_stats() -> dict[str, Any]:
+    """Return container statistics for **only** the containers referenced
+    in ``user_registry.yml``.
+
+    Categories
+    ----------
+    - healthy_running   — container is running (and health check OK if present)
+    - unhealthy_running — container is running but health check reports unhealthy
+    - restarting        — container is in restarting state
+    - down              — container exists but is stopped / exited / paused
+    - missing           — container does not exist at all
+
+    The gateway dashboard uses this instead of running ``docker ps`` directly.
+    """
+    return _compute_container_stats()
+
+
+def _compute_container_stats() -> dict[str, Any]:
+    all_entries = registry.get_all_users()
+
+    # Collect all expected container names from the registry
+    expected: set[str] = set()
+    for entry in all_entries:
+        names = _expected_container_names(entry)
+        expected.update(names)
+
+    # Single docker ps -a call (NOT per-container inspect)
+    all_containers = {c["name"]: c["status"] for c in docker_ops.docker_ps_all()}
+
+    healthy_running = 0
+    unhealthy_running = 0
+    restarting = 0
+    down = 0
+    missing = 0
+
+    for cname in expected:
+        status = all_containers.get(cname)
+        if status is None:
+            missing += 1
+            continue
+
+        status_lower = status.lower()
+        if "restarting" in status_lower:
+            restarting += 1
+        elif "up" in status_lower:
+            if "(unhealthy)" in status_lower:
+                unhealthy_running += 1
+            else:
+                # "(healthy)", "(health: starting)", or no health check
+                healthy_running += 1
+        else:
+            # "Exited", "Created", "Dead", "Paused", "Removing"
+            down += 1
+
+    return {
+        "container_stats": {
+            "healthy_running": healthy_running,
+            "unhealthy_running": unhealthy_running,
+            "restarting": restarting,
+            "down": down,
+            "missing": missing,
+            "total_expected": len(expected),
+        }
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /service-stats  —  service-level statistics (registry only)
+# ---------------------------------------------------------------------------
+
+@app.get("/service-stats")
+def get_service_stats() -> dict[str, Any]:
+    """Return service-level statistics computed from ``user_registry.yml`` only.
+
+    Categories
+    ----------
+    - healthy   — all expected containers are running and healthy
+    - unhealthy — at least one container is unhealthy, restarting, or down
+    - expected  — total number of service instances in the registry
+
+    The gateway dashboard uses this instead of running ``docker ps`` directly.
+    """
+    return _compute_service_stats()
+
+
+def _compute_service_stats() -> dict[str, Any]:
+    all_entries = registry.get_all_users()
+
+    # Single docker ps -a call
+    all_containers = {c["name"]: c["status"] for c in docker_ops.docker_ps_all()}
+
+    healthy = 0
+    unhealthy = 0
+
+    for entry in all_entries:
+        expected_names = _expected_container_names(entry)
+        if not expected_names:
+            unhealthy += 1
+            continue
+
+        all_ok = True
+        for cname in expected_names:
+            status = all_containers.get(cname)
+            if status is None:
+                all_ok = False
+                break
+            status_lower = status.lower()
+            if "restarting" in status_lower:
+                all_ok = False
+                break
+            if "up" not in status_lower:
+                all_ok = False
+                break
+            if "(unhealthy)" in status_lower:
+                all_ok = False
+                break
+
+        if all_ok:
+            healthy += 1
+        else:
+            unhealthy += 1
+
+    return {
+        "service_stats": {
+            "healthy": healthy,
+            "unhealthy": unhealthy,
+            "expected": len(all_entries),
+        }
+    }

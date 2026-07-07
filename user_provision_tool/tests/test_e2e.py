@@ -453,8 +453,12 @@ server {
         assert nginx_out.exists(), f"nginx conf not found at {nginx_out}"
         content = nginx_out.read_text()
         # The compose service name "web" should have been replaced
-        assert "proxy_pass http://myapp-user_alice-0-web:80;" in content, (
+        # Now uses variable-based form: set $upstream_XXXX myapp-user_alice-0-web:80;
+        assert "myapp-user_alice-0-web:80" in content, (
             f"Expected rendered container name in proxy_pass, got:\n{content}"
+        )
+        assert "set $upstream_" in content, (
+            f"Expected variable-based proxy_pass (set $upstream_...), got:\n{content}"
         )
         # The raw template variable should NOT be in the rendered output
         assert "{{ container_prefix }}" not in content

@@ -207,11 +207,20 @@ def docker_info() -> dict[str, Any]:
 
 def docker_ps() -> list[dict[str, str]]:
     """Return list of running containers as dicts with keys: name, status, image."""
-    result = subprocess.run(
-        ["docker", "ps", "--format", "{{.Names}}\t{{.Status}}\t{{.Image}}"],
-        text=True,
-        capture_output=True,
-    )
+    return _docker_ps_raw(False)
+
+
+def docker_ps_all() -> list[dict[str, str]]:
+    """Return list of ALL containers (including stopped) as dicts with keys: name, status, image."""
+    return _docker_ps_raw(True)
+
+
+def _docker_ps_raw(all_containers: bool) -> list[dict[str, str]]:
+    flag = "-a" if all_containers else ""
+    args = ["docker", "ps", "--format", "{{.Names}}\t{{.Status}}\t{{.Image}}"]
+    if flag:
+        args.insert(2, flag)  # docker ps -a --format ...
+    result = subprocess.run(args, text=True, capture_output=True)
     containers = []
     for line in result.stdout.splitlines():
         parts = line.split("\t")
@@ -272,10 +281,15 @@ def network_inspect(network: str) -> dict | None:
 
 
 def container_inspect(container: str) -> dict | None:
-    """Inspect a Docker container. Returns parsed JSON or None."""
+    """Inspect a Docker container. Returns parsed JSON or None.
+
+    Uses ``docker container inspect`` (explicit type) to avoid ambiguity:
+    ``docker inspect <name>`` may return image metadata when a container
+    with that name does not exist but an image with the same name does.
+    """
     import json
     result = subprocess.run(
-        ["docker", "inspect", container],
+        ["docker", "container", "inspect", container],
         text=True, capture_output=True,
     )
     if result.returncode != 0:
@@ -290,7 +304,7 @@ def container_inspect(container: str) -> dict | None:
 def container_exists(container: str) -> bool:
     """Check if a container exists (running or stopped)."""
     result = subprocess.run(
-        ["docker", "inspect", container],
+        ["docker", "container", "inspect", container],
         text=True, capture_output=True,
     )
     return result.returncode == 0

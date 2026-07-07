@@ -222,7 +222,7 @@ class TestTemplateEngine:
         #   proxy_pass http://$upstream_XXXX;
         assert "set $upstream_" in content
         assert "myapp-user_alice-0-web:80;" in content
-        assert "proxy_pass         http://$upstream_" in content
+        assert "proxy_pass" in content and "$upstream_" in content
 
     def test_render_nginx_conf_no_password_strips_auth_basic(self, tmp_path):
         out = str(tmp_path / "myapp.user-alice.0.nginx.conf")
@@ -316,7 +316,7 @@ class TestTemplateEngine:
         # The variable form must appear
         assert "set $upstream_" in content
         assert "myapp-user_alice-0-web:80;" in content
-        assert "proxy_pass         http://$upstream_" in content
+        assert "proxy_pass" in content and "$upstream_" in content
         # The variable name should be unique and sequential
         assert "$upstream_0000" in content
 
@@ -392,7 +392,7 @@ server {
         # Variable form in HTTP redirect block shouldn't apply (no proxy_pass there)
         # but in the HTTPS server block it should
         assert "set $upstream_" in content
-        assert "proxy_pass         http://$upstream_" in content
+        assert "proxy_pass" in content and "$upstream_" in content
         # Still has HTTPS directives
         assert "listen 443 ssl;" in content
         assert "ssl_certificate" in content

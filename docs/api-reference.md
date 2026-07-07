@@ -40,6 +40,12 @@ add `?sync=true` to any mutable endpoint.
 | `POST` | `/reconcile` | Run live nginx upstream reconciliation |
 | `GET` | `/reconcile/status` | Live nginx state snapshot (networks, containers, confs) |
 | `GET` | `/nginx-state` | Same as `/reconcile/status` — live state snapshot |
+| `GET` | `/container-stats` | Container-level statistics (registry-scoped) |
+| `GET` | `/service-stats` | Service-level health summary (registry-scoped) |
+| `GET` | `/ssl-certs` | List available SSL certificate domains |
+| `POST` | `/ssl-certs` | Upload SSL certificates for a domain |
+| `POST` | `/ssl-certs/{domain}/refresh` | Refresh certs from original source path |
+| `DELETE` | `/ssl-certs/{domain}` | Delete SSL certificates for a domain |
 
 ---
 
@@ -748,6 +754,174 @@ Convenience alias — returns the same live state snapshot.
 
 ---
 
+## `GET /container-stats` — Container-Level Statistics
+
+Returns container statistics for **only** the containers referenced in `user_registry.yml`.
+Uses a single `docker ps -a` call rather than per-container inspect.
+
+Categories:
+- **healthy_running** — container is running (and health check OK if present)
+- **unhealthy_running** — container is running but health check reports unhealthy
+- **restarting** — container is in restarting state
+- **down** — container exists but is stopped / exited / paused
+- **missing** — container does not exist at all
+
+**Response `200`**
+```json
+{
+  "container_stats": {
+    "healthy_running": 12,
+    "unhealthy_running": 1,
+    "restarting": 0,
+    "down": 3,
+    "missing": 0,
+    "total_expected": 16
+  }
+}
+```
+
+The gateway dashboard uses this instead of running `docker ps` directly.
+
+---
+
+## `GET /service-stats` — Service-Level Statistics
+
+Returns service-level health computed from `user_registry.yml` only. A service is
+**healthy** when ALL its expected containers are running and healthy; otherwise it
+is **unhealthy**.
+
+**Response `200`**
+```json
+{
+  "service_stats": {
+    "healthy": 5,
+    "unhealthy": 1,
+    "expected": 6
+  }
+}
+```
+
+The gateway dashboard uses this instead of running `docker ps` directly.
+
+---
+
+## SSL Certificate Management
+
+Endpoints for managing SSL/TLS certificates independently of user registration.
+Certificates are stored in `SSL_DIR/{domain}/` (default: `$PROVISION_DIR/ssl/{domain}/`).
+
+### `GET /ssl-certs` — List Certificates
+
+Scans `SSL_DIR/` for subdirectories containing both `fullchain.pem` and `privkey.pem`.
+Returns domain names with expiry information (computed via `openssl x509 -enddate`).
+
+**Response `200`**
+```json
+{
+  "domains": [
+    {
+      "domain": "example.com",
+      "fullchain_path": "/srv/provision/ssl/example.com/fullchain.pem",
+      "privkey_path": "/srv/provision/ssl/example.com/privkey.pem",
+      "created_at": "",
+      "expiry_date": "2026-10-05",
+      "days_left": 89
+    }
+  ]
+}
+```
+
+### `POST /ssl-certs` — Upload Certificates
+
+Supports two modes:
+- **Paste mode**: provide `fullchain` and `privkey` PEM content directly.
+- **Path mode**: provide `ssl_path` (directory containing `fullchain.pem` and `privkey.pem`).
+  Files are read from that path. Stores the source path in `.source_path` for later refresh.
+
+Saves files to `SSL_DIR/{domain}/`. Overwrites existing files.
+
+**Request body** (paste mode)
+```json
+{
+  "domain": "example.com",
+  "fullchain": "-----BEGIN CERTIFICATE-----\n...",
+  "privkey": "-----BEGIN PRIVATE KEY-----\n..."
+}
+```
+
+**Request body** (path mode)
+```json
+{
+  "domain": "example.com",
+  "ssl_path": "/etc/letsencrypt/live/example.com"
+}
+```
+
+**Response `201`**
+```json
+{
+  "domain": "example.com",
+  "fullchain_path": "/srv/provision/ssl/example.com/fullchain.pem",
+  "privkey_path": "/srv/provision/ssl/example.com/privkey.pem",
+  "expiry_date": "2026-10-05",
+  "days_left": 89,
+  "message": "SSL certificates saved for example.com"
+}
+```
+
+**Error codes**
+
+| Code | Cause |
+|---|---|
+| `400` | Invalid domain name (empty, contains `/` or `..`) |
+| `400` | `ssl_path` is not a directory |
+| `400` | `fullchain.pem` or `privkey.pem` not found in `ssl_path` |
+
+### `POST /ssl-certs/{domain}/refresh` — Refresh Certificates
+
+Re-reads certificates from the original source path stored in `.source_path`.
+Only works for certs that were originally uploaded via path mode.
+
+**Response `200`**
+```json
+{
+  "domain": "example.com",
+  "fullchain_path": "/srv/provision/ssl/example.com/fullchain.pem",
+  "privkey_path": "/srv/provision/ssl/example.com/privkey.pem",
+  "expiry_date": "2026-10-05",
+  "days_left": 89,
+  "message": "SSL certificates refreshed for example.com"
+}
+```
+
+**Error codes**
+
+| Code | Cause |
+|---|---|
+| `404` | No certificates found for domain |
+| `400` | No source path stored (uploaded via paste mode, not path mode) |
+| `400` | Source path no longer exists |
+
+### `DELETE /ssl-certs/{domain}` — Delete Certificates
+
+Removes the entire `SSL_DIR/{domain}/` directory tree.
+
+**Response `200`**
+```json
+{
+  "domain": "example.com",
+  "message": "SSL certificates deleted for example.com"
+}
+```
+
+**Error codes**
+
+| Code | Cause |
+|---|---|
+| `404` | No certificates found for domain |
+
+---
+
 ## Quick Reference
 
 ```bash
@@ -798,6 +972,16 @@ curl http://localhost:8765/docker/ps
 curl http://localhost:8765/docker/stats
 curl http://localhost:8765/docker/info
 curl http://localhost:8765/host/stats
+
+# Container / service stats (registry-scoped)
+curl http://localhost:8765/container-stats
+curl http://localhost:8765/service-stats
+
+# SSL certificate management
+curl http://localhost:8765/ssl-certs
+curl -X POST http://localhost:8765/ssl-certs -H 'Content-Type: application/json' -d '{"domain":"example.com","ssl_path":"/etc/letsencrypt/live/example.com"}'
+curl -X POST http://localhost:8765/ssl-certs/example.com/refresh
+curl -X DELETE http://localhost:8765/ssl-certs/example.com
 
 # Reconciliation helpers
 curl http://localhost:8765/docker/container/provision-nginx/exists

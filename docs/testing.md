@@ -24,7 +24,7 @@ Async Task Pool      tests/test_task_manager.py     14 tests
   └─ submit, complete, fail, cancel, list_all, uniqueness, per-task log file,
     TTL cleanup, max-count eviction
 
-Unit (pytest)        tests/test_unit.py             186 tests
+Unit (pytest)        tests/test_unit.py             192 tests
   └─ individual lib/ functions in isolation, all I/O mocked
     includes provisioner proxy support tests
     includes env_file render_compose rewrite + per-user copy tests
@@ -32,13 +32,15 @@ Unit (pytest)        tests/test_unit.py             186 tests
       SSL block wrapping, provisioner cert copying + bare filenames
     includes docker_ops: compose_stop, docker_info, container_exists/running,
       container_inspect, network_list/inspect, network_connected_to_container,
-      container_logs, orphan_network_cleanup, thread-local task log
+      container_logs, orphan_network_cleanup, thread-local task log,
+      docker_ps_all, per-task log threading fix
     includes provisioner: start_service, stop_service, change_password,
       orphan network cleanup on remove
     includes api (FastAPI TestClient): up/down/password endpoints, docker/ps,
       docker/stats, docker/info, host/stats, reconciliation helpers,
       nginx/connections, nginx/reconnect-all, container logs, task log SSE,
-      health, tasks list — all with mocked docker_ops
+      health, tasks list, container-stats, service-stats,
+      ssl-certs (list/upload/refresh/delete) — all with mocked docker_ops
 ```
 
 ---
@@ -61,7 +63,7 @@ Notable patterns:
 - `TestNginxConverter` covers server_name, auth_basic, proxy_pass, htpasswd_path substitutions, and SSL certificate path conversion with `{% if https %}` block wrapping.
 - `TestProvisionerProxySupport` covers `build_args` storage in registry and rebuild fallback.
 - `TestProvisionerEnvFile` covers HTTPS, start_service, stop_service, change_password, orphan network cleanup, and `container_names` storage in registry.
-- `TestAPINewEndpoints` covers API endpoints using FastAPI `TestClient`: docker/ps, docker/stats, docker/info, host/stats, reconciliation helpers, up/down/password, nginx/connections, nginx/reconnect-all, container logs, task log SSE, health, tasks, reconcile, reconcile/status, nginx-state.
+- `TestAPINewEndpoints` covers API endpoints using FastAPI `TestClient`: docker/ps, docker/stats, docker/info, host/stats, reconciliation helpers, up/down/password, nginx/connections, nginx/reconnect-all, container logs, task log SSE, health, tasks, reconcile, reconcile/status, nginx-state, container-stats, service-stats, ssl-certs (list/upload/refresh/delete).
 - `TestNginxConverter` covers deterministic proxy_pass rewriting (exact compose service name matching, no prefix stripping), SSL certificate path replacement, auth_basic injection, and HTTPS block auto-generation.
 
 ---
@@ -117,7 +119,7 @@ Covers: submit → complete, submit → fail, cancel pending, cancel completed, 
 **File:** `tests/test_integration.sh`  
 **Requires:** Docker, `curl`; `jq` optional (falls back to Python).
 
-Runs the full end-to-end cycle against a real Docker daemon (29 tests):
+Runs the full end-to-end cycle against a real Docker daemon (120 tests):
 
 ```
 Build provision-api image
@@ -150,7 +152,12 @@ Build provision-api image
             ├─ POST /users?sync=true with env_file_path → per-user .env copy + env_file: rewrite
             ├─ GET  /tasks/{nonexistent}                → 404
             ├─ POST /users?sync=true (hyphenated user)  → hyphen allowed, container prefix correct
-            └─ POST /users?sync=true (plain conf + https)→ auto-HTTPS generation from HTTP conf
+            ├─ POST /users?sync=true (plain conf + https)→ auto-HTTPS generation from HTTP conf
+            ├─ GET  /container-stats                    → registry-scoped container stats
+            ├─ GET  /service-stats                      → registry-scoped service stats
+            ├─ POST /ssl-certs + GET + DELETE           → SSL cert lifecycle
+            ├─ per-task log output verification         → docker output captured in logs
+            └─ nginx resilience with missing upstreams  → reload succeeds with stopped/removed containers
 ```
 
 Run:

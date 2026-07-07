@@ -10,9 +10,11 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       # Same-path bind-mount so generated compose files reference valid host paths
       - ${PROVISION_DIR}:${PROVISION_DIR}
-      # Mount letsencrypt so full-path cert references work without manual copying
-      - /etc/letsencrypt:/etc/letsencrypt:ro
+      # Mount SSL provider path (e.g. /etc/letsencrypt) so path-based cert
+      # imports and full-path cert references work without manual copying
+      - ${SSL_PROVIDER_PATH:-/etc/letsencrypt}:${SSL_PROVIDER_PATH:-/etc/letsencrypt}:ro
     environment:
+      - SSL_PROVIDER_PATH=${SSL_PROVIDER_PATH:-/etc/letsencrypt}
       - GENERATED_DIR=${PROVISION_DIR}/generated
       - USER_DATA_DIR=${PROVISION_DIR}/user_data
       - SOURCE_PROJECTS_DIR=${PROVISION_DIR}/source_projects

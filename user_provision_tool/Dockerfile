@@ -1,5 +1,9 @@
 FROM python:3.13-slim
 
+# ---- System dependencies ----
+RUN apt-get update && apt-get install -y --no-install-recommends openssl \
+    && rm -rf /var/lib/apt/lists/*
+
 # ---- Docker CLI + Compose plugin ----
 # Multi-stage COPY from docker:cli pulls these binaries from Docker Hub
 # during the build — no host filesystem involved. The docker binary in

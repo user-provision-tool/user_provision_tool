@@ -164,14 +164,16 @@ def register_user(
         # --- Resolve fullchain ---
         # Bare filename (no path separator) → look up directly in /provision/ssl/{domain}/
         # Full / relative path → copy to /provision/ssl/{domain}/fullchain.pem (normalized name)
-        _fc = Path(fullchain)
+        _fc = Path(fullchain).resolve()
         if _fc.is_absolute() or "/" in str(fullchain):
             if not _fc.is_file():
                 raise ValueError(
                     f"https=True: fullchain file not found at {fullchain}"
                 )
             ssl_certificate_path = str(ssl_dir / "fullchain.pem")
-            shutil.copy2(str(_fc), ssl_certificate_path)
+            _dest = Path(ssl_certificate_path).resolve()
+            if _fc != _dest:
+                shutil.copy2(str(_fc), ssl_certificate_path)
         else:
             ssl_certificate_path = str(ssl_dir / fullchain)
             if not Path(ssl_certificate_path).is_file():
@@ -180,14 +182,16 @@ def register_user(
                 )
 
         # --- Resolve privkey (same logic) ---
-        _pk = Path(privkey)
+        _pk = Path(privkey).resolve()
         if _pk.is_absolute() or "/" in str(privkey):
             if not _pk.is_file():
                 raise ValueError(
                     f"https=True: privkey file not found at {privkey}"
                 )
             ssl_certificate_key_path = str(ssl_dir / "privkey.pem")
-            shutil.copy2(str(_pk), ssl_certificate_key_path)
+            _pdest = Path(ssl_certificate_key_path).resolve()
+            if _pk != _pdest:
+                shutil.copy2(str(_pk), ssl_certificate_key_path)
         else:
             ssl_certificate_key_path = str(ssl_dir / privkey)
             if not Path(ssl_certificate_key_path).is_file():

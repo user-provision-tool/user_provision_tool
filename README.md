@@ -161,6 +161,8 @@ curl http://localhost:8765/docker/ps          # list all containers
 curl http://localhost:8765/docker/stats        # per-container resource stats
 curl http://localhost:8765/docker/info         # docker host info
 curl http://localhost:8765/host/stats          # host CPU/memory/disk
+curl http://localhost:8765/container-stats     # registry-scoped container stats
+curl http://localhost:8765/service-stats       # registry-scoped service health summary
 ```
 
 **12. Nginx state**
@@ -193,7 +195,24 @@ curl http://localhost:8765/reconcile/status          # live nginx state snapshot
 curl http://localhost:8765/nginx-state               # same as above
 ```
 
-**15. Register with HTTPS**
+**15. SSL certificate management**
+```bash
+# List all available SSL certificate domains
+curl http://localhost:8765/ssl-certs
+
+# Upload certificates (path mode — reads from a directory)
+curl -X POST http://localhost:8765/ssl-certs \
+  -H 'Content-Type: application/json' \
+  -d '{"domain":"example.com","ssl_path":"/etc/letsencrypt/live/example.com"}'
+
+# Refresh from original source path
+curl -X POST http://localhost:8765/ssl-certs/example.com/refresh
+
+# Delete certificates
+curl -X DELETE http://localhost:8765/ssl-certs/example.com
+```
+
+**16. Register with HTTPS**
 ```bash
 # Full path — certs are copied to $PROVISION_DIR/ssl/example.com/
 curl -X POST "http://localhost:8765/users?sync=true" \

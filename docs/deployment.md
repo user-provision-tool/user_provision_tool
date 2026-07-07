@@ -132,15 +132,19 @@ HTTP request
         ▼
   provision-nginx  (port 80)
         │
+        │  resolver 127.0.0.11 (Docker embedded DNS)
         │  nginx matches server_name in GENERATED_DIR/myapp.user-alice.0.nginx.conf
         │
         ▼
-  proxy_pass  http://myapp-user_alice-0-web:8000
+  proxy_pass  http://$upstream_0000
+              (variable-based → DNS resolved per-request via 127.0.0.11)
               (reachable because nginx is connected to the myapp-user_alice-0 network)
 ```
 
 Routing is virtual-host based (matched by the `Host:` header / `server_name` directive).
 Each registered user gets their own `*.nginx.conf` in `GENERATED_DIR`.
+
+Per-user nginx confs use variable-based `proxy_pass` (`set $upstream_XXXX host:port; proxy_pass http://$upstream_XXXX;`) so that DNS resolution is deferred to request time via the Docker embedded DNS resolver (`127.0.0.11`). This allows nginx to start and reload cleanly even when upstream containers are stopped or missing — no more hanging on `nginx -s reload`.
 
 ### Config loading
 

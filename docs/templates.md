@@ -130,6 +130,33 @@ server {
 
 ---
 
+## Nginx `proxy_pass` — Variable-Based DNS Resolution
+
+After Jinja2 rendering, `render_nginx_conf()` post-processes every `proxy_pass` directive
+to use **nginx variables** instead of static hostnames:
+
+```
+Before:  proxy_pass http://myapp-user_alice-0-web:80;
+After:   set $upstream_0000 myapp-user_alice-0-web:80;
+         proxy_pass http://$upstream_0000;
+```
+
+**Why**: Without variables, nginx resolves upstream hostnames **once** at startup/reload
+and caches the IP forever. If the upstream container restarts (getting a new IP) or is
+missing at reload time, nginx hangs. With variables, DNS resolution is **deferred to
+request time** via the Docker embedded DNS resolver (`127.0.0.11`).
+
+**Requirements**:
+- The main `nginx.provision.conf` must include `resolver 127.0.0.11 valid=30s ipv6=off;`
+- Each `proxy_pass` gets a unique variable name (`$upstream_0000`, `$upstream_0001`, …)
+- Both `http://` and `https://` schemes are supported
+- Original indentation is preserved
+
+This is an automatic post-processing step — you write `proxy_pass http://{{ container_prefix }}web:80;`
+in your template as usual; the variable rewrite happens transparently.
+
+---
+
 ## `.env` File Support
 
 If you supply an `.env` file path at registration time (`env_file_path` in the API,

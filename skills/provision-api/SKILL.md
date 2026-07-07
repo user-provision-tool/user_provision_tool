@@ -199,6 +199,31 @@ curl http://localhost:8765/docker/ps          # all containers
 curl http://localhost:8765/docker/stats        # per-container resource stats
 curl http://localhost:8765/docker/info         # docker host info (container counts)
 curl http://localhost:8765/host/stats          # host CPU/memory/disk
+curl http://localhost:8765/container-stats     # registry-scoped container health stats
+curl http://localhost:8765/service-stats       # registry-scoped service health summary
+```
+
+### SSL certificate management
+
+```bash
+# List all available certificate domains
+curl http://localhost:8765/ssl-certs
+
+# Upload certificates (path mode — reads fullchain.pem + privkey.pem from a directory)
+curl -X POST http://localhost:8765/ssl-certs \
+  -H 'Content-Type: application/json' \
+  -d '{"domain":"example.com","ssl_path":"/etc/letsencrypt/live/example.com"}'
+
+# Upload certificates (paste mode — PEM content in request body)
+curl -X POST http://localhost:8765/ssl-certs \
+  -H 'Content-Type: application/json' \
+  -d '{"domain":"example.com","fullchain":"-----BEGIN CERTIFICATE-----\n...","privkey":"-----BEGIN PRIVATE KEY-----\n..."}'
+
+# Refresh from original source path
+curl -X POST http://localhost:8765/ssl-certs/example.com/refresh
+
+# Delete certificates for a domain
+curl -X DELETE http://localhost:8765/ssl-certs/example.com
 ```
 
 ### Nginx state management

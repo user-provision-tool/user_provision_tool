@@ -929,6 +929,112 @@ class TestDockerOps:
         assert "before clear" in content
         assert "after clear" not in content  # not written after clear
 
+    def test_task_log_captures_stdout_from_child_threads(self, tmp_path, monkeypatch):
+        """_run() writes command output to the per-task log even from child threads.
+
+        Regression test for the ``threading.local()`` propagation bug:
+        ``_task_log.path`` was set on the caller thread but the reader threads
+        spawned by ``_run()`` could not see it, so docker stdout/stderr was
+        silently discarded.  The fix captures the path as a closure variable
+        inside ``_run()`` before spawning threads.
+        """
+        import io
+
+        log_path = str(tmp_path / "task-capture.log")
+        docker_ops.set_task_log_file(log_path)
+
+        stdout_data = "Container web-1  Started\nContainer db-1  Healthy\n"
+        stderr_data = "warning: deprecated option\nBuild finished\n"
+
+        # A pipe-like object: readline() returns lines until exhausted,
+        # then returns "".  close() is a no-op (real pipes return "" after
+        # the write end closes; StringIO raises ValueError instead).
+        class _Pipe(io.StringIO):
+            def close(self):
+                pass  # don't invalidate the buffer on close
+
+        class _FakeProc:
+            def __init__(self, args, **kwargs):
+                self.returncode = 0
+                self.stdout = _Pipe(stdout_data)
+                self.stderr = _Pipe(stderr_data)
+            def wait(self): pass
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+
+        monkeypatch.setattr(docker_ops.subprocess, "Popen", _FakeProc)
+
+        docker_ops._run(["docker", "compose", "up", "-d"])
+        docker_ops.clear_task_log_file()
+
+        content = Path(log_path).read_text()
+
+        # The command line MUST be logged
+        assert "+ docker compose up -d" in content
+
+        # stdout output MUST be captured (this was broken before the fix)
+        assert "Container web-1  Started" in content, (
+            "stdout output NOT captured in task log — "
+            "threading.local() path may not be propagating to child threads"
+        )
+        assert "Container db-1  Healthy" in content
+
+        # stderr output MUST be captured
+        assert "warning: deprecated option" in content
+        assert "Build finished" in content
+
+    def test_task_log_captures_output_even_when_called_from_another_thread(self, tmp_path, monkeypatch):
+        """Same as above, but _run() is invoked from a spawned thread.
+
+        This simulates the real deployment scenario: the task worker runs on
+        a ThreadPoolExecutor thread, calls set_task_log_file(), then _run().
+        """
+        import io, threading
+
+        log_path = str(tmp_path / "task-thread.log")
+
+        stdout_data = "Network connected\n"
+        stderr_data = ""
+
+        class _Pipe(io.StringIO):
+            def close(self):
+                pass
+
+        class _FakeProc:
+            def __init__(self, args, **kwargs):
+                self.returncode = 0
+                self.stdout = _Pipe(stdout_data)
+                self.stderr = _Pipe(stderr_data)
+            def wait(self): pass
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+
+        monkeypatch.setattr(docker_ops.subprocess, "Popen", _FakeProc)
+
+        errors = []
+
+        def worker():
+            try:
+                docker_ops.set_task_log_file(log_path)
+                docker_ops._run(["docker", "network", "connect", "net", "container"])
+            except Exception as e:
+                errors.append(str(e))
+            finally:
+                docker_ops.clear_task_log_file()
+
+        t = threading.Thread(target=worker)
+        t.start()
+        t.join()
+
+        assert not errors, f"Worker thread raised: {errors}"
+        content = Path(log_path).read_text()
+
+        assert "+ docker network connect net container" in content
+        assert "Network connected" in content, (
+            "stdout NOT captured when _run() called from a spawned thread — "
+            "the fix must use closure-captured path, not threading.local()"
+        )
+
 
 # ---------------------------------------------------------------------------
 # compose_converter

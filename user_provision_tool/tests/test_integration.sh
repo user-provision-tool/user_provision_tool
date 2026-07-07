@@ -1945,6 +1945,64 @@ fi
 curl -sf -X DELETE "$API_URL/users/taskloguser/services/myapp/0" >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
+# Test 41: Per-task log contains docker COMMAND OUTPUT (not just commands)
+#
+# Regression test: prior to the threading.local() fix in docker_ops._run(),
+# only the "+ docker compose ..." command lines were written to the per-task
+# log.  Docker stdout/stderr (build progress, container ids, warnings) was
+# silently discarded because threading.local() data did not propagate to the
+# reader threads spawned inside _run().  This test verifies that the fix
+# actually captures real docker output.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- Test 41: Per-task log captures docker command OUTPUT ---"
+
+# The taskloguser from Test 40 was just cleaned up.  Reuse its log file
+# (which still exists on disk) to verify it contains real docker output.
+if [ -f "$TASK_LOG_FILE" ]; then
+    # Count lines — a command-only log would have ~3-6 lines.
+    # A real log with build output has dozens (BuildKit steps, etc.).
+    line_count=$(wc -l < "$TASK_LOG_FILE")
+    if [ "$line_count" -gt 10 ]; then
+        pass "Per-task log has $line_count lines (expected >10 for real docker output)"
+    else
+        fail "Per-task log only has $line_count lines — expected docker output to be captured (threading.local bug may still be present)"
+    fi
+
+    # Check for specific docker output patterns that prove stdout was captured
+    # (not just the "+ docker compose ..." command echo)
+    if grep -qE 'Container|Started|Healthy|Running|Removed|Building|#1|Network|Built' "$TASK_LOG_FILE"; then
+        pass "Per-task log contains docker container/network status output (not just commands)"
+    else
+        echo "  ┌─ Log file content ─────────────────────────────────────────────┐"
+        cat "$TASK_LOG_FILE" | while IFS= read -r line; do echo "  │ $line"; done
+        echo "  └────────────────────────────────────────────────────────────────┘"
+        fail "Per-task log missing docker status output — only command lines present"
+    fi
+
+    # Verify the command lines are still there (they should always be)
+    if grep -q "^+ docker" "$TASK_LOG_FILE"; then
+        pass "Per-task log contains docker command lines (as expected)"
+    else
+        fail "Per-task log missing docker command lines"
+    fi
+
+    # Verify SSE stream returns the detailed output
+    tasklog_sse_detailed=$(curl -s "$API_URL/tasks/$tasklog_tid/log?tail=50&follow=false" 2>/dev/null || echo "")
+    sse_line_count=$(echo "$tasklog_sse_detailed" | grep -c "^data:" || echo "0")
+    if [ "$sse_line_count" -gt 5 ]; then
+        pass "SSE log stream returns $sse_line_count data lines (detailed output)"
+    else
+        echo "  ┌─ SSE stream content ───────────────────────────────────────────┐"
+        echo "$tasklog_sse_detailed" | while IFS= read -r line; do echo "  │ $line"; done
+        echo "  └────────────────────────────────────────────────────────────────┘"
+        fail "SSE log stream only returned $sse_line_count data lines — expected detailed docker output"
+    fi
+else
+    fail "Per-task log file not found at: $TASK_LOG_FILE (test 40 may have failed)"
+fi
+
+# ---------------------------------------------------------------------------
 # Results
 # ---------------------------------------------------------------------------
 echo ""

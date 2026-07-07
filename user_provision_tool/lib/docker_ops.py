@@ -62,16 +62,48 @@ def _run(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
     stdout_lines: list[str] = []
     stderr_lines: list[str] = []
 
+    # ------------------------------------------------------------------
+    # Capture the per-task log file path NOW, before spawning reader
+    # threads.  ``threading.local()`` data does NOT propagate to child
+    # threads, so ``_task_log.path`` would be ``None`` inside the reader
+    # thread functions and docker command output would be silently lost.
+    # ------------------------------------------------------------------
+    _task_log_path: str | None = getattr(_task_log, "path", None)
+    _global_log = _LOG_FILE  # also capture module-level global log path
+
+    def _write_line(text: str) -> None:
+        """Log *text* to the global log file and the per-task log file.
+
+        Uses pre-captured paths so this works correctly even when called
+        from a child thread that does not share ``threading.local()`` state.
+        """
+        # Global log
+        if _global_log:
+            try:
+                Path(_global_log).parent.mkdir(parents=True, exist_ok=True)
+                with open(_global_log, "a") as f:
+                    f.write(text)
+            except Exception:
+                pass
+        # Per-task log (captured from parent thread)
+        if _task_log_path:
+            try:
+                Path(_task_log_path).parent.mkdir(parents=True, exist_ok=True)
+                with open(_task_log_path, "a") as f:
+                    f.write(text)
+            except Exception:
+                pass
+
     def _read_stdout(pipe) -> None:
         for line in iter(pipe.readline, ""):
             print(line, end="", flush=True)
-            _write_log(line)
+            _write_line(line)
             stdout_lines.append(line)
 
     def _read_stderr(pipe) -> None:
         for line in iter(pipe.readline, ""):
             print(line, end="", file=sys.stderr, flush=True)
-            _write_log(line)
+            _write_line(line)
             stderr_lines.append(line)
 
     with subprocess.Popen(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env) as proc:

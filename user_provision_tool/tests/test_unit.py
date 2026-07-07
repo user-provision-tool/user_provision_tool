@@ -217,7 +217,12 @@ class TestTemplateEngine:
         content = Path(out).read_text()
         assert "server_name myapp-alice-0.example.com;" in content
         assert f"auth_basic_user_file {htpasswd};" in content
-        assert "proxy_pass         http://myapp-user_alice-0-web:80;" in content
+        # proxy_pass now uses variable-based resolution:
+        #   set $upstream_XXXX myapp-user_alice-0-web:80;
+        #   proxy_pass http://$upstream_XXXX;
+        assert "set $upstream_" in content
+        assert "myapp-user_alice-0-web:80;" in content
+        assert "proxy_pass         http://$upstream_" in content
 
     def test_render_nginx_conf_no_password_strips_auth_basic(self, tmp_path):
         out = str(tmp_path / "myapp.user-alice.0.nginx.conf")
@@ -294,6 +299,123 @@ class TestTemplateEngine:
         # SSL blocks should NOT render when https=False
         assert "listen 443 ssl;" not in content
         assert "listen 80;" in content
+
+    # ── Variable-based proxy_pass (per-request DNS resolution) ──
+
+    def test_proxy_pass_rewritten_to_variable_with_port(self, tmp_path):
+        """proxy_pass http://host:port; → set $upstream_XXXX host:port; + proxy_pass http://$upstream_XXXX;"""
+        out = str(tmp_path / "out.conf")
+        template_engine.render_nginx_conf(
+            NGINX_TEMPLATE, out,
+            user_name="alice", service_name="myapp", label="0",
+            domain_name="example.com", htpasswd_path="",
+        )
+        content = Path(out).read_text()
+        # The old static form must NOT appear
+        assert "proxy_pass         http://myapp-user_alice-0-web:80;" not in content
+        # The variable form must appear
+        assert "set $upstream_" in content
+        assert "myapp-user_alice-0-web:80;" in content
+        assert "proxy_pass         http://$upstream_" in content
+        # The variable name should be unique and sequential
+        assert "$upstream_0000" in content
+
+    def test_proxy_pass_multiple_upstreams_get_unique_variables(self, tmp_path):
+        """Multiple proxy_pass lines get unique variable names (upstream_0000, upstream_0001, ...)."""
+        # Create a temp template with two proxy_pass lines
+        tpl_dir = tmp_path / "templates"
+        tpl_dir.mkdir()
+        tpl_path = tpl_dir / "multi.conf.j2"
+        tpl_path.write_text("""\
+server {
+    listen 80;
+    server_name {{ hostname }};
+    location /app {
+        proxy_pass http://{{ container_prefix }}web:80;
+    }
+    location /api {
+        proxy_pass http://{{ container_prefix }}api:8080;
+    }
+}
+""")
+        out = str(tmp_path / "out.conf")
+        template_engine.render_nginx_conf(
+            str(tpl_path), out,
+            user_name="alice", service_name="myapp", label="0",
+            domain_name="example.com", htpasswd_path="",
+        )
+        content = Path(out).read_text()
+        assert "$upstream_0000" in content, f"Expected upstream_0000 in:\n{content}"
+        assert "$upstream_0001" in content, f"Expected upstream_0001 in:\n{content}"
+        # The old static forms must be gone
+        assert "proxy_pass http://myapp-user_alice-0-web:80;" not in content
+        assert "proxy_pass http://myapp-user_alice-0-api:8080;" not in content
+
+    def test_proxy_pass_no_port_handled_correctly(self, tmp_path):
+        """proxy_pass without port (http://host;) also gets variable treatment."""
+        tpl_dir = tmp_path / "templates"
+        tpl_dir.mkdir()
+        tpl_path = tpl_dir / "noport.conf.j2"
+        tpl_path.write_text("""\
+server {
+    listen 80;
+    location / {
+        proxy_pass http://{{ container_prefix }}app;
+    }
+}
+""")
+        out = str(tmp_path / "out.conf")
+        template_engine.render_nginx_conf(
+            str(tpl_path), out,
+            user_name="alice", service_name="myapp", label="0",
+            domain_name="example.com", htpasswd_path="",
+        )
+        content = Path(out).read_text()
+        assert "set $upstream_0000 myapp-user_alice-0-app;" in content
+        assert "proxy_pass http://$upstream_0000;" in content
+        # Static form must be gone
+        assert "proxy_pass http://myapp-user_alice-0-app;" not in content
+
+    def test_proxy_pass_variable_does_not_break_https(self, tmp_path):
+        """When https=True, the variable rewrite works in both HTTP redirect and HTTPS server blocks."""
+        out = str(tmp_path / "out.conf")
+        htpasswd = str(tmp_path / "test.htpasswd")
+        template_engine.render_nginx_conf(
+            NGINX_TEMPLATE, out,
+            user_name="alice", service_name="myapp", label="0",
+            domain_name="example.com", htpasswd_path=htpasswd,
+            https=True,
+            ssl_certificate_path="/ssl/cert.pem",
+            ssl_certificate_key_path="/ssl/key.pem",
+        )
+        content = Path(out).read_text()
+        # Variable form in HTTP redirect block shouldn't apply (no proxy_pass there)
+        # but in the HTTPS server block it should
+        assert "set $upstream_" in content
+        assert "proxy_pass         http://$upstream_" in content
+        # Still has HTTPS directives
+        assert "listen 443 ssl;" in content
+        assert "ssl_certificate" in content
+
+    def test_proxy_pass_variable_nginx_starts_with_missing_upstream(self, tmp_path):
+        """The generated conf should NOT contain a bare proxy_pass that would
+        trigger DNS resolution at nginx startup.  It must use the
+        set+variable form so nginx defers resolution to request time.
+        """
+        out = str(tmp_path / "out.conf")
+        template_engine.render_nginx_conf(
+            NGINX_TEMPLATE, out,
+            user_name="alice", service_name="myapp", label="0",
+            domain_name="example.com", htpasswd_path="",
+        )
+        content = Path(out).read_text()
+        # Must NOT contain bare proxy_pass (without $ prefix)
+        import re
+        bare_matches = re.findall(r"proxy_pass\s+http://[^$;\s]+", content)
+        assert len(bare_matches) == 0, (
+            f"Found bare proxy_pass directives that would cause nginx to "
+            f"resolve DNS at startup (may hang if upstream is missing): {bare_matches}"
+        )
 
     def test_render_compose_two_users_independent(self, tmp_path):
         out_alice = str(tmp_path / "alice.yml")

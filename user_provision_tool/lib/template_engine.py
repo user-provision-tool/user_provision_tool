@@ -298,5 +298,40 @@ def render_nginx_conf(
     if not htpasswd_path:
         # Strip auth_basic directives — no password was set for this user
         rendered = re.sub(r'[ \t]*auth_basic[^\n]*\n', '', rendered)
+
+    # ------------------------------------------------------------------
+    # Rewrite static proxy_pass → variable-based for per-request DNS
+    # resolution.  Without this, nginx resolves the upstream hostname
+    # ONCE at startup and caches the IP forever.  If the container
+    # restarts or is missing at reload time, nginx hangs.  With
+    # variables, resolution is deferred to request time and nginx
+    # starts/reloads cleanly regardless of upstream state.
+    #
+    #  Before:  proxy_pass http://myapp-user_alice-0-web:80;
+    #  After:   set $upstream_abc12 myapp-user_alice-0-web:80;
+    #           proxy_pass http://$upstream_abc12;
+    # ------------------------------------------------------------------
+    _upstream_counter = 0
+
+    def _rewrite_proxy_pass(m: re.Match) -> str:
+        nonlocal _upstream_counter
+        scheme = m.group("scheme")
+        host = m.group("host")
+        port = m.group("port") or ""
+        target = f"{host}{port}"
+        var_name = f"upstream_{_upstream_counter:04d}"
+        _upstream_counter += 1
+        return (
+            f"{m.group('indent')}set ${var_name} {target};\n"
+            f"{m.group('indent')}proxy_pass {scheme}${var_name};"
+        )
+
+    rendered = re.sub(
+        r"^(?P<indent>[ \t]*)proxy_pass\s+(?P<scheme>https?://)(?P<host>[^:;\s]+)(?P<port>:\d+)?\s*;",
+        _rewrite_proxy_pass,
+        rendered,
+        flags=re.MULTILINE,
+    )
+
     with open(output_path, "w") as f:
         f.write(rendered)

@@ -478,10 +478,11 @@ if [ -f "$FC_NGINX_CONF" ]; then
     fi
     # Verify proxy_pass target was rendered with container_prefix
     # (web matches compose service key → {{ container_prefix }}web → myapp-user_fileuser-0-web)
-    if grep -q "proxy_pass.*myapp-user_fileuser-0-web:80" "$FC_NGINX_CONF"; then
+    # Now uses variable-based form: set $upstream_XXXX myapp-user_fileuser-0-web:80;
+    if grep -q "myapp-user_fileuser-0-web:80" "$FC_NGINX_CONF"; then
         pass "proxy_pass rendered with correct container_prefix (compose service name match)"
     else
-        fail "proxy_pass missing rendered container name (compose service name): $(grep proxy_pass "$FC_NGINX_CONF" || echo 'no proxy_pass found')"
+        fail "proxy_pass missing rendered container name (compose service name): $(grep -E 'set \$upstream_|proxy_pass' "$FC_NGINX_CONF" || echo 'no proxy_pass found')"
     fi
     # The original host 'web' should NOT appear in the rendered output (it was templatized)
     if grep -q "http://web:" "$FC_NGINX_CONF"; then
@@ -1010,10 +1011,11 @@ fi
 SVC_NGINX="${PROVISION_DIR}/generated/svcname_test.user-svcuser.0.nginx.conf"
 if [ -f "$SVC_NGINX" ]; then
     # The rendered conf must have the full container name: svcname_test-user_svcuser-0-web
-    if grep -q "proxy_pass.*svcname_test-user_svcuser-0-web:80" "$SVC_NGINX"; then
+    # Now uses variable-based form: set $upstream_XXXX svcname_test-user_svcuser-0-web:80;
+    if grep -q "svcname_test-user_svcuser-0-web:80" "$SVC_NGINX"; then
         pass "Rendered nginx conf has correct container name in proxy_pass"
     else
-        fail "Rendered nginx conf missing container name: $(grep proxy_pass "$SVC_NGINX" || echo 'no proxy_pass')"
+        fail "Rendered nginx conf missing container name: $(grep -E 'set \$upstream_|proxy_pass' "$SVC_NGINX" || echo 'no proxy_pass')"
     fi
     # The raw template variable {{ container_prefix }} must NOT appear
     if grep -q "{{ container_prefix }}" "$SVC_NGINX"; then
@@ -2001,6 +2003,138 @@ if [ -f "$TASK_LOG_FILE" ]; then
 else
     fail "Per-task log file not found at: $TASK_LOG_FILE (test 40 may have failed)"
 fi
+
+# ---------------------------------------------------------------------------
+# Test 42: Nginx resilience — reload succeeds even with missing upstreams
+#
+# The provision-api now generates per-user nginx confs with variable-based
+# proxy_pass (set $upstream_XXXX ...; proxy_pass http://$upstream_XXXX;).
+# This means nginx defers DNS resolution to request time and does NOT hang
+# or fail at reload even when the upstream container is missing.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- Test 42: Nginx reloads cleanly with missing upstream containers ---"
+
+# Step 1: Deploy a service so we have an nginx conf pointing to a container
+RESILIENCE_USER="resilience"
+mkdir -p "${PROVISION_DIR}/user-data/${RESILIENCE_USER}/app" "${PROVISION_DIR}/user-data/${RESILIENCE_USER}/db"
+
+RESILIENCE_BODY=$(cat <<EOF
+{
+  "user_name": "${RESILIENCE_USER}",
+  "service_name": "myapp",
+  "compose_template_path": "${PROVISION_DIR}/templates/docker-compose.template.yml.j2",
+  "nginx_conf_template_path": "${PROVISION_DIR}/templates/myapp.template.nginx.conf.j2",
+  "label": "0",
+  "domain": "localhost",
+  "passwd": "",
+  "volumes": {
+    "app_data": "${PROVISION_DIR}/user-data/${RESILIENCE_USER}/app",
+    "db_data":  "${PROVISION_DIR}/user-data/${RESILIENCE_USER}/db"
+  }
+}
+EOF
+)
+
+deploy_resp=$(curl -sf -X POST "$API_URL/users" \
+    -H "Content-Type: application/json" \
+    -d "$RESILIENCE_BODY")
+deploy_tid=$(echo "$deploy_resp" | python3 -c "import sys,json; print(json.load(sys.stdin)['task_id'])" 2>/dev/null || echo "")
+
+if [ -n "$deploy_tid" ]; then
+    # Wait for deploy to complete
+    for i in $(seq 1 30); do
+        tstat=$(curl -sf "$API_URL/tasks/$deploy_tid")
+        ts=$(echo "$tstat" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])" 2>/dev/null || echo "")
+        if [ "$ts" = "completed" ]; then
+            pass "Resilience test: deploy completed"
+            break
+        elif [ "$ts" = "failed" ]; then
+            fail "Resilience test: deploy failed"
+            break
+        fi
+        sleep 1
+    done
+else
+    fail "Resilience test: deploy did not return task_id"
+fi
+
+# Step 2: Verify the generated nginx conf uses variable-based proxy_pass
+NGINX_CONF="${PROVISION_DIR}/generated/myapp.user-${RESILIENCE_USER}.0.nginx.conf"
+if [ -f "$NGINX_CONF" ]; then
+    if grep -q 'set \$upstream_' "$NGINX_CONF"; then
+        pass "Generated nginx conf uses variable-based proxy_pass (set \$upstream_...)"
+    else
+        fail "Generated nginx conf missing variable-based proxy_pass"
+    fi
+    if grep -q 'proxy_pass http://\$upstream_' "$NGINX_CONF"; then
+        pass "Generated nginx conf has proxy_pass http://\$upstream_..."
+    else
+        fail "Generated nginx conf missing proxy_pass with variable"
+    fi
+    # Must NOT have bare proxy_pass (without $ prefix)
+    if grep -qE 'proxy_pass\s+http://[^$]' "$NGINX_CONF"; then
+        fail "Generated nginx conf has BARE proxy_pass (would trigger DNS at startup!)"
+    else
+        pass "Generated nginx conf has NO bare proxy_pass — safe for missing upstreams"
+    fi
+else
+    fail "Generated nginx conf not found at $NGINX_CONF"
+fi
+
+# Step 3: Reload nginx — must succeed even though containers exist (normal case)
+if docker exec provision-nginx nginx -s reload 2>/dev/null; then
+    pass "nginx -s reload succeeds with active upstreams"
+else
+    fail "nginx -s reload failed with active upstreams"
+fi
+sleep 1
+
+# Step 4: Stop the containers to simulate missing upstream
+COMPOSE_FILE="${PROVISION_DIR}/templates/docker-compose.user-${RESILIENCE_USER}.0.yml"
+PROJECT_NAME="myapp-user_${RESILIENCE_USER}-0"
+docker compose -f "$COMPOSE_FILE" -p "$PROJECT_NAME" stop 2>/dev/null || true
+sleep 2
+
+# Step 5: Reload nginx — must succeed even with STOPPED containers
+if docker exec provision-nginx nginx -s reload 2>/dev/null; then
+    pass "nginx -s reload succeeds with STOPPED upstream containers"
+else
+    fail "nginx -s reload FAILED with stopped upstream containers"
+fi
+sleep 1
+
+# Step 6: Remove the containers entirely
+docker compose -f "$COMPOSE_FILE" -p "$PROJECT_NAME" down 2>/dev/null || true
+sleep 2
+
+# Step 7: Reload nginx — must succeed even with REMOVED containers
+# This is the critical test: before the variable-based proxy_pass change,
+# nginx would hang during reload trying to resolve the missing hostname.
+if docker exec provision-nginx nginx -s reload 2>/dev/null; then
+    pass "nginx -s reload succeeds with REMOVED upstream containers (critical!)"
+else
+    fail "nginx -s reload FAILED with removed upstream containers — nginx may be stuck"
+fi
+sleep 1
+
+# Step 8: Verify nginx is still healthy
+if docker exec provision-nginx nginx -t 2>/dev/null; then
+    pass "nginx -t passes after all resilience tests"
+else
+    fail "nginx -t failed after resilience tests"
+fi
+
+# Step 9: Verify nginx is still serving (health check)
+NGINX_STATUS=$(docker inspect provision-nginx --format '{{.State.Status}}' 2>/dev/null || echo "unknown")
+if [ "$NGINX_STATUS" = "running" ]; then
+    pass "nginx container is still running after resilience tests"
+else
+    fail "nginx container status is '$NGINX_STATUS' (expected running)"
+fi
+
+# Cleanup: remove the test user from registry
+curl -sf -X DELETE "$API_URL/users/${RESILIENCE_USER}/services/myapp/0" >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
 # Results

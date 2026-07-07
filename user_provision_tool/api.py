@@ -1116,3 +1116,181 @@ def _compute_service_stats() -> dict[str, Any]:
             "expected": len(all_entries),
         }
     }
+
+
+# ---------------------------------------------------------------------------
+# GET /ssl-certs  —  list available SSL certificate domains
+# ---------------------------------------------------------------------------
+
+import datetime
+import subprocess
+
+class SSLCertUploadRequest(BaseModel):
+    domain: str
+    fullchain: str = ""    # PEM content (paste mode)
+    privkey: str = ""      # PEM content (paste mode)
+    ssl_path: str = ""     # Path to dir containing fullchain.pem + privkey.pem (path mode)
+
+
+def _get_cert_expiry(cert_path: Path) -> tuple[str, int]:
+    """Return (iso8601-date, days_until_expiry) for a certificate file.
+
+    Returns ("unknown", -1) on any error.
+    """
+    try:
+        cp = subprocess.run(
+            ["openssl", "x509", "-enddate", "-noout", "-in", str(cert_path)],
+            capture_output=True, text=True, timeout=10,
+        )
+        if cp.returncode != 0:
+            return ("unknown", -1)
+        # output format: "notAfter=Oct  5 14:12:06 2026 GMT"
+        date_str = cp.stdout.strip().split("=", 1)[-1]
+        end_dt = datetime.datetime.strptime(date_str, "%b %d %H:%M:%S %Y %Z")
+        iso = end_dt.strftime("%Y-%m-%d")
+        days = (end_dt - datetime.datetime.utcnow()).days
+        return (iso, days)
+    except Exception:
+        return ("unknown", -1)
+
+
+@app.get("/ssl-certs")
+def list_ssl_certs() -> dict[str, Any]:
+    """List available SSL certificate domains.
+
+    Returns domain names that have both fullchain.pem and privkey.pem
+    in ``SSL_DIR/{domain}/``, plus expiry info for each cert.
+    """
+    domains = []
+    if SSL_DIR.exists():
+        for d in sorted(SSL_DIR.iterdir()):
+            if not d.is_dir():
+                continue
+            chain = d / "fullchain.pem"
+            key = d / "privkey.pem"
+            if chain.is_file() and key.is_file():
+                expiry_date, days_left = _get_cert_expiry(chain)
+                domains.append({
+                    "domain": d.name,
+                    "fullchain_path": str(chain),
+                    "privkey_path": str(key),
+                    "created_at": "",  # could stat the files
+                    "expiry_date": expiry_date,
+                    "days_left": days_left,
+                })
+    return {"domains": domains}
+
+
+@app.post("/ssl-certs", status_code=201)
+def upload_ssl_cert(req: SSLCertUploadRequest) -> dict[str, Any]:
+    """Upload SSL certificates for a domain.
+
+    Supports two modes:
+    - **Paste mode**: provide ``fullchain`` and ``privkey`` PEM content.
+    - **Path mode**: provide ``ssl_path`` (directory containing
+      fullchain.pem and privkey.pem).  The files are read from that path.
+
+    Saves fullchain.pem and privkey.pem to ``SSL_DIR/{domain}/``.
+    Overwrites existing files.
+    """
+    domain = req.domain.strip()
+    if not domain or "/" in domain or ".." in domain:
+        raise HTTPException(400, "Invalid domain name")
+
+    cert_dir = SSL_DIR / domain
+    cert_dir.mkdir(parents=True, exist_ok=True)
+
+    fullchain_content: str
+    privkey_content: str
+
+    if req.ssl_path:
+        # Path mode: read files from the provided directory path
+        src = Path(req.ssl_path).resolve()
+        # Basic safety: prevent traversal outside reasonable paths
+        if not src.is_dir():
+            raise HTTPException(400, f"SSL path is not a directory: {req.ssl_path}")
+        chain_src = src / "fullchain.pem"
+        key_src = src / "privkey.pem"
+        if not chain_src.is_file():
+            raise HTTPException(400, f"fullchain.pem not found in: {req.ssl_path}")
+        if not key_src.is_file():
+            raise HTTPException(400, f"privkey.pem not found in: {req.ssl_path}")
+        fullchain_content = chain_src.read_text()
+        privkey_content = key_src.read_text()
+        # Store source path for later refresh
+        (cert_dir / ".source_path").write_text(str(src))
+    else:
+        # Paste mode: use the PEM content from the request
+        fullchain_content = req.fullchain
+        privkey_content = req.privkey
+
+    (cert_dir / "fullchain.pem").write_text(fullchain_content)
+    (cert_dir / "privkey.pem").write_text(privkey_content)
+
+    expiry_date, days_left = _get_cert_expiry(cert_dir / "fullchain.pem")
+
+    return {
+        "domain": domain,
+        "fullchain_path": str(cert_dir / "fullchain.pem"),
+        "privkey_path": str(cert_dir / "privkey.pem"),
+        "expiry_date": expiry_date,
+        "days_left": days_left,
+        "message": f"SSL certificates saved for {domain}",
+    }
+
+
+@app.post("/ssl-certs/{domain}/refresh")
+def refresh_ssl_cert(domain: str) -> dict[str, Any]:
+    """Refresh SSL certificates for a domain from its original source path.
+
+    Reads the stored ``.source_path`` file inside ``SSL_DIR/{domain}/``
+    and re-imports fullchain.pem + privkey.pem from that directory.
+    """
+    cert_dir = SSL_DIR / domain
+    if not cert_dir.exists():
+        raise HTTPException(404, f"No certificates found for domain: {domain}")
+
+    source_file = cert_dir / ".source_path"
+    if not source_file.exists():
+        raise HTTPException(
+            400,
+            f"No source path stored for {domain}. "
+            "Re-upload using ssl_path mode to enable refresh.",
+        )
+
+    src = Path(source_file.read_text().strip())
+    if not src.is_dir():
+        raise HTTPException(400, f"Source path no longer exists: {src}")
+
+    chain_src = src / "fullchain.pem"
+    key_src = src / "privkey.pem"
+    if not chain_src.is_file():
+        raise HTTPException(400, f"fullchain.pem not found in: {src}")
+    if not key_src.is_file():
+        raise HTTPException(400, f"privkey.pem not found in: {src}")
+
+    (cert_dir / "fullchain.pem").write_text(chain_src.read_text())
+    (cert_dir / "privkey.pem").write_text(key_src.read_text())
+
+    expiry_date, days_left = _get_cert_expiry(cert_dir / "fullchain.pem")
+
+    return {
+        "domain": domain,
+        "fullchain_path": str(cert_dir / "fullchain.pem"),
+        "privkey_path": str(cert_dir / "privkey.pem"),
+        "expiry_date": expiry_date,
+        "days_left": days_left,
+        "message": f"SSL certificates refreshed for {domain}",
+    }
+
+
+@app.delete("/ssl-certs/{domain}")
+def delete_ssl_cert(domain: str) -> dict[str, Any]:
+    """Delete SSL certificates for a domain."""
+    cert_dir = SSL_DIR / domain
+    if not cert_dir.exists():
+        raise HTTPException(404, f"No certificates found for domain: {domain}")
+
+    import shutil
+    shutil.rmtree(cert_dir)
+    return {"domain": domain, "message": f"SSL certificates deleted for {domain}"}

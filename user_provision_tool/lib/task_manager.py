@@ -2,7 +2,8 @@
 
 Provides a thread-pool-backed task queue so long-running Docker operations
 (register, rebuild, remove) don't block the API.  Each task gets a UUID,
-runs on a worker thread, and reports status through in-memory storage.
+runs on a worker thread, and reports status through in-memory storage
+with disk persistence for surviving restarts.
 
 Usage::
 
@@ -20,6 +21,7 @@ Usage::
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
@@ -37,7 +39,7 @@ class Task:
         "result", "error", "_future", "_cancel_event", "log_file",
     )
 
-    def __init__(self, task_id: str, task_type: str, future: Future, log_file: str = ""):
+    def __init__(self, task_id: str, task_type: str, future: Future = None, log_file: str = ""):
         self.task_id = task_id
         self.type = task_type          # "register" | "rebuild" | "remove"
         self.status = "pending"        # pending → running → completed | failed | cancelled
@@ -60,6 +62,27 @@ class Task:
             "error": self.error,
         }
 
+    @classmethod
+    def from_dict(cls, d: dict) -> "Task":
+        """Reconstruct a Task from a persisted dict (no future/cancel_event)."""
+        task = cls(
+            task_id=d["task_id"],
+            task_type=d.get("type", "unknown"),
+            log_file=d.get("log_file", ""),
+        )
+        task.status = d.get("status", "unknown")
+        task.created_at = d.get("created_at", 0)
+        task.updated_at = d.get("updated_at", 0)
+        task.result = d.get("result")
+        task.error = d.get("error")
+        return task
+
+    def to_persist_dict(self) -> dict[str, Any]:
+        """Dict for disk persistence (includes log_file path)."""
+        d = self.to_dict()
+        d["log_file"] = self.log_file
+        return d
+
 
 class TaskManager:
     """In-memory task pool backed by a ThreadPoolExecutor.
@@ -68,6 +91,9 @@ class TaskManager:
     *ttl_seconds* are cleaned up, and if the total number exceeds *max_tasks*,
     the oldest are evicted first.  Task log files are deleted alongside their
     task entries.
+
+    Task metadata is persisted to ``task_registry.json`` in *log_dir* so
+    that task history survives provision-api restarts (up to TTL).
     """
 
     def __init__(
@@ -84,6 +110,52 @@ class TaskManager:
         self._max_tasks = max_tasks
         self._log_dir = Path(log_dir) if log_dir else Path(".")
         self._log_dir.mkdir(parents=True, exist_ok=True)
+        self._registry_file = self._log_dir / "task_registry.json"
+
+        # Restore tasks from disk
+        self._restore_from_disk()
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    def _restore_from_disk(self) -> None:
+        """Load previously persisted tasks from the registry JSON file."""
+        if not self._registry_file.exists():
+            return
+        try:
+            with open(self._registry_file, "r") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return
+
+        now = time.time()
+        restored = 0
+        for task_dict in data.get("tasks", []):
+            task = Task.from_dict(task_dict)
+            # Skip tasks that have already exceeded TTL
+            if task.status in ("completed", "failed", "cancelled", "unknown"):
+                if (now - task.updated_at) > self._ttl:
+                    self._delete_task_log(task.log_file)
+                    continue
+            # Mark any non-terminal tasks as "unknown" since they didn't survive restart
+            if task.status in ("pending", "running"):
+                task.status = "unknown"
+                task.error = "provision-api restarted — task state lost"
+                task.updated_at = now
+            self._tasks[task.task_id] = task
+            restored += 1
+        if restored > 0:
+            print(f"[task_manager] Restored {restored} tasks from {self._registry_file}")
+
+    def _persist_to_disk(self) -> None:
+        """Save current task metadata to the registry JSON file."""
+        try:
+            tasks_data = [t.to_persist_dict() for t in self._tasks.values()]
+            with open(self._registry_file, "w") as f:
+                json.dump({"tasks": tasks_data, "updated_at": time.time()}, f, default=str)
+        except OSError:
+            pass  # Don't crash if we can't persist
 
     # ------------------------------------------------------------------
     # Public API
@@ -105,6 +177,7 @@ class TaskManager:
         with self._lock:
             self._tasks[task_id] = task
             self._cleanup_excess()
+            self._persist_to_disk()
 
         real_future = self._executor.submit(
             self._run_task, task_id, task_type, fn, *args, **kwargs
@@ -138,6 +211,7 @@ class TaskManager:
         task._cancel_event.set()
         task.status = "cancelled"
         task.updated_at = time.time()
+        self._persist_to_disk()
         return True
 
     def list_all(self) -> list[dict[str, Any]]:
@@ -168,6 +242,7 @@ class TaskManager:
 
         task.status = "running"
         task.updated_at = time.time()
+        self._persist_to_disk()
 
         cancel_event = kwargs.pop("_cancel_event", None)
         if cancel_event is not None:
@@ -183,6 +258,7 @@ class TaskManager:
         finally:
             task.updated_at = time.time()
             docker_ops.clear_task_log_file()
+            self._persist_to_disk()
 
     def _cleanup_stale(self) -> None:
         """Remove finished tasks older than _ttl and delete their log files."""
@@ -190,12 +266,15 @@ class TaskManager:
         with self._lock:
             stale = [
                 (tid, t) for tid, t in self._tasks.items()
-                if t.status in ("completed", "failed", "cancelled")
+                if t.status in ("completed", "failed", "cancelled", "unknown")
                 and (now - t.updated_at) > self._ttl
             ]
+            if not stale:
+                return
             for tid, t in stale:
                 self._delete_task_log(t.log_file)
                 del self._tasks[tid]
+            self._persist_to_disk()
 
     def _cleanup_excess(self) -> None:
         """Remove oldest tasks if total exceeds _max_tasks and delete their logs."""
@@ -210,6 +289,7 @@ class TaskManager:
         for tid, t in sorted_tasks[:to_remove]:
             self._delete_task_log(t.log_file)
             del self._tasks[tid]
+        self._persist_to_disk()
 
     @staticmethod
     def _delete_task_log(log_file: str) -> None:

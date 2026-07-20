@@ -273,9 +273,10 @@ class TestTaskManager:
         assert task["status"] == "completed"
         assert task["result"] == 42
 
-    def test_list_all_returns_all_tasks(self):
+    def test_list_all_returns_all_tasks(self, tmp_path):
         from lib.task_manager import TaskManager
-        tm = TaskManager(max_workers=4)
+        log_dir = tmp_path / "task_logs"
+        tm = TaskManager(max_workers=4, log_dir=str(log_dir))
         import time
 
         ids = [tm.submit("test", lambda x: x, i) for i in range(3)]
@@ -290,8 +291,9 @@ class TestTaskManager:
         assert tasks[0]["task_id"] == ids[2]
         assert tasks[2]["task_id"] == ids[0]
 
-    def test_list_all_empty(self):
+    def test_list_all_empty(self, tmp_path):
         from lib.task_manager import TaskManager
-        tm = TaskManager()
+        log_dir = tmp_path / "task_logs"
+        tm = TaskManager(log_dir=str(log_dir))
         tasks = tm.list_all()
         assert tasks == []

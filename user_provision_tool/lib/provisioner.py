@@ -164,8 +164,8 @@ def register_user(
         # --- Resolve fullchain ---
         # Bare filename (no path separator) → look up directly in /provision/ssl/{domain}/
         # Full / relative path → copy to /provision/ssl/{domain}/fullchain.pem (normalized name)
-        _fc = Path(fullchain).resolve()
-        if _fc.is_absolute() or "/" in str(fullchain):
+        if Path(fullchain).is_absolute() or "/" in str(fullchain):
+            _fc = Path(fullchain).resolve()
             if not _fc.is_file():
                 raise ValueError(
                     f"https=True: fullchain file not found at {fullchain}"
@@ -182,8 +182,8 @@ def register_user(
                 )
 
         # --- Resolve privkey (same logic) ---
-        _pk = Path(privkey).resolve()
-        if _pk.is_absolute() or "/" in str(privkey):
+        if Path(privkey).is_absolute() or "/" in str(privkey):
+            _pk = Path(privkey).resolve()
             if not _pk.is_file():
                 raise ValueError(
                     f"https=True: privkey file not found at {privkey}"

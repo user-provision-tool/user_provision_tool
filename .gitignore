@@ -33,3 +33,4 @@ _ref/
 example/
 */tests/fixtures/docker-compose.user-*
 _ignore/
+task_registry.json

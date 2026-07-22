@@ -46,6 +46,7 @@ add `?sync=true` to any mutable endpoint.
 | `POST` | `/ssl-certs` | Upload SSL certificates for a domain |
 | `POST` | `/ssl-certs/{domain}/refresh` | Refresh certs from original source path |
 | `DELETE` | `/ssl-certs/{domain}` | Delete SSL certificates for a domain |
+| `GET` | `/services/{service_name}/check-missing-files` | Check which essential deployment files are missing |
 
 ---
 

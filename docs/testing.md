@@ -172,7 +172,7 @@ bash tests/test_integration.sh
 ### Run all tests
 
 ```bash
-# All pytest-based tests (292 tests, no Docker needed)
+# All pytest-based tests (297 tests, no Docker needed)
 uv run pytest tests/test_unit.py tests/test_e2e.py tests/test_proxy_support.py tests/test_task_manager.py -v
 
 # Full integration (120 tests, requires Docker)
@@ -194,7 +194,7 @@ uv sync
 python -m pytest tests/test_unit.py tests/test_e2e.py -v
 ```
 
-Expected: **292 passed** (192 unit + 40 e2e + 38 proxy + 14 task_manager + 8 api).
+Expected: **297 passed** (197 unit + 40 e2e + 38 proxy + 14 task_manager + 8 api).
 
 ---
 

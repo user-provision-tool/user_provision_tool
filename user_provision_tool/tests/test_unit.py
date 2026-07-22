@@ -2766,3 +2766,99 @@ class TestAPINewEndpoints:
         })
         assert response.status_code == 202, f"Register {user_name} failed: {response.text}"
         return response.json()
+
+
+# ---------------------------------------------------------------------------
+# Tests for check-missing-files endpoint (dev-debug-cycle task 3.2.1.4)
+# ---------------------------------------------------------------------------
+
+class TestCheckMissingFiles:
+    """Tests for the GET /services/{service_name}/check-missing-files endpoint."""
+
+    def test_check_missing_files_response_model_exists(self):
+        """CheckMissingFilesResponse model should be importable with correct fields."""
+        from api import CheckMissingFilesResponse
+        assert CheckMissingFilesResponse is not None
+        # Verify the model fields
+        fields = CheckMissingFilesResponse.model_fields
+        assert "service_name" in fields
+        assert "ready" in fields
+        assert "missing" in fields
+        assert "existing" in fields
+
+    def test_check_missing_files_endpoint_registered(self, monkeypatch):
+        """The endpoint should be registered on the FastAPI app."""
+        from api import app
+        routes = [r.path for r in app.routes]
+        assert "/services/{service_name}/check-missing-files" in routes, (
+            f"check-missing-files route not found in app routes"
+        )
+
+    def test_check_missing_files_missing_service_returns_404(self, monkeypatch):
+        """When the service directory doesn't exist, endpoint returns 404."""
+        # Mock SOURCE_PROJECTS_DIR to a non-existent path
+        import api
+        from pathlib import Path
+        original = api.SOURCE_PROJECTS_DIR
+        try:
+            api.SOURCE_PROJECTS_DIR = Path("/nonexistent/path/xyz")
+            from fastapi.testclient import TestClient
+            client = TestClient(api.app)
+            response = client.get("/services/nonexistent_service/check-missing-files")
+            assert response.status_code == 404
+        finally:
+            api.SOURCE_PROJECTS_DIR = original
+
+    def test_check_missing_files_all_present(self, tmp_path, monkeypatch):
+        """When all essential files exist, ready=true and missing=[]."""
+        import api
+        from pathlib import Path
+
+        # Create a temp service directory with all essential files
+        svc_dir = tmp_path / "myapp"
+        svc_dir.mkdir()
+        (svc_dir / "docker-compose.yml").write_text("services:\n  web:\n    build: .")
+        (svc_dir / "nginx.conf").write_text("server { listen 80; }")
+        (svc_dir / "Dockerfile").write_text("FROM python:3.13")
+        (svc_dir / ".env").write_text("DEBUG=true")
+
+        original = api.SOURCE_PROJECTS_DIR
+        try:
+            api.SOURCE_PROJECTS_DIR = tmp_path
+            from fastapi.testclient import TestClient
+            client = TestClient(api.app)
+            response = client.get("/services/myapp/check-missing-files")
+            assert response.status_code == 200
+            data = response.json()
+            assert data["ready"] is True
+            assert data["missing"] == []
+            assert len(data["existing"]) == 4
+        finally:
+            api.SOURCE_PROJECTS_DIR = original
+
+    def test_check_missing_files_with_j2_templates(self, tmp_path, monkeypatch):
+        """When .j2 templates exist instead of plain files, ready=true."""
+        import api
+        from pathlib import Path
+
+        svc_dir = tmp_path / "myapp_j2"
+        svc_dir.mkdir()
+        (svc_dir / "docker-compose.yml.j2").write_text("services:\n  web: {{ container_prefix }}")
+        (svc_dir / "nginx.conf.j2").write_text("server { server_name {{ hostname }}; }")
+        (svc_dir / "Dockerfile").write_text("FROM python:3.13")
+
+        original = api.SOURCE_PROJECTS_DIR
+        try:
+            api.SOURCE_PROJECTS_DIR = tmp_path
+            from fastapi.testclient import TestClient
+            client = TestClient(api.app)
+            response = client.get("/services/myapp_j2/check-missing-files")
+            assert response.status_code == 200
+            data = response.json()
+            assert data["ready"] is False  # .env is missing
+            assert ".env" in data["missing"]
+            assert "docker-compose" in data["existing"]
+            assert "nginx.conf" in data["existing"]
+            assert "Dockerfile" in data["existing"]
+        finally:
+            api.SOURCE_PROJECTS_DIR = original

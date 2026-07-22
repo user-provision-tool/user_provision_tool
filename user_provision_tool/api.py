@@ -833,6 +833,88 @@ async def stream_task_log(
 
 
 # ---------------------------------------------------------------------------
+# Service deployment files readiness check
+# ---------------------------------------------------------------------------
+
+class CheckMissingFilesResponse(BaseModel):
+    service_name: str
+    project_root: str | None = None
+    ready: bool
+    missing: list[str]
+    existing: list[str]
+
+
+@app.get("/services/{service_name}/check-missing-files")
+def check_missing_files(service_name: str) -> CheckMissingFilesResponse:
+    """Check which essential deployment files are missing for a service.
+
+    Essential files for deployment:
+      - docker-compose.yml (or .yml.j2 template)
+      - nginx.conf (or .conf.j2 template)
+      - .env (recommended, but not strictly required)
+      - Dockerfile (or build context)
+
+    Returns a list of missing file types so the gateway can offer
+    LLM-based generation or manual upload before deployment.
+    """
+    project_dir = SOURCE_PROJECTS_DIR / service_name
+    if not project_dir.is_dir():
+        raise HTTPException(404, f"Service '{service_name}' not found")
+
+    files = [f.name for f in project_dir.iterdir() if f.is_file()]
+
+    has_compose = any(
+        f.endswith(".yml.j2") or f.endswith(".yaml.j2") or
+        (f.endswith(".yml") and not f.endswith(".j2")) or
+        (f.endswith(".yaml") and not f.endswith(".j2"))
+        for f in files
+    )
+    has_nginx = any(
+        f.endswith(".conf.j2") or
+        (f.endswith(".conf") and not f.endswith(".j2"))
+        for f in files
+    )
+    has_dockerfile = any(
+        f == "Dockerfile" or f.lower().endswith("dockerfile")
+        for f in files
+    )
+    has_env = any(
+        f == ".env" for f in files
+    )
+
+    missing: list[str] = []
+    existing: list[str] = []
+
+    if has_compose:
+        existing.append("docker-compose")
+    else:
+        missing.append("docker-compose")
+
+    if has_nginx:
+        existing.append("nginx.conf")
+    else:
+        missing.append("nginx.conf")
+
+    if has_dockerfile:
+        existing.append("Dockerfile")
+    else:
+        missing.append("Dockerfile")
+
+    if has_env:
+        existing.append(".env")
+    else:
+        missing.append(".env")
+
+    return CheckMissingFilesResponse(
+        service_name=service_name,
+        project_root=str(project_dir),
+        ready=len(missing) == 0,
+        missing=missing,
+        existing=existing,
+    )
+
+
+# ---------------------------------------------------------------------------
 # GET /users  — all users status
 # ---------------------------------------------------------------------------
 

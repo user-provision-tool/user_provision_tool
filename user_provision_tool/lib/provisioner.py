@@ -20,6 +20,25 @@ from .compose_converter import get_compose_service_names
 _registry_lock = threading.Lock()
 
 
+def _update_registry_status(user_name: str, service_name: str, label: str, status: str) -> None:
+    """Update the status field of a registry entry (building → running).
+
+    Used so the API can report accurate service state during long builds.
+    Thread-safe: acquires _registry_lock.
+    """
+    with _registry_lock:
+        users = registry._load()
+        for u in users:
+            if (
+                u.get("user_name") == user_name
+                and u.get("service_name") == service_name
+                and str(u.get("label", "")) == str(label)
+            ):
+                u["status"] = status
+                break
+        registry._save(users)
+
+
 def _auto_volumes(
     compose_template: str,
     user_name: str,
@@ -281,16 +300,31 @@ def register_user(
             ssl_certificate_key_path=ssl_certificate_key_path,
         )
 
+    # --- Mark as building (container not yet started) ---
+    _update_registry_status(user_name, service_name, label, "building")
+
     # --- Start containers ---
     try:
         if build_args:
             docker_ops.compose_build(compose_out, env_file=copied_env, project_name=entry["network_name"], build_args=build_args)
         docker_ops.compose_up(compose_out, env_file=copied_env, project_name=entry["network_name"])
     except RuntimeError:
-        # Rollback: remove registry entry so the caller can retry
+        # Rollback: tear down any partially-created Docker resources
+        # (containers, networks) so a retry doesn't hit "already exists" errors,
+        # then remove the registry entry.
+        import logging
+        _log = logging.getLogger(__name__)
+        try:
+            if Path(compose_out).exists():
+                docker_ops.compose_down(compose_out, project_name=entry["network_name"])
+        except Exception as down_err:
+            _log.warning("Failed to clean up Docker resources after failed deploy: %s", down_err)
         with _registry_lock:
             registry.remove_user_service(user_name, service_name, label)
         raise
+
+    # --- Mark as running (containers started successfully) ---
+    _update_registry_status(user_name, service_name, label, "running")
 
     # --- Connect provision-nginx to user network + reload ---
     net = entry["network_name"]
@@ -435,8 +469,15 @@ def rebuild_user(
     # Use explicit build_args if provided; otherwise fall back to registry-stored ones
     if build_args is None:
         build_args = entry.get("build_args") or None
-    docker_ops.compose_build(compose_file, no_cache=no_cache, env_file=env_file, project_name=project_name, build_args=build_args)
-    docker_ops.compose_up(compose_file, env_file=env_file, project_name=project_name)
+
+    _update_registry_status(user_name, service_name, label, "building")
+    try:
+        docker_ops.compose_build(compose_file, no_cache=no_cache, env_file=env_file, project_name=project_name, build_args=build_args)
+        docker_ops.compose_up(compose_file, env_file=env_file, project_name=project_name)
+    except Exception:
+        _update_registry_status(user_name, service_name, label, "error")
+        raise
+    _update_registry_status(user_name, service_name, label, "running")
 
     return {"user_name": user_name, "service_name": service_name, "label": label}
 

@@ -170,6 +170,10 @@ def render_compose(
 
     with open(output_path, "w") as f:
         f.write(rendered)
+    # Create .generated marker so the gateway UI shows it under "Generated Files"
+    Path(str(output_path) + ".generated").write_text("")
+    if copied_env:
+        Path(copied_env + ".generated").write_text("")
 
     return copied_env
 
@@ -335,3 +339,5 @@ def render_nginx_conf(
 
     with open(output_path, "w") as f:
         f.write(rendered)
+    # Create .generated marker so the gateway UI shows it under "Generated Files"
+    Path(str(output_path) + ".generated").write_text("")

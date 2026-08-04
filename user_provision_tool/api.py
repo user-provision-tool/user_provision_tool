@@ -335,6 +335,8 @@ def register_user(
         except Exception as e:
             raise HTTPException(422, f"could not convert compose file: {e}")
         compose_template = template_out
+        # Create .generated marker for the source compose file too
+        Path(str(compose_file_path) + ".generated").write_text("")
     else:
         if not Path(compose_template_path).exists():
             raise HTTPException(404, f"compose_template_path not found: {compose_template_path}")
@@ -370,6 +372,8 @@ def register_user(
         except Exception as e:
             raise HTTPException(422, f"could not convert nginx conf file: {e}")
         nginx_template = template_out
+        # Create .generated marker for the source nginx conf file too
+        Path(str(nginx_conf_file_path) + ".generated").write_text("")
     elif nginx_conf_template_path:
         if not Path(nginx_conf_template_path).exists():
             raise HTTPException(404, f"nginx_conf_template_path not found: {nginx_conf_template_path}")
@@ -1041,8 +1045,14 @@ def _status_for_user(user_name: str, running: dict[str, str]) -> dict[str, Any]:
             "missing_containers": missing,
         }
 
+        # Check if the service is currently being built
+        svc["status"] = entry.get("status", "unknown")
+
         if not Path(compose_file).exists():
             missing_services.append(svc)
+        elif entry.get("status") == "building":
+            # During build, containers don't exist yet — don't classify as missing/unhealthy
+            unhealthy_services.append(svc)
         elif len(healthy) == len(expected_names) and not unhealthy and not missing:
             healthy_services.append(svc)
         elif not healthy and not unhealthy:

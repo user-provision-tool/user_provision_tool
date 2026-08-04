@@ -47,6 +47,49 @@ def recover_on_startup(
     _log.info("nginx recovery: reconnecting to all user networks from registry")
 
     all_users = registry.get_all_users()
+
+    # --- Clean up zombie registry entries (written before compose_up but never started) ---
+    # A zombie entry has: registry entry exists, but NO containers exist for it.
+    # This happens when provision-api is killed between writing the registry and
+    # calling docker compose up (e.g., during a container restart).
+    # NOTE: use print() not _log.info() because the logging module may not have
+    # a handler configured at startup time.
+    zombies_cleaned = 0
+    zombies_restarted = 0
+    for entry in list(all_users):
+        container_names = entry.get("container_names") or []
+        compose_file = entry.get("compose_file_path", "")
+        network_name = entry.get("network_name", "")
+        user_name = entry.get("user_name", "")
+        service_name = entry.get("service_name", "")
+        label = str(entry.get("label", "0"))
+
+        if not container_names:
+            continue
+
+        # Check if any container for this entry exists (running or stopped)
+        any_exists = any(docker_ops.container_exists(c) for c in container_names)
+
+        if not any_exists:
+            # Zombie entry: registry says deployed, but no container exists.
+            if compose_file and Path(compose_file).exists():
+                env_file = entry.get("env_file_path") or None
+                print(f"[recovery] Zombie entry {user_name}/{service_name}/{label} — starting containers via compose_up", flush=True)
+                try:
+                    docker_ops.compose_up(compose_file, env_file=env_file, project_name=network_name)
+                    zombies_restarted += 1
+                    print(f"[recovery] Zombie entry {user_name}/{service_name}/{label} — started successfully", flush=True)
+                except Exception as exc:
+                    print(f"[recovery] WARNING: Failed to recover zombie {user_name}/{service_name}/{label}: {exc}", flush=True)
+            else:
+                print(f"[recovery] Removing zombie registry entry {user_name}/{service_name}/{label} — compose file missing", flush=True)
+                registry.remove_user_service(user_name, service_name, label)
+                zombies_cleaned += 1
+
+    # Reload registry after cleaning
+    if zombies_cleaned or zombies_restarted:
+        all_users = registry.get_all_users()
+
     networks = sorted({e["network_name"] for e in all_users if e.get("network_name")})
 
     reconnected = 0
@@ -65,8 +108,8 @@ def recover_on_startup(
         nginx_reloaded = False
 
     _log.info(
-        "nginx recovery complete: %d/%d networks reconnected, nginx %s",
-        reconnected, len(networks),
+        "nginx recovery complete: %d/%d networks reconnected, %d zombies restarted, %d zombies cleaned, nginx %s",
+        reconnected, len(networks), zombies_restarted, zombies_cleaned,
         "reloaded" if nginx_reloaded else "NOT reloaded",
     )
 
@@ -74,6 +117,8 @@ def recover_on_startup(
         "networks_reconnected": reconnected,
         "networks_total": len(networks),
         "nginx_reloaded": nginx_reloaded,
+        "zombies_restarted": zombies_restarted,
+        "zombies_cleaned": zombies_cleaned,
     }
 
 

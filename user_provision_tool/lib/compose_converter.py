@@ -398,6 +398,8 @@ def compose_file_to_template(
     _Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w") as f:
         f.write(header + template_body)
+    # Create .generated marker so the gateway UI shows it under "Generated Files"
+    _Path(str(output_path) + ".generated").write_text("")
 
     return src_to_key
 

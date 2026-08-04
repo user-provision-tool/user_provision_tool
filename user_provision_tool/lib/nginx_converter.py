@@ -265,5 +265,3 @@ def nginx_file_to_template(
     header = make_header(src.name, hint)
     converted = convert_nginx(text, hint, compose_service_names)
     Path(output_path).write_text(header + converted)
-    # Create .generated marker so the gateway UI shows it under "Generated Files"
-    Path(str(output_path) + ".generated").write_text("")

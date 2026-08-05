@@ -291,6 +291,8 @@ def register_user(
     if nginx_template and nginx_out:
         if htpasswd_out:
             auth.write_htpasswd_file(htpasswd_out, user_name, passwd_hash)
+            # Mark htpasswd as generated
+            Path(htpasswd_out + ".generated").write_text("")
         template_engine.render_nginx_conf(
             nginx_template, nginx_out,
             user_name, service_name, label,

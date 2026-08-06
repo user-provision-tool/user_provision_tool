@@ -1039,6 +1039,7 @@ def _status_for_user(user_name: str, running: dict[str, str]) -> dict[str, Any]:
             "healthy_containers": healthy,
             "unhealthy_containers": unhealthy,
             "missing_containers": missing,
+            "volumes": entry.get("volumes", {}),
         }
 
         # Check if the service is currently being built

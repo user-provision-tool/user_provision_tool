@@ -33,7 +33,7 @@ def _generated_dir() -> Path:
 
 
 def recover_on_startup(
-    nginx_container: str = "provision-nginx",
+    nginx_container: str = "subnet-acl-nginx",
 ) -> dict[str, Any]:
     """Reconnect nginx to every user network listed in the registry.
 
@@ -128,7 +128,7 @@ def recover_on_startup(
 
 
 def run_reconciliation(
-    nginx_container: str = "provision-nginx",
+    nginx_container: str = "subnet-acl-nginx",
 ) -> dict[str, Any]:
     """Run a live reconciliation pass.
 
@@ -281,7 +281,7 @@ def get_nginx_state() -> dict[str, Any]:
     # Check which networks nginx is actually connected to
     nginx_connected: list[str] = []
     for net in networks:
-        if docker_ops.network_connected_to_container(net, "provision-nginx"):
+        if docker_ops.network_connected_to_container(net, "subnet-acl-nginx"):
             nginx_connected.append(net)
 
     # Per-service container health (from stored container_names in registry)

@@ -339,7 +339,7 @@ def container_logs(container: str, tail: int = 100) -> str:
     return result.stdout
 
 
-def orphan_network_cleanup(network: str, nginx_container: str = "provision-nginx") -> bool:
+def orphan_network_cleanup(network: str, nginx_container: str = "subnet-acl-nginx") -> bool:
     """Clean up an orphaned network. Disconnect nginx and remove if only nginx is left.
     Returns True if the network was removed."""
     info = network_inspect(network)

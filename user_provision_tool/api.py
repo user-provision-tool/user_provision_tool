@@ -34,7 +34,7 @@ from pydantic import BaseModel, field_validator
 # Make lib/ importable when the file sits at the project root
 sys.path.insert(0, str(Path(__file__).parent))
 
-from lib import docker_ops, provisioner, reconciliation, registry, template_engine, validation
+from lib import docker_ops, provisioner, reconciliation, registry, subnet_manager, template_engine, validation
 from lib.compose_converter import compose_file_to_template, get_compose_service_names
 from lib.nginx_converter import nginx_file_to_template
 from lib.task_manager import task_manager
@@ -67,7 +67,7 @@ SSL_DIR = Path(
 )
 SSL_DIR.mkdir(parents=True, exist_ok=True)
 
-NGINX_CONTAINER = os.environ.get("NGINX_CONTAINER", "provision-nginx")
+NGINX_CONTAINER = os.environ.get("NGINX_CONTAINER", "subnet-acl-nginx")
 
 # The registry module reads REGISTRY_FILE from its own env var at import time.
 # We additionally sync it here so both the API and the lib use the same path.
@@ -285,7 +285,7 @@ def network_connect_ep(network: str, container: str) -> dict[str, Any]:
     return {"connected": True}
 
 @app.post("/docker/nginx/reload")
-def nginx_reload_ep(container: str = "provision-nginx") -> dict[str, Any]:
+def nginx_reload_ep(container: str = "subnet-acl-nginx") -> dict[str, Any]:
     docker_ops.nginx_reload(container)
     return {"reloaded": True}
 
@@ -1040,7 +1040,15 @@ def _status_for_user(user_name: str, running: dict[str, str]) -> dict[str, Any]:
             "unhealthy_containers": unhealthy,
             "missing_containers": missing,
             "volumes": entry.get("volumes", {}),
+            "subnet": entry.get("subnet", ""),
         }
+        # If subnet not in registry, try to discover from Docker (legacy)
+        if not svc["subnet"]:
+            net_name = entry.get("network_name", "")
+            if net_name:
+                discovered = subnet_manager.discover_subnet_from_docker(net_name)
+                if discovered:
+                    svc["subnet"] = discovered["subnet"]
 
         # Check if the service is currently being built
         svc["status"] = entry.get("status", "unknown")
@@ -1205,6 +1213,21 @@ def _compute_service_stats() -> dict[str, Any]:
             "expected": len(all_entries),
         }
     }
+
+
+# ---------------------------------------------------------------------------
+# GET /subnet-pool  —  subnet pool usage statistics
+# ---------------------------------------------------------------------------
+
+@app.get("/subnet-pool")
+def get_subnet_pool() -> dict[str, Any]:
+    """Return subnet pool usage statistics for the dashboard.
+
+    Data is computed from environment (SUBNET_POOLS) and registry entries.
+    When SUBNET_POOLS is not set, returns disabled state.
+    """
+    all_entries = registry.get_all_users()
+    return subnet_manager.get_pool_stats(all_entries)
 
 
 # ---------------------------------------------------------------------------

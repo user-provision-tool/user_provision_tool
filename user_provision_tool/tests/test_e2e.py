@@ -531,6 +531,72 @@ server {
         entry = reg_mod.get_user_service("alice", "myapp", "0")
         assert entry is None
 
+class TestE2ESubnetAllocation:
+    """Gap 7: the enabled subnet path (SUBNET_POOLS set) renders an ipam block
+    with a right-sized subnet, and pool exhaustion surfaces cleanly."""
+
+    @pytest.fixture()
+    def registered_with_subnet(self, tmp_path, mock_docker, monkeypatch):
+        import shutil
+        import cli.register as reg_script
+        from lib import subnet_manager
+
+        monkeypatch.setenv("SUBNET_POOLS", "10.0.0.0/16")
+        subnet_manager._load_env()
+
+        compose_tpl = "docker-compose.template.yml.j2"
+        nginx_tpl = "myapp.template.nginx.conf.j2"
+        shutil.copy(FIXTURES_DIR / compose_tpl, tmp_path / compose_tpl)
+        shutil.copy(FIXTURES_DIR / nginx_tpl, tmp_path / nginx_tpl)
+        monkeypatch.setattr("getpass.getpass", lambda prompt="": "secret123")
+        monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+
+        sys_argv = [
+            "cli/register.py",
+            "-u", "subnetuser",
+            "-sn", "myapp",
+            "-pr", str(tmp_path),
+            "-tc", compose_tpl,
+            "-tn", nginx_tpl,
+            "-l", "0",
+            "-d", "example.com",
+            "-v", "app_data=/srv/subnetuser/app",
+            "-v", "db_data=/srv/subnetuser/db",
+        ]
+        with patch.object(sys, "argv", sys_argv):
+            reg_script.main()
+
+        entry = reg_mod.get_user_service("subnetuser", "myapp", "0")
+        assert entry is not None, "Registration did not write registry entry"
+        return entry
+
+    def test_registry_entry_has_allocated_subnet(self, registered_with_subnet):
+        entry = registered_with_subnet
+        assert entry["subnet"], "subnet should be allocated when SUBNET_POOLS is set"
+        assert entry["gateway"].endswith(".1")
+        # 2 containers + 2 headroom + 1 gateway = 5 usable → /29 (8 addresses)
+        assert entry["subnet"].endswith("/29")
+
+    def test_rendered_compose_has_ipam_block(self, registered_with_subnet):
+        compose_path = Path(registered_with_subnet["compose_file_path"])
+        data = yaml.safe_load(compose_path.read_text())
+        net_name = registered_with_subnet["network_name"]
+        net = data["networks"][net_name]
+        ipam = net["ipam"]
+        assert ipam["config"][0]["subnet"] == registered_with_subnet["subnet"]
+        assert ipam["config"][0]["gateway"] == registered_with_subnet["gateway"]
+
+    def test_pool_exhaustion_raises(self, tmp_path, mock_docker, monkeypatch):
+        """A fully-allocated /16 pool leaves no free slot; allocation raises
+        RuntimeError (design §6/§14) rather than silently falling back."""
+        from lib import subnet_manager
+        monkeypatch.setenv("SUBNET_POOLS", "10.0.0.0/16")
+        subnet_manager._load_env()
+        # The whole pool is already allocated → no free slots remain
+        with pytest.raises(RuntimeError):
+            subnet_manager.allocate_subnet(1, ["10.0.0.0/16"])
+
+
 class TestE2ERemoval:
     def test_removal_deregisters_user(self, registered_alice, mock_docker):
         import cli.remove as rem_script

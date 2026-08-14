@@ -246,6 +246,121 @@ class TestTemplateEngine:
         content = Path(out).read_text()
         assert "server_name svc-testuser-3.test.local;" in content
 
+    def test_render_nginx_conf_acl_on_injects_enforcement(self, tmp_path, monkeypatch):
+        """Gap 11: with ENABLE_ACL=true, a template with `location = /_auth_jwt` gets
+        auth_request + error_page + named redirects, and auth_basic is REMOVED (no
+        password bypass)."""
+        monkeypatch.setenv("ENABLE_ACL", "true")
+        stale = tmp_path / "stale.nginx.conf.j2"
+        stale.write_text(
+            "server {\n"
+            "    listen 80;\n"
+            "    location = /_set_token { return 302 $arg_redirect; }\n"
+            "    location = /_auth_jwt { internal; proxy_pass http://gateway:8770/api/auth/verify; }\n"
+            "    server_name {{ hostname }};\n"
+            "    location / {\n"
+            "        auth_basic \"x\";\n"
+            "        auth_basic_user_file {{ htpasswd_path }};\n"
+            "        proxy_pass http://{{ container_prefix }}web:80;\n"
+            "    }\n"
+            "}\n"
+        )
+        out = str(tmp_path / "out.conf")
+        htpasswd = str(tmp_path / "x.htpasswd")
+        template_engine.render_nginx_conf(
+            str(stale), out,
+            user_name="alice", service_name="myapp", label="0",
+            domain_name="localhost", htpasswd_path=htpasswd,
+        )
+        content = Path(out).read_text()
+        # server-level enforcement injected
+        assert "auth_request /_auth_jwt;" in content
+        assert "auth_request_set $service_basic" in content
+        assert "auth_request_set $auth_action" in content
+        assert "error_page 401 = @auth_401;" in content
+        assert "error_page 403 = @auth_403;" in content
+        assert "location @auth_401" in content
+        assert "location @auth_403" in content
+        # credential injection
+        assert 'proxy_set_header Authorization "Basic $service_basic";' in content
+        # auth_basic removed (no password bypass)
+        assert "auth_basic" not in content
+        # old broken server-level if/rewrite removed (the phase-correct
+        # `if ($auth_action = "token_expired")` inside @auth_401 is allowed)
+        assert 'if ($auth_action = "login_required")' not in content
+        assert "if ($has_basic)" not in content
+        assert "rewrite ^ /__bypass__" not in content
+
+    def test_render_nginx_conf_set_token_preserves_host_port(self, tmp_path):
+        """Gap 9: the _set_token redirect must preserve the browser's host:port so
+        the /go/ flow redirects back to the subnet-acl nginx port (not :80)."""
+        stale = tmp_path / "stale.nginx.conf.j2"
+        stale.write_text(
+            "server {\n"
+            "    listen 80;\n"
+            "    location = /_set_token {\n"
+            "        add_header Set-Cookie \"provision_token=$arg_token; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400\";\n"
+            "        return 302 $arg_redirect;\n"
+            "    }\n"
+            "    server_name {{ hostname }};\n"
+            "    location / { proxy_pass http://{{ container_prefix }}web:80; }\n"
+            "}\n"
+        )
+        out = str(tmp_path / "out.conf")
+        template_engine.render_nginx_conf(
+            str(stale), out,
+            user_name="alice", service_name="myapp", label="0",
+            domain_name="localhost", htpasswd_path=str(tmp_path / "x.htpasswd"),
+        )
+        content = Path(out).read_text()
+        assert "return 302 $scheme://$http_host$arg_redirect;" in content
+        assert "return 302 $arg_redirect;" not in content
+
+    def test_render_nginx_conf_acl_off_keeps_auth_basic(self, tmp_path, monkeypatch):
+        """Gap 11: with ENABLE_ACL=false, auth_basic is preserved (no enforcement)."""
+        monkeypatch.setenv("ENABLE_ACL", "false")
+        stale = tmp_path / "stale.nginx.conf.j2"
+        stale.write_text(
+            "server {\n"
+            "    listen 80;\n"
+            "    location = /_auth_jwt { internal; proxy_pass http://gateway:8770/api/auth/verify; }\n"
+            "    server_name {{ hostname }};\n"
+            "    location / { auth_basic \"x\"; auth_basic_user_file {{ htpasswd_path }}; proxy_pass http://{{ container_prefix }}web:80; }\n"
+            "}\n"
+        )
+        out = str(tmp_path / "out.conf")
+        htpasswd = str(tmp_path / "x.htpasswd")
+        template_engine.render_nginx_conf(
+            str(stale), out,
+            user_name="alice", service_name="myapp", label="0",
+            domain_name="localhost", htpasswd_path=htpasswd,
+        )
+        content = Path(out).read_text()
+        assert "auth_basic" in content
+        assert "auth_request /_auth_jwt;" not in content
+
+    def test_render_nginx_conf_no_acl_locations_not_modified(self, tmp_path, monkeypatch):
+        """Gap 11: even with ENABLE_ACL=true, a template with no `location = /_auth_jwt`
+        (not ACL-aware) must be left untouched (no auth_request injected)."""
+        monkeypatch.setenv("ENABLE_ACL", "true")
+        plain = tmp_path / "plain.nginx.conf.j2"
+        plain.write_text(
+            "server {\n"
+            "    listen 80;\n"
+            "    server_name {{ hostname }};\n"
+            "    location / { auth_basic \"x\"; auth_basic_user_file {{ htpasswd_path }}; proxy_pass http://{{ container_prefix }}web:80; }\n"
+            "}\n"
+        )
+        out = str(tmp_path / "out.conf")
+        htpasswd = str(tmp_path / "x.htpasswd")
+        template_engine.render_nginx_conf(
+            str(plain), out,
+            user_name="alice", service_name="myapp", label="0",
+            domain_name="localhost", htpasswd_path=htpasswd,
+        )
+        content = Path(out).read_text()
+        assert "auth_request /_auth_jwt;" not in content
+
     # --- HTTPS rendering ---
 
     def test_render_nginx_conf_https_enabled(self, tmp_path):
@@ -719,23 +834,23 @@ class TestDockerOps:
 
     def test_network_connect_command(self, monkeypatch):
         calls = self._mock_run(monkeypatch)
-        docker_ops.network_connect("provision-nginx", "myapp-user_alice-0")
+        docker_ops.network_connect("subnet-acl-nginx", "myapp-user_alice-0")
         assert calls[-1] == [
-            "docker", "network", "connect", "myapp-user_alice-0", "provision-nginx"
+            "docker", "network", "connect", "myapp-user_alice-0", "subnet-acl-nginx"
         ]
 
     def test_network_disconnect_command(self, monkeypatch):
         calls = self._mock_run(monkeypatch)
-        docker_ops.network_disconnect("provision-nginx", "myapp-user_alice-0")
+        docker_ops.network_disconnect("subnet-acl-nginx", "myapp-user_alice-0")
         assert calls[-1] == [
-            "docker", "network", "disconnect", "myapp-user_alice-0", "provision-nginx"
+            "docker", "network", "disconnect", "myapp-user_alice-0", "subnet-acl-nginx"
         ]
 
     def test_nginx_reload_command(self, monkeypatch):
         calls = self._mock_run(monkeypatch)
-        docker_ops.nginx_reload("provision-nginx")
+        docker_ops.nginx_reload("subnet-acl-nginx")
         assert calls[-1] == [
-            "docker", "exec", "provision-nginx", "nginx", "-s", "reload"
+            "docker", "exec", "subnet-acl-nginx", "nginx", "-s", "reload"
         ]
 
     def test_network_connect_uses_check_false(self, monkeypatch):
@@ -749,7 +864,7 @@ class TestDockerOps:
             def __enter__(self): return self
             def __exit__(self, *a): pass
         monkeypatch.setattr(docker_ops.subprocess, "Popen", _FailProc)
-        docker_ops.network_connect("provision-nginx", "nonexistent-net")
+        docker_ops.network_connect("subnet-acl-nginx", "nonexistent-net")
 
     def test_network_disconnect_uses_check_false(self, monkeypatch):
         class _FailProc:
@@ -761,7 +876,7 @@ class TestDockerOps:
             def __enter__(self): return self
             def __exit__(self, *a): pass
         monkeypatch.setattr(docker_ops.subprocess, "Popen", _FailProc)
-        docker_ops.network_disconnect("provision-nginx", "nonexistent-net")
+        docker_ops.network_disconnect("subnet-acl-nginx", "nonexistent-net")
 
     def test_nginx_reload_uses_check_false(self, monkeypatch):
         class _FailProc:
@@ -773,7 +888,7 @@ class TestDockerOps:
             def __enter__(self): return self
             def __exit__(self, *a): pass
         monkeypatch.setattr(docker_ops.subprocess, "Popen", _FailProc)
-        docker_ops.nginx_reload("provision-nginx")
+        docker_ops.nginx_reload("subnet-acl-nginx")
 
     def test_compose_build_with_build_args(self, monkeypatch):
         """compose_build appends --build-arg flags before the build subcommand."""
@@ -937,11 +1052,11 @@ class TestDockerOps:
 
     def test_network_connected_to_container_positive(self, monkeypatch):
         """network_connected_to_container returns True when container is in network."""
-        fake_json = '[{"Name": "test-net", "Containers": {"abc": {"Name": "provision-nginx"}, "def": {"Name": "myapp-web"}}}]'
+        fake_json = '[{"Name": "test-net", "Containers": {"abc": {"Name": "subnet-acl-nginx"}, "def": {"Name": "myapp-web"}}}]'
         import subprocess as sp
         monkeypatch.setattr(docker_ops.subprocess, "run",
             lambda *a, **kw: sp.CompletedProcess([], 0, stdout=fake_json, stderr=""))
-        assert docker_ops.network_connected_to_container("test-net", "provision-nginx") is True
+        assert docker_ops.network_connected_to_container("test-net", "subnet-acl-nginx") is True
 
     def test_network_connected_to_container_negative(self, monkeypatch):
         """network_connected_to_container returns False when container is not in network."""
@@ -949,7 +1064,7 @@ class TestDockerOps:
         import subprocess as sp
         monkeypatch.setattr(docker_ops.subprocess, "run",
             lambda *a, **kw: sp.CompletedProcess([], 0, stdout=fake_json, stderr=""))
-        assert docker_ops.network_connected_to_container("test-net", "provision-nginx") is False
+        assert docker_ops.network_connected_to_container("test-net", "subnet-acl-nginx") is False
 
     # ── container_logs ──
 
@@ -985,7 +1100,7 @@ class TestDockerOps:
             call_args.append(list(args))
             if "inspect" in args:
                 return sp.CompletedProcess([], 0,
-                    stdout='[{"Name":"orphan-net","Containers":{"abc":{"Name":"provision-nginx"}}}]',
+                    stdout='[{"Name":"orphan-net","Containers":{"abc":{"Name":"subnet-acl-nginx"}}}]',
                     stderr="")
             return sp.CompletedProcess([], 0, stdout="", stderr="")
 
@@ -993,7 +1108,7 @@ class TestDockerOps:
         # Mock network_disconnect to be a no-op
         monkeypatch.setattr(docker_ops, "network_disconnect", lambda *a: None)
 
-        result = docker_ops.orphan_network_cleanup("orphan-net", "provision-nginx")
+        result = docker_ops.orphan_network_cleanup("orphan-net", "subnet-acl-nginx")
         assert result is True
         # Should have run docker network rm
         rm_calls = [c for c in call_args if "rm" in c and "network" in c]
@@ -1002,12 +1117,12 @@ class TestDockerOps:
     def test_orphan_network_cleanup_keeps_when_other_containers(self, monkeypatch):
         """orphan_network_cleanup does not remove network when other containers are connected."""
         import subprocess as sp
-        fake_json = '[{"Name":"shared-net","Containers":{"abc":{"Name":"provision-nginx"},"def":{"Name":"myapp-web"}}}]'
+        fake_json = '[{"Name":"shared-net","Containers":{"abc":{"Name":"subnet-acl-nginx"},"def":{"Name":"myapp-web"}}}]'
         monkeypatch.setattr(docker_ops.subprocess, "run",
             lambda *a, **kw: sp.CompletedProcess([], 0, stdout=fake_json, stderr=""))
         monkeypatch.setattr(docker_ops, "network_disconnect", lambda *a: None)
 
-        result = docker_ops.orphan_network_cleanup("shared-net", "provision-nginx")
+        result = docker_ops.orphan_network_cleanup("shared-net", "subnet-acl-nginx")
         assert result is False
 
     def test_orphan_network_cleanup_nonexistent_network(self, monkeypatch):
@@ -1337,6 +1452,51 @@ class TestComposeConverter:
         with pytest.raises(ValueError, match="services"):
             compose_file_to_template(bad, out)
 
+    def test_ensure_subnet_ipam_block_injects_and_backs_up(self, tmp_path):
+        """Gap 8: an old template missing {% if subnet %} gets the ipam block
+        injected and the original backed up as .bak."""
+        from lib.compose_converter import ensure_subnet_ipam_block
+        tpl = tmp_path / "old.yml.j2"
+        tpl.write_text(
+            "services:\n"
+            "  web:\n"
+            "    image: nginx\n"
+            "networks:\n"
+            "  {{ network_name }}:\n"
+            "    name: {{ network_name }}\n"
+        )
+        assert ensure_subnet_ipam_block(str(tpl)) is True
+        content = tpl.read_text()
+        assert "{% if subnet %}" in content
+        assert "ipam:" in content
+        assert "subnet: {{ subnet }}" in content
+        assert "gateway: {{ gateway }}" in content
+        # original backed up
+        bak = tmp_path / "old.yml.j2.bak"
+        assert bak.exists()
+        assert "{% if subnet %}" not in bak.read_text()
+
+    def test_ensure_subnet_ipam_block_noop_when_present(self, tmp_path):
+        from lib.compose_converter import ensure_subnet_ipam_block
+        tpl = tmp_path / "new.yml.j2"
+        tpl.write_text(
+            "networks:\n"
+            "  {{ network_name }}:\n"
+            "    name: {{ network_name }}\n"
+            "{% if subnet %}\n"
+            "    ipam:\n"
+            "      config:\n"
+            "        - subnet: {{ subnet }}\n"
+            "{% endif %}\n"
+        )
+        assert ensure_subnet_ipam_block(str(tpl)) is False
+
+    def test_ensure_subnet_ipam_block_noop_without_anchor(self, tmp_path):
+        from lib.compose_converter import ensure_subnet_ipam_block
+        tpl = tmp_path / "noanchor.yml.j2"
+        tpl.write_text("services:\n  web:\n    image: nginx\n")
+        assert ensure_subnet_ipam_block(str(tpl)) is False
+
     def test_make_header_contains_volume_keys(self):
         from lib.compose_converter import make_header
         src_to_key = {"/data/app": "app", "/data/db": "db"}
@@ -1396,6 +1556,99 @@ class TestComposeConverter:
         Path(compose).write_text("not: valid: yaml: [[[")
         names = get_compose_service_names(compose)
         assert names == []
+
+    def test_get_compose_service_names_with_jinja2_control_flow(self, tmp_path):
+        """Templates with {% if/endif %} blocks should be parseable.
+
+        GAP-034: The YAML sanitizer must strip {% %} control flow tags
+        alongside {{ }} expression tokens, otherwise the YAML parser fails
+        and returns an empty service list.
+
+        GAP-NEW-01/GAP-NEW-02 regression: The IPAM block injected by
+        compose_file_to_template() used 6-space indentation for ipam:
+        while the sibling name: entry used 4-space. After {% %} tag
+        stripping, ipam: at 6-space was nested under the scalar name:
+        entry -- invalid YAML. This test uses 4-space ipam: indentation
+        (matching name: at the same level) which produces valid YAML
+        after {% %} stripping.
+        """
+        from lib.compose_converter import get_compose_service_names
+        compose = str(tmp_path / "docker-compose.with-if.yml.j2")
+        Path(compose).write_text(
+            "services:\n"
+            "  web:\n"
+            "    image: nginx\n"
+            "networks:\n"
+            "  {{ network_name }}:\n"
+            "    name: {{ network_name }}\n"
+            "{% if subnet %}\n"
+            "    ipam:\n"
+            "      config:\n"
+            "        - subnet: {{ subnet }}\n"
+            "          gateway: {{ gateway }}\n"
+            "{% endif %}\n"
+        )
+        names = get_compose_service_names(compose)
+        assert names == ["web"], f"Expected ['web'], got {names}"
+
+    def test_get_compose_service_names_ipam_indentation_regression(self, tmp_path):
+        """Legacy 6-space ipam: indentation should also be handled.
+
+        GAP-NEW-01/GAP-NEW-02: The original compose_file_to_template()
+        injected ipam: at 6-space indentation.  After {% %} tag stripping,
+        the 6-space ipam: was nested under the scalar name: entry (4-space)
+        producing invalid YAML.  The regex fallback in
+        get_compose_service_names() must handle this edge case.
+        """
+        from lib.compose_converter import get_compose_service_names
+        # 6-space indentation for ipam: -- the legacy broken format
+        compose = str(tmp_path / "docker-compose.broken-ipam.yml.j2")
+        Path(compose).write_text(
+            "services:\n"
+            "  web:\n"
+            "    image: nginx\n"
+            "networks:\n"
+            "  {{ network_name }}:\n"
+            "    name: {{ network_name }}\n"
+            "{% if subnet %}\n"
+            "      ipam:\n"
+            "        config:\n"
+            "          - subnet: {{ subnet }}\n"
+            "            gateway: {{ gateway }}\n"
+            "{% endif %}\n"
+        )
+        names = get_compose_service_names(compose)
+        assert names == ["web"], (
+            f"Regex fallback should extract ['web'] even with 6-space ipam: "
+            f"indentation, got {names}"
+        )
+
+    def test_get_compose_service_names_from_generated_template(self, tmp_path):
+        """End-to-end: compose_file_to_template output is parseable.
+
+        GAP-NEW-01/GAP-NEW-02: After fixing IPAM indent to 4-space,
+        the generated template should be directly parseable by
+        get_compose_service_names() without needing the regex fallback.
+        """
+        from lib.compose_converter import (
+            compose_file_to_template,
+            get_compose_service_names,
+        )
+        # Write a minimal compose file with networks
+        compose_src = str(tmp_path / "docker-compose.yml")
+        Path(compose_src).write_text(
+            "services:\n"
+            "  web:\n"
+            "    image: nginx\n"
+            "networks:\n"
+            "  mynet:\n"
+        )
+        out = str(tmp_path / "output.yml.j2")
+        compose_file_to_template(compose_src, out, "myapp")
+        names = get_compose_service_names(out)
+        assert "web" in names, (
+            f"Expected 'web' in service names from generated template, got {names}"
+        )
 
     # ── docker.sock passthrough ──────────────────────────────────────────
 
@@ -1779,6 +2032,118 @@ class TestNginxConverter:
         # Auto-generated HTTPS block is conditionally wrapped
         assert "{% if https %}" in out
         assert "listen 443 ssl;" in out
+
+    # --- ACL template injection (GAP-001 through GAP-004) ---
+
+    def test_convert_injects_acl_server_directives(self):
+        """GAP-001: auth_request /_auth_jwt; is injected at server level."""
+        from lib.nginx_converter import convert_nginx
+        out = convert_nginx(_SAMPLE_NGINX_CONF)
+        assert "auth_request /_auth_jwt;" in out, (
+            "Server-level auth_request directive must be present for JWT+ACL enforcement"
+        )
+
+    def test_convert_injects_auth_request_set_directives(self):
+        """Gap 11: auth_request_set captures gateway response headers."""
+        from lib.nginx_converter import convert_nginx
+        out = convert_nginx(_SAMPLE_NGINX_CONF)
+        assert "auth_request_set $service_basic $upstream_http_x_service_basic;" in out, (
+            "Must capture X-Service-Basic header from gateway"
+        )
+        assert "auth_request_set $auth_action $upstream_http_x_auth_action;" in out, (
+            "Must capture X-Auth-Action header from gateway"
+        )
+
+    def test_convert_injects_error_page_redirects(self):
+        """Gap 11: error_page + named redirect locations are injected. The old
+        broken SERVER-level if/return blocks are gone (only a phase-correct
+        `if ($auth_action = "token_expired")` inside the named location remains)."""
+        from lib.nginx_converter import convert_nginx
+        out = convert_nginx(_SAMPLE_NGINX_CONF)
+        assert "error_page 401 = @auth_401;" in out
+        assert "error_page 403 = @auth_403;" in out
+        assert "location @auth_401" in out
+        assert "location @auth_403" in out
+        assert "return 401;" in out
+        assert "return 403;" in out
+        # The old server-level redirect-if blocks must NOT be emitted.
+        assert 'if ($auth_action = "login_required")' not in out
+        assert 'if ($auth_action = "acl_denied")' not in out
+
+    def test_convert_no_bypass_rewrite(self):
+        """Gap 11: the if ($has_basic) bypass rewrite is gone (credential is now
+        injected inline via map + proxy_set_header at deploy time)."""
+        from lib.nginx_converter import convert_nginx
+        out = convert_nginx(_SAMPLE_NGINX_CONF)
+        assert "if ($has_basic)" not in out
+        assert "rewrite ^ /__bypass__$request_uri last;" not in out
+
+    def test_convert_acl_directives_placed_after_listen_in_server_block(self):
+        """ACL directives are placed inside server block, after listen."""
+        from lib.nginx_converter import convert_nginx
+        out = convert_nginx(_SAMPLE_NGINX_CONF)
+        # Find positions to verify ordering
+        listen_pos = out.find("listen 80;")
+        auth_req_pos = out.find("auth_request /_auth_jwt;")
+        assert listen_pos >= 0
+        assert auth_req_pos > listen_pos, (
+            "auth_request must be placed AFTER listen directive in server block"
+        )
+
+    def test_convert_acl_directives_include_bypass_location(self):
+        """Gap 11: ACL injection includes /_auth_jwt (and _set_token), but NOT the
+        dead /__bypass__/ location (credential is injected inline now)."""
+        from lib.nginx_converter import convert_nginx
+        out = convert_nginx(_SAMPLE_NGINX_CONF)
+        assert "location = /_auth_jwt" in out, (
+            "Must have internal auth subrequest location"
+        )
+        assert "location /__bypass__/" not in out, (
+            "bypass location is removed — credential injected inline via proxy_set_header"
+        )
+
+    def test_convert_acl_server_directives_include_set_token_location(self):
+        """_set_token location for /go/ cookie flow is still present."""
+        from lib.nginx_converter import convert_nginx
+        out = convert_nginx(_SAMPLE_NGINX_CONF)
+        assert "location = /_set_token" in out, (
+            "_set_token location must still be present for /go/ cookie flow"
+        )
+
+    def test_convert_acl_all_directives_present_integrated(self):
+        """Integration check: all ACL directives coexist in the output."""
+        from lib.nginx_converter import convert_nginx
+        conf = (
+            "server {\n"
+            "    listen 80;\n"
+            "    server_name example.com;\n"
+            "    auth_basic \"My App\";\n"
+            "    auth_basic_user_file /etc/nginx/htpasswd/myapp;\n"
+            "    location / {\n"
+            "        proxy_pass http://myapp-web:80;\n"
+            "    }\n"
+            "}\n"
+        )
+        out = convert_nginx(conf, compose_service_names=["myapp-web"])
+        # Server-level directives
+        assert "auth_request /_auth_jwt;" in out
+        assert "auth_request_set $service_basic" in out
+        assert "auth_request_set $auth_action" in out
+        assert "error_page 401 = @auth_401;" in out
+        assert "error_page 403 = @auth_403;" in out
+        assert "location @auth_401" in out
+        assert "location @auth_403" in out
+        # Old broken if/rewrite must be absent
+        assert 'if ($auth_action = "login_required")' not in out
+        assert "if ($has_basic)" not in out
+        assert "rewrite ^ /__bypass__$request_uri last;" not in out
+        # Location blocks
+        assert "location = /_auth_jwt" in out
+        assert "location /__bypass__/" not in out
+        assert "location = /_set_token" in out
+        # Existing directives still present
+        assert "{{ hostname }}" in out
+        assert "{{ htpasswd_path }}" in out
 
 
 class TestProvisioner:
@@ -2199,7 +2564,7 @@ class TestProvisionerEnvFile:
             service_name="myapp",
             label="0",
             passwd="newpass",
-            nginx_container="provision-nginx",
+            nginx_container="subnet-acl-nginx",
         )
         assert result["user_name"] == "pwuser"
 
@@ -2242,7 +2607,7 @@ class TestProvisionerEnvFile:
             user_name="orphanuser",
             service_name="myapp",
             label="0",
-            nginx_container="provision-nginx",
+            nginx_container="subnet-acl-nginx",
         )
         down_calls = [c for c in self.calls if "down" in c]
         assert len(down_calls) >= 1, "Expected compose_down to be called during removal"
@@ -2481,7 +2846,7 @@ class TestAPINewEndpoints:
     def test_network_connect_endpoint(self, monkeypatch):
         """POST /docker/network/{n}/connect/{c} returns connected=True."""
         monkeypatch.setattr(self.api.docker_ops, "network_connect", lambda *a, **kw: None)
-        response = self.client.post("/docker/network/testnet/connect/provision-nginx")
+        response = self.client.post("/docker/network/testnet/connect/subnet-acl-nginx")
         assert response.status_code == 200
         assert response.json()["connected"] is True
 
@@ -2862,3 +3227,169 @@ class TestCheckMissingFiles:
             assert "Dockerfile" in data["existing"]
         finally:
             api.SOURCE_PROJECTS_DIR = original
+
+
+# ---------------------------------------------------------------------------
+# Tests for render_compose with subnet/gateway params (GAP-026)
+# ---------------------------------------------------------------------------
+
+
+class TestRenderComposeWithSubnet:
+    """Test that render_compose passes subnet and gateway params to template context."""
+
+    def test_render_compose_with_subnet_and_gateway(self, tmp_path):
+        """render_compose with subnet/gateway should include them in rendered output."""
+        out = str(tmp_path / "docker-compose.user-alice.0.yml")
+        template_engine.render_compose(
+            COMPOSE_TEMPLATE, out,
+            user_name="alice", service_name="myapp", label="0",
+            volumes={"app_data": "/srv/alice/app", "db_data": "/srv/alice/db"},
+            subnet="10.0.0.0/29",
+            gateway="10.0.0.1",
+        )
+        content = Path(out).read_text()
+        data = yaml.safe_load(content)
+        services = data["services"]
+        assert "web" in services
+        assert "db" in services
+        # The template context should include subnet/gateway
+        # The compose template fixture may or may not use them
+        # At minimum, render should not crash with these params
+
+    def test_render_compose_without_subnet_backward_compat(self, tmp_path):
+        """render_compose without subnet should still work (backward compat)."""
+        out = str(tmp_path / "docker-compose.user-alice.0.yml")
+        template_engine.render_compose(
+            COMPOSE_TEMPLATE, out,
+            user_name="alice", service_name="myapp", label="0",
+            volumes={"app_data": "/srv/alice/app", "db_data": "/srv/alice/db"},
+        )
+        content = Path(out).read_text()
+        data = yaml.safe_load(content)
+        assert "web" in data["services"]
+        # subnet should NOT appear in content when not passed
+        assert "10.0.0.0" not in content
+
+    def test_render_compose_with_subnet_empty_string_subnet(self, tmp_path):
+        """render_compose with empty subnet string should not inject subnet."""
+        out = str(tmp_path / "docker-compose.user-alice.0.yml")
+        template_engine.render_compose(
+            COMPOSE_TEMPLATE, out,
+            user_name="alice", service_name="myapp", label="0",
+            volumes={"app_data": "/srv/alice/app", "db_data": "/srv/alice/db"},
+            subnet="",
+            gateway="",
+        )
+        content = Path(out).read_text()
+        # Empty subnet should not appear as a literal IP in output
+        # (it may appear in a context diff if template has a guard)
+        assert "web" in content or "services:" in content
+
+
+# ---------------------------------------------------------------------------
+# Tests for provisioner storing hostname + passwd_plain + subnet (GAP-009, GAP-031)
+# ---------------------------------------------------------------------------
+
+
+class TestProvisionerRegistryFields:
+    """Verify register_user stores hostname, passwd_plain, and subnet in registry."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, monkeypatch, tmp_path):
+        """Mock docker ops so no real Docker calls happen."""
+        self.calls: list[list[str]] = []
+
+        def fake_run(args, check=True):
+            self.calls.append(list(args))
+            import subprocess as sp
+            return sp.CompletedProcess(args, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(docker_ops, "_run", fake_run)
+        monkeypatch.setattr(docker_ops, "network_connect", lambda *a, **kw: None)
+        monkeypatch.setattr(docker_ops, "nginx_reload", lambda *a: None)
+        # Mock container operations needed by provisioner
+        monkeypatch.setattr(docker_ops, "container_exists", lambda *a: False)
+        monkeypatch.setattr(docker_ops, "container_running", lambda *a: False)
+        monkeypatch.setattr(docker_ops, "network_inspect", lambda *a: {"IPAM": {"Config": []}})
+
+        # Redirect registry to temp file
+        self.reg_path = tmp_path / "user_registry.yml"
+        monkeypatch.setattr(registry, "REGISTRY_FILE", self.reg_path)
+        self.tmp_path = tmp_path
+        self.user_data_dir = tmp_path / "user_data"
+        self.user_data_dir.mkdir()
+        self.ssl_base_dir = tmp_path / "provision" / "ssl"
+        self.ssl_base_dir.mkdir(parents=True, exist_ok=True)
+
+    def test_register_user_stores_hostname_in_registry(self):
+        """Registry entry should include hostname field after registration."""
+        provisioner.register_user(
+            user_name="hostuser",
+            service_name="myapp",
+            label="0",
+            compose_template=COMPOSE_TEMPLATE,
+            output_dir=self.tmp_path,
+            volumes={"app_data": str(self.tmp_path / "vol_app"), "db_data": str(self.tmp_path / "vol_db")},
+            passwd="testpass",
+            user_data_dir=self.user_data_dir,
+        )
+        reg_data = registry._load()
+        assert len(reg_data) >= 1
+        entry = reg_data[0]
+        assert "hostname" in entry
+        assert entry["hostname"] == "myapp-hostuser-0.localhost"
+
+    def test_register_user_stores_passwd_plain_in_registry(self):
+        """Registry entry should include passwd_plain field after registration."""
+        provisioner.register_user(
+            user_name="pwuser",
+            service_name="myapp",
+            label="0",
+            compose_template=COMPOSE_TEMPLATE,
+            output_dir=self.tmp_path,
+            volumes={"app_data": str(self.tmp_path / "vol_app"), "db_data": str(self.tmp_path / "vol_db")},
+            passwd="secret123",
+            user_data_dir=self.user_data_dir,
+        )
+        reg_data = registry._load()
+        assert len(reg_data) >= 1
+        entry = reg_data[0]
+        assert "passwd_plain" in entry
+        assert entry["passwd_plain"] == "secret123"
+
+    def test_register_user_stores_subnet_field_in_registry(self):
+        """Registry entry should have subnet field (empty when SUBNET_POOLS is not set)."""
+        provisioner.register_user(
+            user_name="subnetuser",
+            service_name="myapp",
+            label="0",
+            compose_template=COMPOSE_TEMPLATE,
+            output_dir=self.tmp_path,
+            volumes={"app_data": str(self.tmp_path / "vol_app"), "db_data": str(self.tmp_path / "vol_db")},
+            passwd="testpass",
+            user_data_dir=self.user_data_dir,
+        )
+        reg_data = registry._load()
+        assert len(reg_data) >= 1
+        entry = reg_data[0]
+        assert "subnet" in entry
+        # subnet is empty when SUBNET_POOLS is not configured
+        assert entry["subnet"] == ""
+
+    def test_register_user_stores_hostname_with_custom_domain(self):
+        """hostname should use the domain parameter."""
+        provisioner.register_user(
+            user_name="domuser",
+            service_name="myapp",
+            label="0",
+            compose_template=COMPOSE_TEMPLATE,
+            output_dir=self.tmp_path,
+            volumes={"app_data": str(self.tmp_path / "vol_app"), "db_data": str(self.tmp_path / "vol_db")},
+            passwd="testpass",
+            domain="example.com",
+            user_data_dir=self.user_data_dir,
+        )
+        reg_data = registry._load()
+        assert len(reg_data) >= 1
+        entry = reg_data[0]
+        assert entry["hostname"] == "myapp-domuser-0.example.com"

@@ -293,6 +293,9 @@ def convert(data: dict) -> tuple[dict, dict[str, str], _TokenRegistry]:
     }
 
     # 4. Rewrite top-level networks to isolated per-user network
+    # IPAM config with Jinja2 guards is injected as a post-processing step
+    # in the template body, because it contains multi-line {% if %} blocks
+    # that can't be represented as YAML values.
     net_tok = tokens.tok("{{ network_name }}")
     result["networks"] = {net_tok: {"name": net_tok}}
 
@@ -393,6 +396,32 @@ def compose_file_to_template(
     transformed, src_to_key, tokens = convert(data)
     raw_yaml = _dump_yaml(transformed)
     template_body = tokens.detokenize(raw_yaml)
+
+    # ---- Inject IPAM config under the network block ----
+    # The network section looks like:
+    #   networks:
+    #     {{ network_name }}:
+    #       name: {{ network_name }}
+    # We append an {% if subnet %} ... {% endif %} block after the 'name:' line.
+    ipam_block = (
+        "{% if subnet %}\n"
+        "    ipam:\n"
+        "      config:\n"
+        "        - subnet: {{ subnet }}\n"
+        "          gateway: {{ gateway }}\n"
+        "{% endif %}"
+    )
+    # Find "name: {{ network_name }}" line in the networks section and append IPAM after it
+    import re as _re2
+    _net_name_line = _re2.compile(
+        r'^(\s+name:\s+\{\{\s*network_name\s*\}\})$',
+        flags=_re2.MULTILINE,
+    )
+    template_body = _net_name_line.sub(
+        r'\1\n' + ipam_block,
+        template_body,
+    )
+
     header = make_header(src_to_key, hint)
 
     _Path(output_path).parent.mkdir(parents=True, exist_ok=True)
@@ -404,11 +433,63 @@ def compose_file_to_template(
     return src_to_key
 
 
+def ensure_subnet_ipam_block(template_path: str) -> bool:
+    """Inject the ``{% if subnet %}`` ipam block into a compose .j2 template if missing.
+
+    Gap 8 (subnet §13 Phase 4 Option B): when ``SUBNET_POOLS`` is enabled, an
+    old template that lacks the subnet block would reserve a subnet in the
+    registry but render no ``ipam:`` block — Docker then auto-assigns a subnet,
+    leaking the reserved allocation. Auto re-convert the template (backing up
+    the original as ``.bak``) so the allocation renders into the compose.
+
+    Returns True if the template was re-converted, False if it already had the
+    subnet block (no-op) or could not be safely re-converted (no
+    ``name: {{ network_name }}`` anchor line).
+    """
+    from pathlib import Path as _Path
+
+    path = _Path(template_path)
+    if not path.is_file():
+        return False
+    content = path.read_text()
+    if "{% if subnet %}" in content:
+        return False
+
+    ipam_block = (
+        "{% if subnet %}\n"
+        "    ipam:\n"
+        "      config:\n"
+        "        - subnet: {{ subnet }}\n"
+        "          gateway: {{ gateway }}\n"
+        "{% endif %}"
+    )
+    _net_name_line = re.compile(
+        r'^(\s+name:\s+\{\{\s*network_name\s*\}\})$',
+        flags=re.MULTILINE,
+    )
+    new_content, nsubs = _net_name_line.subn(
+        r'\1\n' + ipam_block,
+        content,
+    )
+    if nsubs == 0:
+        # No anchor line to attach the block to — leave unchanged.
+        return False
+
+    backup = _Path(str(path) + ".bak")
+    if not backup.exists():
+        backup.write_text(content)
+    path.write_text(new_content)
+    return True
+
+
 def get_compose_service_names(compose_path: str) -> list[str]:
     """Return the list of service keys from a compose file or .j2 template.
 
     Jinja2 tokens (``{{ ... }}``) in templates are replaced with placeholder
     strings before YAML parsing so the file remains parseable.
+
+    When YAML parsing fails (e.g. due to malformed template content), falls
+    back to regex-based extraction from the ``services:`` section.
     """
     import yaml as _yaml
 
@@ -416,18 +497,59 @@ def get_compose_service_names(compose_path: str) -> list[str]:
         raw = f.read()
 
     # Neutralise Jinja2 expressions so the YAML parser doesn't choke.
-    # Replace the entire {{ expr }} token with a plain word so any adjacent
+    # First: remove control-flow blocks ({% if/for/endif/endfor %}) which are
+    # standalone directives that aren't valid YAML in any position.
+    # Then: replace {{ expr }} tokens with a plain word so any adjacent
     # text (e.g. "{{ prefix }}web") stays a valid YAML key.
-    sanitised = re.sub(r'\{\{.*?\}\}', 'j2placeholder', raw)
+    sanitised = re.sub(r'\{%-?.*?-?%\}', '', raw)
+    sanitised = re.sub(r'\{\{.*?\}\}', 'j2placeholder', sanitised)
 
     try:
         data = _yaml.safe_load(sanitised)
     except _yaml.YAMLError:
+        data = None  # trigger regex fallback below
+
+    if isinstance(data, dict):
+        services = data.get("services")
+        if isinstance(services, dict) and services:
+            return list(services.keys())
+
+    # ---- regex fallback ----
+    # Look for top-level ``services:`` key and extract direct child keys.
+    # This handles edge cases where the template body is not valid YAML
+    # (e.g. leftover IPAM content at mis-matched indentation after
+    # {% %} tag stripping).
+    svc_match = re.search(
+        r'(?:^|\n)services:\s*\n((?:\s{2,}\S.*\n?)*)',
+        sanitised,
+    )
+    if not svc_match:
         return []
 
-    if not isinstance(data, dict):
-        return []
-    services = data.get("services")
-    if not isinstance(services, dict):
-        return []
-    return list(services.keys())
+    services_block = svc_match.group(1)
+    keys: list[str] = re.findall(r'^\s{2}(\S+)', services_block, re.MULTILINE)
+
+    # Exclude known keys that look like top-level compose keys inside the
+    # services block (e.g. image:, container_name:, volumes:, networks: if
+    # they happen to appear at the same indent as service names — unlikely
+    # but defensive).
+    known_attrs = {
+        'image', 'container_name', 'volumes', 'networks',
+        'ports', 'depends_on', 'environment', 'env_file',
+        'restart', 'profiles', 'command', 'entrypoint',
+        'expose', 'healthcheck', 'labels', 'logging',
+        'deploy', 'dns', 'dns_search', 'extra_hosts',
+        'cap_add', 'cap_drop', 'security_opt', 'tmpfs',
+        'ulimits', 'user', 'working_dir', 'stop_signal',
+        'stop_grace_period', 'init', 'privileged', 'tty',
+        'stdin_open', 'read_only', 'pid', 'domainname',
+        'hostname', 'ipc', 'mac_address', 'mem_limit',
+        'memswap_limit', 'oom_score_adj', 'cgroup_parent',
+        'build', 'external_links', 'links', 'isolation',
+        'network_mode', 'secrets', 'configs', 'devices',
+        'sysctls', 'userns_mode', 'group_add', 'shm_size',
+        'cpus', 'cpu_shares', 'cpu_period', 'cpu_quota',
+        'cpuset', 'blkio_config', 'device_cgroup_rules',
+        'credential_spec', 'runtime',
+    }
+    return [k.rstrip(':') for k in keys if k.rstrip(':') not in known_attrs]

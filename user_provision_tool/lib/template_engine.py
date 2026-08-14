@@ -15,6 +15,7 @@ should use the container_prefix so inter-service communication works by generate
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 from pathlib import Path
@@ -121,6 +122,8 @@ def render_compose(
     label: str,
     volumes: dict[str, str],
     env_file: str | None = None,
+    subnet: str | None = None,
+    gateway: str | None = None,
 ) -> str | None:
     """Render a docker-compose template and write the output file.
 
@@ -128,6 +131,11 @@ def render_compose(
     with a per-user unique name (``.env.{user_name}.{label}``) so that
     multiple users in the same project directory don't collide.  The copied
     file path is returned so ``docker compose --env-file`` can reference it.
+
+    If *subnet* and *gateway* are given, they are passed to the template
+    as Jinja2 variables.  The per-user compose template should guard the
+    IPAM block with ``{% if subnet %}`` for backward compatibility when
+    subnet management is disabled.
 
     Additionally, any ``env_file: .env`` directives in service definitions
     (both string and list forms) are replaced with the per-user env file name,
@@ -148,6 +156,8 @@ def render_compose(
         "container_prefix": prefix,
         "network_name": user_network_name(service_name, user_name, label),
         "volumes": volumes,
+        "subnet": subnet or "",
+        "gateway": gateway or "",
     }
     rendered = env.get_template(tpl_name).render(**ctx)
 
@@ -304,6 +314,20 @@ def render_nginx_conf(
         rendered = re.sub(r'[ \t]*auth_basic[^\n]*\n', '', rendered)
 
     # ------------------------------------------------------------------
+    # Gap 9: fix the _set_token redirect to preserve the host port. The
+    # dashboard /go/ flow redirects the browser to the service hostname at the
+    # subnet-acl nginx host port (e.g. :8766), then /_set_token must redirect
+    # back to that SAME host:port. A bare `return 302 $arg_redirect;` expands to
+    # http://$host/ (nginx uses $host, which drops the port), so the browser
+    # would land on :80 instead of the subnet-acl port. $http_host preserves the
+    # exact Host header the browser sent (including the non-default port).
+    # ------------------------------------------------------------------
+    rendered = rendered.replace(
+        "return 302 $arg_redirect;",
+        "return 302 $scheme://$http_host$arg_redirect;",
+    )
+
+    # ------------------------------------------------------------------
     # Rewrite static proxy_pass → variable-based for per-request DNS
     # resolution.  Without this, nginx resolves the upstream hostname
     # ONCE at startup and caches the IP forever.  If the container
@@ -336,6 +360,78 @@ def render_nginx_conf(
         rendered,
         flags=re.MULTILINE,
     )
+
+    # ------------------------------------------------------------------
+    # Gap 11 (acl-enforcement-design-v2): when ENABLE_ACL=true, apply full
+    # JWT+ACL enforcement with NO auth_basic (so a denied viewer cannot bypass
+    # via the shared password). The http-level maps ($is_browser,
+    # $auth_redirect_url, $auth_header) live in nginx.provision.conf (once per
+    # stack), not per service. When ENABLE_ACL=false, the template keeps its
+    # auth_basic fallback (today's behavior).
+    # ------------------------------------------------------------------
+    enable_acl = os.environ.get("ENABLE_ACL", "false").lower() == "true"
+    if enable_acl and "location = /_auth_jwt" in rendered:
+        # Strip any stale server-level ACL directives and the dead /__bypass__/
+        # location, so we re-inject cleanly (handles both old and new templates).
+        rendered = re.sub(r"[ \t]*auth_request /_auth_jwt;[^\n]*\n", "", rendered)
+        rendered = re.sub(r"[ \t]*auth_request_set \$[A-Za-z_]+ [^\n]*\n", "", rendered)
+        rendered = re.sub(r"[ \t]*error_page[^\n]*\n", "", rendered)
+        rendered = re.sub(r"[ \t]*location /__bypass__/ \{.*?\n[ \t]*\}\n", "", rendered, flags=re.DOTALL)
+
+        # Fix the /_auth_jwt subrequest to forward BOTH the API client's
+        # X-Provision-Token header AND the browser's cookie (stale templates
+        # forward only $cookie_provision_token, which drops the API client token).
+        rendered = rendered.replace(
+            "proxy_set_header X-Provision-Token $cookie_provision_token;",
+            "proxy_set_header X-Provision-Token $http_x_provision_token;\n"
+            "        proxy_set_header Cookie $http_cookie;",
+        )
+
+        acl_directives = (
+            "\n    # JWT + ACL enforcement (server-level)\n"
+            "    auth_request /_auth_jwt;\n"
+            "    auth_request_set $service_basic $upstream_http_x_service_basic;\n"
+            "    auth_request_set $auth_action $upstream_http_x_auth_action;\n"
+            "    error_page 401 = @auth_401;\n"
+            "    error_page 403 = @auth_403;\n"
+            "\n"
+            "    location @auth_401 {\n"
+            "        if ($is_browser) { return 302 http://$dashboard_host/login?redirect=$scheme://$host$request_uri; }\n"
+            "        return 401;\n"
+            "    }\n"
+            "    location @auth_403 {\n"
+            "        if ($is_browser) { return 302 http://$dashboard_host/alert?reason=acl_denied&service=$host; }\n"
+            "        return 403;\n"
+            "    }\n"
+        )
+        if "location = /_set_token" in rendered:
+            rendered = re.sub(
+                r"(location = /_set_token \{[^}]*\})",
+                r"\1" + acl_directives,
+                rendered,
+                count=1,
+                flags=re.DOTALL,
+            )
+        else:
+            rendered = re.sub(
+                r"(listen\s+[^;]+;)",
+                r"\1" + acl_directives,
+                rendered,
+                count=1,
+            )
+
+        # Remove auth_basic — JWT+ACL is the only auth (no password bypass).
+        rendered = re.sub(r"[ \t]*auth_basic[^\n]*\n", "", rendered)
+        rendered = re.sub(r"[ \t]*auth_basic_user_file[^\n]*\n", "", rendered)
+
+        # Inject the credential via proxy_set_header before the main upstream
+        # proxy_pass (the variable-based one, i.e. `proxy_pass http://$upstream_`).
+        rendered = re.sub(
+            r"([ \t]*)(proxy_pass\s+https?://\$upstream_)",
+            r'\1proxy_set_header Authorization "Basic $service_basic";\n\1\2',
+            rendered,
+            count=1,
+        )
 
     with open(output_path, "w") as f:
         f.write(rendered)

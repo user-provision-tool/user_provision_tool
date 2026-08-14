@@ -42,9 +42,3 @@ volumes:
 networks:
   {{ network_name }}:
     name: {{ network_name }}
-{% if subnet %}
-    ipam:
-      config:
-        - subnet: {{ subnet }}
-          gateway: {{ gateway }}
-{% endif %}

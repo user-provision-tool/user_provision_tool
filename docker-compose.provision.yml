@@ -1,46 +1,61 @@
 services:
-  provision-api:
+  subnet-acl-provision-api:
     build:
       context: ./user_provision_tool
 
-    container_name: provision-api
+    container_name: subnet-acl-provision-api
     ports:
-      - "${PROVISION_API_PORT:-8765}:8000"
+      - "${PROVISION_API_PORT:-8875}:8000"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       # Same-path bind-mount so generated compose files reference valid host paths
-      - ${PROVISION_DIR}:${PROVISION_DIR}
+      - ${PROVISION_DIR:-/srv/provision_subnet_acl}:${PROVISION_DIR:-/srv/provision_subnet_acl}
       # Mount SSL provider path (e.g. /etc/letsencrypt) so path-based cert
       # imports and full-path cert references work without manual copying
       - ${SSL_PROVIDER_PATH:-/etc/letsencrypt}:${SSL_PROVIDER_PATH:-/etc/letsencrypt}:ro
+    networks:
+      - subnet_acl_shared
     environment:
       - SSL_PROVIDER_PATH=${SSL_PROVIDER_PATH:-/etc/letsencrypt}
-      - GENERATED_DIR=${PROVISION_DIR}/generated
-      - USER_DATA_DIR=${PROVISION_DIR}/user_data
-      - SOURCE_PROJECTS_DIR=${PROVISION_DIR}/source_projects
-      - REGISTRY_FILE=${PROVISION_DIR}/generated/user_registry.yml
-      - NGINX_CONTAINER=provision-nginx
-      - DOCKER_OPS_LOG=${PROVISION_DIR}/generated/docker_ops.log
-      - TASK_LOG_DIR=${PROVISION_DIR}/generated/task_logs
+      - GENERATED_DIR=${PROVISION_DIR:-/srv/provision_subnet_acl}/generated
+      - USER_DATA_DIR=${PROVISION_DIR:-/srv/provision_subnet_acl}/user_data
+      - SOURCE_PROJECTS_DIR=${PROVISION_DIR:-/srv/provision_subnet_acl}/source_projects
+      - REGISTRY_FILE=${PROVISION_DIR:-/srv/provision_subnet_acl}/generated/user_registry.yml
+      - NGINX_CONTAINER=subnet-acl-nginx
+      - DOCKER_OPS_LOG=${PROVISION_DIR:-/srv/provision_subnet_acl}/generated/docker_ops.log
+      - TASK_LOG_DIR=${PROVISION_DIR:-/srv/provision_subnet_acl}/generated/task_logs
       - TASK_TTL_SECONDS=${TASK_TTL_SECONDS:-604800}
       - TASK_MAX_COUNT=${TASK_MAX_COUNT:-1000}
-      - SSL_DIR=${PROVISION_DIR}/ssl
+      - SSL_DIR=${PROVISION_DIR:-/srv/provision_subnet_acl}/ssl
+      - SUBNET_POOLS=${SUBNET_POOLS:-}
+      - SUBNET_HEADROOM=${SUBNET_HEADROOM:-2}
+      - ENABLE_ACL=${ENABLE_ACL:-false}
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
     restart: unless-stopped
 
-  provision-nginx:
+  subnet-acl-nginx:
     image: nginx:alpine
-    container_name: provision-nginx
+    container_name: subnet-acl-nginx
     ports:
-      - "${NGINX_HTTP_PORT:-80}:80"
-      - "${NGINX_HTTPS_PORT:-443}:443"
-      - "${NGINX_STREAM_PORT:-7687}:7687"
+      - "${NGINX_HTTP_PORT:-8080}:80"
+      - "${NGINX_HTTPS_PORT:-8443}:443"
+      - "${NGINX_STREAM_PORT:-8769}:7687"
     volumes:
       # Same-path bind-mount so htpasswd paths in generated confs resolve correctly
-      - ${PROVISION_DIR}:${PROVISION_DIR}:ro
+      - ${PROVISION_DIR:-/srv/provision_subnet_acl}:${PROVISION_DIR:-/srv/provision_subnet_acl}:ro
       - ./nginx.provision.conf:/etc/nginx/nginx.provision.conf:ro
+    networks:
+      - subnet_acl_shared
     environment:
-      - GENERATED_DIR=${PROVISION_DIR}/generated
+      - GENERATED_DIR=${PROVISION_DIR:-/srv/provision_subnet_acl}/generated
     # envsubst substitutes only $GENERATED_DIR; all nginx $variables are left intact
     command: >
       /bin/sh -c "envsubst '$$GENERATED_DIR' < /etc/nginx/nginx.provision.conf > /etc/nginx/nginx.conf && nginx -g 'daemon off;'"
     restart: unless-stopped
+
+networks:
+  subnet_acl_shared:
+    external: true
+    name: subnet_acl_shared

@@ -21,7 +21,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-API_PORT="${PROVISION_API_PORT:-8765}"
+API_PORT="${PROVISION_API_PORT:-8875}"
 NGINX_PORT="${NGINX_HTTP_PORT:-8766}"
 API_URL="http://localhost:${API_PORT}"
 COMPOSE_FILE="$REPO_DIR/docker-compose.provision.yml"
@@ -33,7 +33,7 @@ TEST_SVC="myapp"
 TEST_LABEL="0"
 TEST_NETWORK_NAME="${TEST_SVC}-user_${TEST_USER}-${TEST_LABEL}"
 # Matches the provision stack containers and the user-provisioned containers
-CONTAINER_FILTER="provision-api|provision-nginx|${TEST_SVC}-user_${TEST_USER}-${TEST_LABEL}"
+CONTAINER_FILTER="subnet-acl-provision-api|subnet-acl-nginx|${TEST_SVC}-user_${TEST_USER}-${TEST_LABEL}"
 
 # Colours
 RED='\033[0;31m'
@@ -129,6 +129,11 @@ print(val)
 # ---------------------------------------------------------------------------
 # Setup: temp provision dir
 # ---------------------------------------------------------------------------
+# Save original PROVISION_DIR (if set) so we can restore the provision stack
+# with the correct bind-mount after this test run. Otherwise subsequent test
+# suites (test_gateway_api.sh) will see an empty or missing PROVISION_DIR and
+# fail with "project_root not found".
+ORIGINAL_PROVISION_DIR="${PROVISION_DIR:-}"
 export PROVISION_DIR
 PROVISION_DIR="$(mktemp -d)"
 echo "PROVISION_DIR=$PROVISION_DIR"
@@ -141,6 +146,24 @@ mkdir -p \
     "$PROVISION_DIR/user-data/testuser/db" \
     "$PROVISION_DIR/user-data/fileuser/html" \
     "$PROVISION_DIR/user-data/fileuser/db"
+
+# ---------------------------------------------------------------------------
+# Pre-create self-signed SSL certs so generated nginx confs that reference
+# $PROVISION_DIR/ssl/example.com/ can be loaded by nginx -s reload / nginx -t.
+# Tests that deploy HTTPS services (e.g. Test 26) create a generated nginx conf
+# pointing to these paths, and even after async cleanup the stale conf may
+# linger in GENERATED_DIR. Without valid PEM certs, nginx reload fails with
+# "PEM_read_bio_X509_AUX() failed ... no start line".
+# ---------------------------------------------------------------------------
+SSL_CERT_DIR="${PROVISION_DIR}/ssl/example.com"
+mkdir -p "$SSL_CERT_DIR"
+openssl req -x509 -newkey rsa:2048 \
+    -keyout "$SSL_CERT_DIR/privkey.pem" \
+    -out "$SSL_CERT_DIR/fullchain.pem" \
+    -days 1 -nodes \
+    -subj "/CN=example.com" \
+    -addext "subjectAltName=DNS:example.com" \
+    2>/dev/null
 
 cp "$SCRIPT_DIR/fixtures/docker-compose.template.yml.j2" "$PROVISION_DIR/templates/"
 cp "$SCRIPT_DIR/fixtures/myapp.template.nginx.conf.j2"  "$PROVISION_DIR/templates/" 2>/dev/null || true
@@ -156,8 +179,83 @@ teardown() {
     echo ""
     echo "--- Teardown ---"
     print_all_containers "before cleanup"
-    (cd "$REPO_DIR" && docker compose -f "$COMPOSE_FILE" down -v 2>/dev/null) || true
-    rm -rf "$PROVISION_DIR"
+
+    # Only clean up test-specific user services — do NOT destroy the shared
+    # subnet-acl- provision stack. The shared stack is managed by the harness
+    # and must survive individual test runs.
+    local users_list
+    users_list=$(curl -sf "$API_URL/users" 2>/dev/null \
+        | python3 -c "import sys,json; d=json.load(sys.stdin); print(' '.join(d.get('user_status',[])))" 2>/dev/null || true)
+    if [ -n "$users_list" ]; then
+        echo "  Cleaning up user registrations: $users_list"
+        for u in $users_list; do
+            # Get services for this user and remove them
+            local svc_resp svc_list
+            svc_resp=$(curl -sf "$API_URL/users/$u" 2>/dev/null || true)
+            svc_list=$(echo "$svc_resp" \
+                | python3 -c "import sys,json; d=json.load(sys.stdin); svcs=d.get('user_status',[]); print(' '.join(f\"{s['name']}/{s['label']}\" for s in svcs))" 2>/dev/null || true)
+            for s in $svc_list; do
+                local svc_name svc_label
+                svc_name="${s%%/*}"
+                svc_label="${s##*/}"
+                echo "    Removing $u/$svc_name/$svc_label ..."
+                curl -sf -X DELETE "$API_URL/users/$u/services/$svc_name/$svc_label" >/dev/null 2>&1 || true
+                sleep 2
+            done
+        done
+    fi
+
+    # CRITICAL: Stop containers FIRST before cleaning up temp files.
+    # docker compose down must succeed before we rm -rf templates/, generated/,
+    # ssl/, etc. because the containers may have bind mounts referencing those
+    # paths. When files are deleted before the containers are stopped, docker
+    # compose down fails with "open .../templates/docker-compose.user-*.yml:
+    # no such file or directory" — and the || true mask silently absorbs the
+    # failure, leaving containers running with temp PROVISION_DIR still mounted.
+    # Subsequent docker compose up -d --force-recreate then finds existing
+    # running containers and does NOT recreate them (compose considers running
+    # containers as already satisfying the desired state).
+    echo "  Stopping provision stack containers..."
+    docker compose -f "$COMPOSE_FILE" down 2>&1 || true
+
+    # Targeted cleanup: delete test-specific subdirectories only.
+    # Do this AFTER docker compose down so the containers are already stopped.
+    # Do NOT delete source_projects/ — it is needed by subsequent test suites
+    # (test_gateway_api.sh deploys services using project_root which resolves
+    # to SOURCE_PROJECTS_DIR -> PROVISION_DIR/source_projects).
+    rm -rf \
+        "$PROVISION_DIR"/generated \
+        "$PROVISION_DIR"/templates \
+        "$PROVISION_DIR"/ssl \
+        "$PROVISION_DIR"/user-data \
+        || true
+
+    # Clean up test-specific source_projects subdirectories that were created
+    # by individual tests (Test 17, 24, 25). Some are cleaned inline but this
+    # ensures none leak.
+    rm -rf \
+        "$PROVISION_DIR"/source_projects/testpr \
+        "$PROVISION_DIR"/source_projects/svcname_test \
+        "$PROVISION_DIR"/source_projects/envtest \
+        2>/dev/null || true
+
+    # Restart provision stack with the original PROVISION_DIR so subsequent
+    # test suites (test_gateway_api.sh, test_provision_api.sh) see the correct
+    # bind-mount and source_projects/ contents (e.g. example-mcp, example-service).
+    #
+    # Use docker compose up -d --force-recreate (not just up -d) because
+    # compose does NOT recreate running containers on env-var-only changes.
+    # Since we already ran docker compose down above, the containers are
+    # stopped/removed, so --force-recreate ensures they are created fresh
+    # with the correct original PROVISION_DIR bind-mount and env vars.
+    echo "  Restarting provision stack with original PROVISION_DIR..."
+    if [ -n "${ORIGINAL_PROVISION_DIR:-}" ]; then
+        PROVISION_DIR="$ORIGINAL_PROVISION_DIR" docker compose -f "$COMPOSE_FILE" up -d --force-recreate 2>&1 || true
+    else
+        unset PROVISION_DIR
+        docker compose -f "$COMPOSE_FILE" up -d --force-recreate 2>&1 || true
+    fi
+
     echo "Cleaned up."
 }
 trap teardown EXIT
@@ -179,7 +277,7 @@ for i in $(seq 1 60); do
     fi
     if [ "$i" -eq 60 ]; then
         echo "--- provision-api container logs ---"
-        docker logs "$(docker compose -f "$COMPOSE_FILE" ps -q provision-api 2>/dev/null)" 2>/dev/null || true
+        docker logs "$(docker compose -f "$COMPOSE_FILE" ps -q subnet-acl-provision-api 2>/dev/null)" 2>/dev/null || true
         die "API did not become ready within 60 seconds"
     fi
     sleep 1
@@ -380,10 +478,10 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Test 11: provision-nginx is connected to the user network after registration
+# Test 11: subnet-acl-nginx is connected to the user network after registration
 # ---------------------------------------------------------------------------
 echo ""
-echo "--- Test 11: provision-nginx connected to user network ---"
+echo "--- Test 11: subnet-acl-nginx connected to user network ---"
 # Re-register to get a fresh network for the connectivity check
 reg_resp2=$(curl -sf -X POST "$API_URL/users?sync=true" \
     -H "Content-Type: application/json" \
@@ -394,12 +492,12 @@ if [ "$reg_status2" = "registered" ]; then
     sleep 2
     nginx_connected=$(docker network inspect "$TEST_NETWORK_NAME" \
         --format '{{range $k,$v := .Containers}}{{$v.Name}} {{end}}' 2>/dev/null \
-        | grep -c 'provision-nginx' || true)
+        | grep -c 'subnet-acl-nginx' || true)
     print_networks "after re-registration"
     if [ "$nginx_connected" -ge 1 ]; then
-        pass "provision-nginx is connected to network $TEST_NETWORK_NAME"
+        pass "subnet-acl-nginx is connected to network $TEST_NETWORK_NAME"
     else
-        fail "provision-nginx is NOT connected to network $TEST_NETWORK_NAME"
+        fail "subnet-acl-nginx is NOT connected to network $TEST_NETWORK_NAME"
     fi
 else
     fail "Re-registration failed: $reg_resp2"
@@ -1312,8 +1410,8 @@ else
     fail "HTTPS nginx conf not found at: $HTTPS_NGINX_CONF"
 fi
 
-# Clean up httpsuser
-curl -sf -X DELETE "$API_URL/users/httpsuser/services/myapp/0" >/dev/null 2>&1 || true
+# Clean up httpsuser (sync: ensures nginx conf removal + reload before next test)
+curl -sf -X DELETE "$API_URL/users/httpsuser/services/myapp/0?sync=true" >/dev/null 2>&1 || true
 rm -f "$FULLCHAIN_SRC" "$PRIVKEY_SRC"
 
 # ---------------------------------------------------------------------------
@@ -1382,8 +1480,8 @@ else
     fail "Bare filename: cert file missing after registration"
 fi
 
-# Clean up barehttps
-curl -sf -X DELETE "$API_URL/users/barehttps/services/myapp/0" >/dev/null 2>&1 || true
+# Clean up barehttps (sync: ensures nginx conf removal + reload before next test)
+curl -sf -X DELETE "$API_URL/users/barehttps/services/myapp/0?sync=true" >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
 # Test 28: Hyphenated username (validation allows hyphens)
@@ -1506,8 +1604,8 @@ else
     fail "Auto-gen HTTPS nginx conf not found at: $AUTOHTTPS_NGINX_CONF"
 fi
 
-# Clean up autohttps
-curl -sf -X DELETE "$API_URL/users/autohttps/services/myapp/0" >/dev/null 2>&1 || true
+# Clean up autohttps (sync: ensures nginx conf removal + reload before next test)
+curl -sf -X DELETE "$API_URL/users/autohttps/services/myapp/0?sync=true" >/dev/null 2>&1 || true
 rm -f "$AUTOHTTPS_CERT_SRC" "$AUTOHTTPS_KEY_SRC"
 
 # ---------------------------------------------------------------------------
@@ -1571,20 +1669,20 @@ fi
 # ---------------------------------------------------------------------------
 echo ""
 echo "--- Test 32: Reconciliation helpers ---"
-# Check that a known container (provision-nginx) exists and is running
-nginx_exists=$(curl -sf "$API_URL/docker/container/provision-nginx/exists" | python3 -c "import sys,json; print(json.load(sys.stdin)['exists'])" 2>/dev/null || echo "false")
-nginx_running=$(curl -sf "$API_URL/docker/container/provision-nginx/running" | python3 -c "import sys,json; print(json.load(sys.stdin)['running'])" 2>/dev/null || echo "false")
+# Check that a known container (subnet-acl-nginx) exists and is running
+nginx_exists=$(curl -sf "$API_URL/docker/container/subnet-acl-nginx/exists" | python3 -c "import sys,json; print(json.load(sys.stdin)['exists'])" 2>/dev/null || echo "false")
+nginx_running=$(curl -sf "$API_URL/docker/container/subnet-acl-nginx/running" | python3 -c "import sys,json; print(json.load(sys.stdin)['running'])" 2>/dev/null || echo "false")
 
 if [ "$nginx_exists" = "True" ]; then
-    pass "GET /docker/container/provision-nginx/exists → exists=True"
+    pass "GET /docker/container/subnet-acl-nginx/exists → exists=True"
 else
-    fail "GET /docker/container/provision-nginx/exists → exists=$nginx_exists"
+    fail "GET /docker/container/subnet-acl-nginx/exists → exists=$nginx_exists"
 fi
 
 if [ "$nginx_running" = "True" ]; then
-    pass "GET /docker/container/provision-nginx/running → running=True"
+    pass "GET /docker/container/subnet-acl-nginx/running → running=True"
 else
-    fail "GET /docker/container/provision-nginx/running → running=$nginx_running"
+    fail "GET /docker/container/subnet-acl-nginx/running → running=$nginx_running"
 fi
 
 # Nonexistent container should return false
@@ -2083,7 +2181,7 @@ else
 fi
 
 # Step 3: Reload nginx — must succeed even though containers exist (normal case)
-if docker exec provision-nginx nginx -s reload 2>/dev/null; then
+if docker exec subnet-acl-nginx nginx -s reload 2>/dev/null; then
     pass "nginx -s reload succeeds with active upstreams"
 else
     fail "nginx -s reload failed with active upstreams"
@@ -2091,13 +2189,18 @@ fi
 sleep 1
 
 # Step 4: Stop the containers to simulate missing upstream
-COMPOSE_FILE="${PROVISION_DIR}/templates/docker-compose.user-${RESILIENCE_USER}.0.yml"
+# NOTE: Use RESILIENCE_COMPOSE_FILE (NOT COMPOSE_FILE) to avoid clobbering the
+# global COMPOSE_FILE variable (set at line 27 to docker-compose.provision.yml).
+# The teardown function (EXIT trap) depends on COMPOSE_FILE pointing to the
+# provision stack compose file. This test is at the script top level, not inside
+# a function, so `local` cannot be used. GAP-015, GAP-017.
+RESILIENCE_COMPOSE_FILE="${PROVISION_DIR}/templates/docker-compose.user-${RESILIENCE_USER}.0.yml"
 PROJECT_NAME="myapp-user_${RESILIENCE_USER}-0"
-docker compose -f "$COMPOSE_FILE" -p "$PROJECT_NAME" stop 2>/dev/null || true
+docker compose -f "$RESILIENCE_COMPOSE_FILE" -p "$PROJECT_NAME" stop 2>/dev/null || true
 sleep 2
 
 # Step 5: Reload nginx — must succeed even with STOPPED containers
-if docker exec provision-nginx nginx -s reload 2>/dev/null; then
+if docker exec subnet-acl-nginx nginx -s reload 2>/dev/null; then
     pass "nginx -s reload succeeds with STOPPED upstream containers"
 else
     fail "nginx -s reload FAILED with stopped upstream containers"
@@ -2105,13 +2208,13 @@ fi
 sleep 1
 
 # Step 6: Remove the containers entirely
-docker compose -f "$COMPOSE_FILE" -p "$PROJECT_NAME" down 2>/dev/null || true
+docker compose -f "$RESILIENCE_COMPOSE_FILE" -p "$PROJECT_NAME" down 2>/dev/null || true
 sleep 2
 
 # Step 7: Reload nginx — must succeed even with REMOVED containers
 # This is the critical test: before the variable-based proxy_pass change,
 # nginx would hang during reload trying to resolve the missing hostname.
-if docker exec provision-nginx nginx -s reload 2>/dev/null; then
+if docker exec subnet-acl-nginx nginx -s reload 2>/dev/null; then
     pass "nginx -s reload succeeds with REMOVED upstream containers (critical!)"
 else
     fail "nginx -s reload FAILED with removed upstream containers — nginx may be stuck"
@@ -2119,14 +2222,14 @@ fi
 sleep 1
 
 # Step 8: Verify nginx is still healthy
-if docker exec provision-nginx nginx -t 2>/dev/null; then
+if docker exec subnet-acl-nginx nginx -t 2>/dev/null; then
     pass "nginx -t passes after all resilience tests"
 else
     fail "nginx -t failed after resilience tests"
 fi
 
 # Step 9: Verify nginx is still serving (health check)
-NGINX_STATUS=$(docker inspect provision-nginx --format '{{.State.Status}}' 2>/dev/null || echo "unknown")
+NGINX_STATUS=$(docker inspect subnet-acl-nginx --format '{{.State.Status}}' 2>/dev/null || echo "unknown")
 if [ "$NGINX_STATUS" = "running" ]; then
     pass "nginx container is still running after resilience tests"
 else

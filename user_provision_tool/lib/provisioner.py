@@ -12,8 +12,8 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from . import auth, docker_ops, registry, template_engine
-from .compose_converter import get_compose_service_names
+from . import auth, docker_ops, registry, subnet_manager, template_engine
+from .compose_converter import ensure_subnet_ipam_block, get_compose_service_names
 
 # Registry writes must be atomic across threads (relevant when the API handles
 # concurrent requests).
@@ -75,7 +75,7 @@ def register_user(
     nginx_template: str | None = None,
     domain: str = "localhost",
     env_file: str | None = None,
-    nginx_container: str = "provision-nginx",
+    nginx_container: str = "subnet-acl-nginx",
     nginx_output_dir: str | Path | None = None,
     user_data_dir: str | Path | None = None,
     build_args: dict[str, str] | None = None,
@@ -227,6 +227,25 @@ def register_user(
         if passwd_hash:
             htpasswd_out = str(nginx_dir / f"{service_name}.user-{user_name}.{label}.htpasswd")
 
+    # --- Gap 8: auto re-convert old compose templates when subnet pools are
+    # enabled. If the template lacks the {% if subnet %} ipam block, the
+    # allocation below would reserve a subnet that never renders (Docker then
+    # auto-assigns → allocation leak). Re-convert (back up as .bak) first.
+    # Re-load env so tests that set SUBNET_POOLS after import are honored.
+    subnet_manager._load_env()
+    if subnet_manager.SUBNET_POOLS:
+        ensure_subnet_ipam_block(compose_template)
+
+    # --- Subnet allocation ---
+    # Count containers from compose template, allocate subnet from pool.
+    container_count = len(get_compose_service_names(compose_template))
+    allocated = subnet_manager.allocate_subnet(
+        container_count,
+        subnet_manager.get_allocated_subnets(registry._load()),
+    )
+    _subnet = allocated["subnet"] if allocated else ""
+    _gateway = allocated["gateway"] if allocated else ""
+
     # --- Registry entry ---
     entry: dict[str, Any] = {
         "user_name": user_name,
@@ -245,6 +264,10 @@ def register_user(
         "https": https,
         "ssl_certificate_path": ssl_certificate_path,
         "ssl_certificate_key_path": ssl_certificate_key_path,
+        "hostname": f"{service_name}-{user_name}-{label}.{domain}",
+        "passwd_plain": passwd,
+        "subnet": _subnet,
+        "gateway": _gateway,
     }
 
     # Duplicate check + add are atomic to prevent concurrent registrations
@@ -261,6 +284,8 @@ def register_user(
         compose_template, compose_out,
         user_name, service_name, label, volumes,
         env_file=env_file,
+        subnet=_subnet,
+        gateway=_gateway,
     )
 
     # --- Record container names from the rendered compose ---
@@ -345,7 +370,7 @@ def remove_user(
     user_name: str,
     service_name: str,
     label: str,
-    nginx_container: str = "provision-nginx",
+    nginx_container: str = "subnet-acl-nginx",
 ) -> dict[str, str]:
     """Stop containers and remove a user's service registration.
 
@@ -561,7 +586,7 @@ def change_password(
     service_name: str,
     label: str,
     passwd: str,
-    nginx_container: str = "provision-nginx",
+    nginx_container: str = "subnet-acl-nginx",
 ) -> dict[str, str]:
     """Change a user's htpasswd password and reload nginx.
 

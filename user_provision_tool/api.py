@@ -845,7 +845,10 @@ class CheckMissingFilesResponse(BaseModel):
 
 
 @app.get("/services/{service_name}/check-missing-files")
-def check_missing_files(service_name: str) -> CheckMissingFilesResponse:
+def check_missing_files(
+    service_name: str,
+    recipe_path: str = Query("", description="Recipe subdirectory path for multi-recipe projects"),
+) -> CheckMissingFilesResponse:
     """Check which essential deployment files are missing for a service.
 
     Essential files for deployment:
@@ -856,10 +859,15 @@ def check_missing_files(service_name: str) -> CheckMissingFilesResponse:
 
     Returns a list of missing file types so the gateway can offer
     LLM-based generation or manual upload before deployment.
+
+    Args:
+        recipe_path: Optional subdirectory for multi-recipe projects.
     """
     project_dir = SOURCE_PROJECTS_DIR / service_name
+    if recipe_path:
+        project_dir = project_dir / recipe_path
     if not project_dir.is_dir():
-        raise HTTPException(404, f"Service '{service_name}' not found")
+        raise HTTPException(404, f"Service '{service_name}' recipe '{recipe_path}' not found" if recipe_path else f"Service '{service_name}' not found")
 
     files = [f.name for f in project_dir.iterdir() if f.is_file()]
 

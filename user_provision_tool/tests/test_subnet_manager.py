@@ -151,3 +151,32 @@ class TestGetAllocatedSubnets:
         assert len(subnets) == 2
         assert "10.0.0.0/29" in subnets
         assert "10.0.0.8/29" in subnets
+
+
+class TestGetHostAllocatedSubnets:
+    def test_returns_subnets_inside_pool(self):
+        """Live Docker networks inside the pool count as allocated (overlap guard)."""
+        with mock.patch.dict(os.environ, {"SUBNET_POOLS": "100.96.0.0/16"}):
+            subnet_manager._load_env()
+            fake = {
+                "live-net": {"IPAM": {"Config": [{"Subnet": "100.96.0.0/29", "Gateway": "100.96.0.1"}]}},
+                "shared": {"IPAM": {"Config": [{"Subnet": "172.20.0.0/16"}]}},   # outside pool
+                "null-ipam": {"IPAM": None},                                    # must not crash
+                "no-ipam": {"IPAM": {"Config": []}},
+            }
+            with mock.patch("lib.docker_ops.network_list", return_value=list(fake)), \
+                 mock.patch("lib.docker_ops.network_inspect", side_effect=lambda n: fake.get(n)):
+                host = subnet_manager.get_host_allocated_subnets()
+        assert "100.96.0.0/29" in host
+        assert all("172.20.0.0/16" not in s for s in host)
+
+    def test_returns_empty_when_disabled(self):
+        with mock.patch.dict(os.environ, {"SUBNET_POOLS": ""}):
+            subnet_manager._load_env()
+            assert subnet_manager.get_host_allocated_subnets() == []
+
+    def test_returns_empty_on_docker_error(self):
+        with mock.patch.dict(os.environ, {"SUBNET_POOLS": "100.96.0.0/16"}):
+            subnet_manager._load_env()
+            with mock.patch("lib.docker_ops.network_list", side_effect=RuntimeError("docker down")):
+                assert subnet_manager.get_host_allocated_subnets() == []

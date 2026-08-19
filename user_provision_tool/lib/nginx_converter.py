@@ -359,6 +359,18 @@ def convert_nginx(
             out_blocks.append(p["text"])
     text = ''.join(out_blocks)
 
+    # --- Normalize legacy _set_token redirects ---
+    # Templates generated before the port-preserving redirect was introduced
+    # contain `return 302 $arg_redirect;`. nginx normalizes a relative redirect
+    # to `$scheme://$host` which DROPS the nginx host port, so /go/ links land
+    # on :80 instead of :{NGINX_HTTP_PORT}. Upgrade any such directive to
+    # preserve the Host header (which includes the port).
+    text = re.sub(
+        r'return\s+302\s+\$arg_redirect\s*;',
+        'return 302 $scheme://$http_host$arg_redirect;',
+        text,
+    )
+
     return text
 
 

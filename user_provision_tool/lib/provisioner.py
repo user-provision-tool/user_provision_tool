@@ -239,9 +239,15 @@ def register_user(
     # --- Subnet allocation ---
     # Count containers from compose template, allocate subnet from pool.
     container_count = len(get_compose_service_names(compose_template))
+    # The registry tracks this stack's allocations, but not networks created by
+    # another stack on the same host (parallel integration run, registry reset).
+    # Merge live Docker-network subnets inside the pools so we never collide
+    # with an existing network (Docker would fail: "Pool overlaps").
+    allocated_subnets = subnet_manager.get_allocated_subnets(registry._load())
+    allocated_subnets += subnet_manager.get_host_allocated_subnets()
     allocated = subnet_manager.allocate_subnet(
         container_count,
-        subnet_manager.get_allocated_subnets(registry._load()),
+        allocated_subnets,
     )
     _subnet = allocated["subnet"] if allocated else ""
     _gateway = allocated["gateway"] if allocated else ""

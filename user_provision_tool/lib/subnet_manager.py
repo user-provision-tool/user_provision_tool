@@ -212,6 +212,58 @@ def get_allocated_subnets(registry_entries: list[dict[str, Any]]) -> list[str]:
     return subnets
 
 
+def get_host_allocated_subnets() -> list[str]:
+    """Return subnets of live Docker networks that fall inside ``SUBNET_POOLS``.
+
+    The registry is the provision system's own source of truth, but it cannot
+    know about networks created by another stack on the same host (e.g. an
+    integration test running a fresh registry alongside the live stack, or a
+    recovery after the registry file was lost). Allocating blindly from the
+    registry would pick subnets that already exist on the host and Docker then
+    fails with ``Pool overlaps with other one on this address space``.
+
+    We therefore treat every Docker network whose IPAM subnet lies inside any
+    configured pool as already-allocated. Returns ``[]`` when subnet management
+    is disabled or Docker inspection is unavailable.
+    """
+    _load_env()
+    if not SUBNET_POOLS:
+        return []
+    try:
+        from . import docker_ops as _dops  # lazy — avoid circular import
+
+        pools = []
+        for pool_cidr in SUBNET_POOLS:
+            try:
+                pools.append(ipaddress.IPv4Network(pool_cidr, strict=False))
+            except ValueError:
+                continue
+        if not pools:
+            return []
+
+        host_subnets: list[str] = []
+        for net_name in _dops.network_list():
+            info = _dops.network_inspect(net_name)
+            if not info:
+                continue
+            # IPAM can be None on some networks (e.g. the default bridge) —
+            # guard before indexing Config.
+            for cfg in (info.get("IPAM") or {}).get("Config", []) or []:
+                cidr = cfg.get("Subnet", "")
+                if not cidr:
+                    continue
+                try:
+                    net = ipaddress.IPv4Network(cidr, strict=False)
+                except ValueError:
+                    continue
+                if any(p.supernet_of(net) for p in pools):
+                    host_subnets.append(str(net))
+        return host_subnets
+    except Exception:
+        # Never block registration because Docker inspection failed.
+        return []
+
+
 def get_pool_stats(
     registry_entries: list[dict[str, Any]],
 ) -> dict[str, Any]:

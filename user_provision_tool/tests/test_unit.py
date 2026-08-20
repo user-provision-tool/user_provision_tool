@@ -2787,6 +2787,35 @@ class TestAPINewEndpoints:
         assert response.status_code == 200
         assert isinstance(response.json(), list)
 
+    # ── GET /subnet-pool ──
+
+    def test_get_subnet_pool_returns_stats(self, monkeypatch):
+        """GET /subnet-pool returns pool usage stats when SUBNET_POOLS is set."""
+        import os
+        from lib import subnet_manager
+        monkeypatch.setenv("SUBNET_POOLS", "100.96.0.0/16")
+        subnet_manager._load_env()
+        response = self.client.get("/subnet-pool")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["enabled"] is True
+        assert len(data["pools"]) == 1
+        assert data["pools"][0]["cidr"] == "100.96.0.0/16"
+        assert data["pools"][0]["total_slots"] > 0
+        assert "overall" in data
+        assert "allocations" in data
+
+    def test_get_subnet_pool_disabled_when_no_pools(self, monkeypatch):
+        """GET /subnet-pool returns disabled state when SUBNET_POOLS is empty."""
+        import os
+        from lib import subnet_manager
+        monkeypatch.setenv("SUBNET_POOLS", "")
+        subnet_manager._load_env()
+        response = self.client.get("/subnet-pool")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["enabled"] is False
+
     # ── GET /docker/stats ──
 
     def test_docker_stats_returns_list(self, monkeypatch):
@@ -3225,6 +3254,80 @@ class TestCheckMissingFiles:
             assert "docker-compose" in data["existing"]
             assert "nginx.conf" in data["existing"]
             assert "Dockerfile" in data["existing"]
+        finally:
+            api.SOURCE_PROJECTS_DIR = original
+
+    def test_check_missing_files_recipe_path_all_present(self, tmp_path):
+        """recipe_path checks files inside the recipe subdirectory."""
+        import api
+        from pathlib import Path
+
+        svc_dir = tmp_path / "multisvc"
+        recipe_dir = svc_dir / "recipes" / "web"
+        recipe_dir.mkdir(parents=True)
+        # Root has nothing deployable; the recipe subdir has all essential files
+        (recipe_dir / "docker-compose.yml").write_text("services:\n  web:\n    build: .")
+        (recipe_dir / "nginx.conf").write_text("server { listen 80; }")
+        (recipe_dir / "Dockerfile").write_text("FROM python:3.13")
+        (recipe_dir / ".env").write_text("DEBUG=true")
+
+        original = api.SOURCE_PROJECTS_DIR
+        try:
+            api.SOURCE_PROJECTS_DIR = tmp_path
+            from fastapi.testclient import TestClient
+            client = TestClient(api.app)
+            response = client.get("/services/multisvc/check-missing-files?recipe_path=recipes/web")
+            assert response.status_code == 200
+            data = response.json()
+            assert data["ready"] is True
+            assert data["missing"] == []
+            assert len(data["existing"]) == 4
+        finally:
+            api.SOURCE_PROJECTS_DIR = original
+
+    def test_check_missing_files_recipe_path_missing_dir_returns_404(self, tmp_path):
+        """recipe_path to a non-existent subdirectory returns 404 with the recipe in the message."""
+        import api
+        from pathlib import Path
+
+        svc_dir = tmp_path / "multisvc"
+        svc_dir.mkdir()
+        (svc_dir / "docker-compose.yml").write_text("services:\n  web:\n    build: .")
+
+        original = api.SOURCE_PROJECTS_DIR
+        try:
+            api.SOURCE_PROJECTS_DIR = tmp_path
+            from fastapi.testclient import TestClient
+            client = TestClient(api.app)
+            response = client.get("/services/multisvc/check-missing-files?recipe_path=recipes/nope")
+            assert response.status_code == 404
+            assert "recipe 'recipes/nope'" in response.json()["detail"]
+        finally:
+            api.SOURCE_PROJECTS_DIR = original
+
+    def test_check_missing_files_recipe_path_ignores_root_files(self, tmp_path):
+        """With recipe_path given, root-only files are NOT counted as existing."""
+        import api
+        from pathlib import Path
+
+        svc_dir = tmp_path / "multisvc2"
+        recipe_dir = svc_dir / "recipes" / "api"
+        recipe_dir.mkdir(parents=True)
+        # Root has compose + Dockerfile, but the recipe subdir is EMPTY
+        (svc_dir / "docker-compose.yml").write_text("services:\n  web:\n    build: .")
+        (svc_dir / "Dockerfile").write_text("FROM python:3.13")
+
+        original = api.SOURCE_PROJECTS_DIR
+        try:
+            api.SOURCE_PROJECTS_DIR = tmp_path
+            from fastapi.testclient import TestClient
+            client = TestClient(api.app)
+            response = client.get("/services/multisvc2/check-missing-files?recipe_path=recipes/api")
+            assert response.status_code == 200
+            data = response.json()
+            assert data["ready"] is False
+            assert len(data["existing"]) == 0  # root files are outside the recipe
+            assert len(data["missing"]) == 4
         finally:
             api.SOURCE_PROJECTS_DIR = original
 

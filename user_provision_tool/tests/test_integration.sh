@@ -330,6 +330,14 @@ else
     fail "POST /users failed: $reg_resp"
 fi
 
+# Subnet allocation: when SUBNET_POOLS is enabled, the registry entry carries a subnet.
+reg_subnet=$(echo "$reg_resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('entry',{}).get('subnet',''))" 2>/dev/null || echo "")
+if [ -n "$reg_subnet" ]; then
+    pass "Register allocated subnet $reg_subnet"
+else
+    fail "No subnet allocated — SUBNET_POOLS disabled or allocation failed"
+fi
+
 # ---------------------------------------------------------------------------
 # Test 3: POST /users duplicate returns 409
 # ---------------------------------------------------------------------------

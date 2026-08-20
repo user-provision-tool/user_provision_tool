@@ -51,12 +51,21 @@ source_project/service_1/          ← project root (-pr), resolved from bare na
       └─────────────────────────────────────────┬───────────────────────────────────────────┘
                                                 ▼
 ┌─────────────────────────────────────────────────────────────┐
-│ [1/5]  registry.add_user()                                  │
+│ [1/5]  subnet allocation + registry.add_user()              │
+│                                                             │
+│  (when SUBNET_POOLS is set)                                 │
+│  subnet_manager.allocate_subnet()                           │
+│    └─ smallest /30../24 fitting containers + HEADROOM + 1   │
+│    └─ bitmap allocator with alignment; RuntimeError on      │
+│       exhaustion                                            │
+│  compose_converter.ensure_subnet_ipam_block()               │
+│    └─ re-injects {% if subnet %} ipam block into old        │
+│       templates (backup as .bak)                            │
 │                                                             │
 │  writes user_registry.yml entry:                            │
 │  { user_name, service_name, label,                          │
 │    compose_template_path, nginx_conf_template_path,         │
-│    volumes, … }                                             │
+│    volumes, …, subnet, gateway }                            │
 └─────────────────────────────────────────────────────────────┘
       │
       ▼
@@ -73,6 +82,18 @@ source_project/service_1/          ← project root (-pr), resolved from bare na
 │  │ container_prefix = "myapp-user_alice-0-"           │     │
 │  │ network_name     = "myapp-user_alice-0"            │     │
 │  │ volumes          = { "app": "/data/alice/app" }    │     │
+│  │ subnet           = "100.96.0.0/29" (or "")         │     │
+│  │ gateway          = "100.96.0.1"    (or "")         │     │
+│  └────────────────────────────────────────────────────┘     │
+│  ┌─ template snippet (IPAM block, guarded) ──────────┐      │
+│  │ networks:                                          │     │
+│  │   - {{ network_name }}                             │     │
+│  │ {% if subnet %}                                    │     │
+│  │   ipam:                                            │     │
+│  │     config:                                        │     │
+│  │       - subnet: {{ subnet }}                       │     │
+│  │         gateway: {{ gateway }}                     │     │
+│  │ {% endif %}                                        │     │
 │  └────────────────────────────────────────────────────┘     │
 │                                                             │
 │  ┌─ template snippet ───────────────────────────────────┐   │
@@ -138,6 +159,11 @@ source_project/service_1/          ← project root (-pr), resolved from bare na
 │                                                             │
 │  (when passwd='': auth_basic* lines stripped post-render;  │
 │   no .htpasswd written; htpasswd_path=null in registry)    │
+│                                                             │
+│  (when ENABLE_ACL=true: JWT+ACL rewrite applied —           │
+│   auth_request /_auth_jwt, error_page 401/403 redirects to  │
+│   $dashboard_host, auth_basic stripped; _set_token redirect │
+│   normalized to $scheme://$http_host$arg_redirect)          │
 └─────────────────────────────────────────────────────────────┘
       │
       ▼
@@ -163,21 +189,22 @@ source_project/service_1/          ← project root (-pr), resolved from bare na
 ┌─────────────────────────────────────────────────────────────┐
 │ [5/5]  docker_ops.network_connect() + nginx_reload()        │
 │                                                             │
-│  docker network connect myapp-user_alice-0 provision-nginx  │
-│  docker exec provision-nginx nginx -s reload                │
+│  docker network connect myapp-user_alice-0 subnet-acl-nginx  │
+│  docker exec subnet-acl-nginx nginx -s reload                │
 │                                                             │
-│  connects provision-nginx to the user's isolated network    │
+│  connects subnet-acl-nginx to the user's isolated network    │
 │  so it can proxy traffic to the user's containers           │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 Two distinct substitution phases:
 
-- **Steps 0a–3** — `{{ var }}` Jinja2 expressions: registration-time, per-user values (names, paths, network, hostname)
-- **Step 0b note** — if the source nginx conf has **no** `auth_basic` block, `nginx_converter` automatically injects `auth_basic "{{ service_name }} - {{ user_name }}";` and `auth_basic_user_file {{ htpasswd_path }};` before the first `proxy_pass`
-- **Step 3 note** — when `passwd=''`, `render_nginx_conf()` strips all `auth_basic*` lines from the rendered output and skips writing the `.htpasswd` file; `htpasswd_path` is stored as `null` in the registry. Also, all static `proxy_pass` directives are post-processed to use nginx variables (`set $upstream_XXXX`) for per-request DNS resolution — this lets nginx reload cleanly even when upstream containers are missing.
+- **Steps 0a–3** — `{{ var }}` Jinja2 expressions: registration-time, per-user values (names, paths, network, hostname, subnet/gateway)
+- **Step 0b note** — if the source nginx conf has **no** `auth_basic` block, `nginx_converter` automatically injects `auth_basic "{{ service_name }} - {{ user_name }}";` and `auth_basic_user_file {{ htpasswd_path }};` before the first `proxy_pass`. It also injects `location = /_set_token` into every server block and normalizes legacy `return 302 $arg_redirect;` → `$scheme://$http_host$arg_redirect;` (port-preserving), plus the `location = /_auth_jwt` gateway subrequest.
+- **Step 1 note** — when `SUBNET_POOLS` is set, `subnet_manager.allocate_subnet()` sizes and reserves a subnet (`/30`..`/24`, `/29` minimum) and `compose_converter.ensure_subnet_ipam_block()` re-injects the `{% if subnet %}` ipam block into old templates (backing up as `.bak`). The registry entry records `subnet` / `gateway`.
+- **Step 3 note** — when `passwd=''`, `render_nginx_conf()` strips all `auth_basic*` lines from the rendered output and skips writing the `.htpasswd` file; `htpasswd_path` is stored as `null` in the registry. Also, all static `proxy_pass` directives are post-processed to use nginx variables (`set $upstream_XXXX`) for per-request DNS resolution — this lets nginx reload cleanly even when upstream containers are missing. When `ENABLE_ACL=true`, the JWT+ACL rewrite is applied (auth_request /_auth_jwt, error_page 401/403 → `$dashboard_host`, `auth_basic` stripped).
 - **Step 4** — `${VAR}` shell env vars: runtime secrets/config supplied via `--env-file`, shared across all users of the same service
-- **Step 5** — post-compose networking: runs unconditionally; provision-nginx is connected to the new isolated network and reloaded
+- **Step 5** — post-compose networking: runs unconditionally; subnet-acl-nginx is connected to the new isolated network and reloaded
 
 Flag summary (all filenames relative to `-pr`):
 

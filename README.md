@@ -15,7 +15,7 @@ a source project directory. When a user registers, the tool:
 1. **Auto-converts** your plain files into per-user Jinja2 templates (once, on first use)
 2. **Renders** isolated `docker-compose.user-{user}.{label}.yml` and `*.nginx.conf` for that user
 3. **Starts** the containers with `docker compose up --project-name {isolated-name}`
-4. **Routes** HTTP/HTTPS traffic by connecting `provision-nginx` to the user's Docker network and reloading nginx live
+4. **Routes** HTTP/HTTPS traffic by connecting `subnet-acl-nginx` to the user's Docker network and reloading nginx live
 5. **Supports TLS** — pass `--https` with certificate paths and the tool copies certs, renders HTTPS server blocks, and enables SSL termination
 6. **Tracks** state in `user_registry.yml` — remove a user's service and its containers are torn down cleanly
 
@@ -72,7 +72,7 @@ A **provisioner**: given a Docker Compose stack, it stamps out one isolated, rou
 
 **1. Set up the provision directory and drop in your service**
 ```bash
-export PROVISION_DIR=/srv/provision
+export PROVISION_DIR=/srv/provision_subnet_acl
 mkdir -p $PROVISION_DIR/{generated,ssl,source_projects/myapp}
 # copy your service into source_projects/myapp/  (Dockerfile, docker-compose.yml, nginx.conf, .env, ...)
 ```
@@ -86,7 +86,7 @@ docker compose -f docker-compose.provision.yml up -d --build
 
 *Async (default) — returns task_id immediately, work runs in background:*
 ```bash
-curl -X POST http://localhost:8765/users \
+curl -X POST http://localhost:8875/users \
   -H 'Content-Type: application/json' \
   -d '{
     "user_name": "alice",
@@ -103,7 +103,7 @@ curl -X POST http://localhost:8765/users \
 
 *Sync (blocking) — add ?sync=true:*
 ```bash
-curl -X POST "http://localhost:8765/users?sync=true" \
+curl -X POST "http://localhost:8875/users?sync=true" \
   -H 'Content-Type: application/json' \
   -d '{...}'
 # → {"status": "registered", "entry": {...}, "copied_env": ".../.env.alice.0"}
@@ -111,64 +111,64 @@ curl -X POST "http://localhost:8765/users?sync=true" \
 
 **4. Poll task status or check all tasks**
 ```bash
-curl http://localhost:8765/tasks/a1b2c3d4e5f6
+curl http://localhost:8875/tasks/a1b2c3d4e5f6
 # → {"task_id": "a1b2c3d4e5f6", "status": "completed", "result": {...}}
 
-curl http://localhost:8765/tasks
+curl http://localhost:8875/tasks
 # → {"count": 3, "tasks": [...]}
 
-curl -X DELETE http://localhost:8765/tasks/a1b2c3d4e5f6
+curl -X DELETE http://localhost:8875/tasks/a1b2c3d4e5f6
 # → cancel a pending/running task
 ```
 
 **5. Check user status**
 ```bash
-curl http://localhost:8765/users/alice
+curl http://localhost:8875/users/alice
 ```
 
 **6. Rebuild (with proxy build args)**
 ```bash
-curl -X POST "http://localhost:8765/users/alice/services/myapp/0/rebuild?sync=true" \
+curl -X POST "http://localhost:8875/users/alice/services/myapp/0/rebuild?sync=true" \
   -H 'Content-Type: application/json' \
   -d '{"no_cache": true, "build_args": {"HTTP_PROXY": "http://proxy:8080"}}'
 ```
 
 **7. Remove**
 ```bash
-curl -X DELETE "http://localhost:8765/users/alice/services/myapp/0?sync=true"
+curl -X DELETE "http://localhost:8875/users/alice/services/myapp/0?sync=true"
 ```
 
 **8. Start / stop a service**
 ```bash
-curl -X POST http://localhost:8765/users/alice/services/myapp/0/up
-curl -X POST http://localhost:8765/users/alice/services/myapp/0/down
+curl -X POST http://localhost:8875/users/alice/services/myapp/0/up
+curl -X POST http://localhost:8875/users/alice/services/myapp/0/down
 ```
 
 **9. Change password**
 ```bash
-curl -X PUT http://localhost:8765/users/alice/services/myapp/0/password \
+curl -X PUT http://localhost:8875/users/alice/services/myapp/0/password \
   -H 'Content-Type: application/json' -d '{"passwd": "newsecret"}'
 ```
 
 **10. Container logs**
 ```bash
-curl "http://localhost:8765/users/alice/services/myapp/0/containers/web/logs?tail=50"
+curl "http://localhost:8875/users/alice/services/myapp/0/containers/web/logs?tail=50"
 ```
 
 **11. Docker / host monitoring**
 ```bash
-curl http://localhost:8765/docker/ps          # list all containers
-curl http://localhost:8765/docker/stats        # per-container resource stats
-curl http://localhost:8765/docker/info         # docker host info
-curl http://localhost:8765/host/stats          # host CPU/memory/disk
-curl http://localhost:8765/container-stats     # registry-scoped container stats
-curl http://localhost:8765/service-stats       # registry-scoped service health summary
+curl http://localhost:8875/docker/ps          # list all containers
+curl http://localhost:8875/docker/stats        # per-container resource stats
+curl http://localhost:8875/docker/info         # docker host info
+curl http://localhost:8875/host/stats          # host CPU/memory/disk
+curl http://localhost:8875/container-stats     # registry-scoped container stats
+curl http://localhost:8875/service-stats       # registry-scoped service health summary
 ```
 
 **12. Nginx state**
 ```bash
-curl http://localhost:8765/nginx/connections     # nginx networks + upstreams
-curl -X POST http://localhost:8765/nginx/reconnect-all  # reconnect to all networks
+curl http://localhost:8875/nginx/connections     # nginx networks + upstreams
+curl -X POST http://localhost:8875/nginx/reconnect-all  # reconnect to all networks
 ```
 
 **13. SSE build log streaming (per-task isolated logs)**
@@ -177,7 +177,7 @@ curl -X POST http://localhost:8765/nginx/reconnect-all  # reconnect to all netwo
 # Each async task writes to its own isolated log file at:
 #   $TASK_LOG_DIR/task-{task_id}.log
 # Stream the log via SSE while the task runs:
-curl http://localhost:8765/tasks/{task_id}/log?tail=20&follow=true
+curl http://localhost:8875/tasks/{task_id}/log?tail=20&follow=true
 
 # Configuration (optional environment variables):
 #   TASK_LOG_DIR       — where per-task .log files are stored
@@ -190,32 +190,32 @@ curl http://localhost:8765/tasks/{task_id}/log?tail=20&follow=true
 
 **14. Reconciliation & nginx state**
 ```bash
-curl -X POST http://localhost:8765/reconcile        # run live reconciliation
-curl http://localhost:8765/reconcile/status          # live nginx state snapshot
-curl http://localhost:8765/nginx-state               # same as above
+curl -X POST http://localhost:8875/reconcile        # run live reconciliation
+curl http://localhost:8875/reconcile/status          # live nginx state snapshot
+curl http://localhost:8875/nginx-state               # same as above
 ```
 
 **15. SSL certificate management**
 ```bash
 # List all available SSL certificate domains
-curl http://localhost:8765/ssl-certs
+curl http://localhost:8875/ssl-certs
 
 # Upload certificates (path mode — reads from a directory)
-curl -X POST http://localhost:8765/ssl-certs \
+curl -X POST http://localhost:8875/ssl-certs \
   -H 'Content-Type: application/json' \
   -d '{"domain":"example.com","ssl_path":"/etc/letsencrypt/live/example.com"}'
 
 # Refresh from original source path
-curl -X POST http://localhost:8765/ssl-certs/example.com/refresh
+curl -X POST http://localhost:8875/ssl-certs/example.com/refresh
 
 # Delete certificates
-curl -X DELETE http://localhost:8765/ssl-certs/example.com
+curl -X DELETE http://localhost:8875/ssl-certs/example.com
 ```
 
 **16. Register with HTTPS**
 ```bash
 # Full path — certs are copied to $PROVISION_DIR/ssl/example.com/
-curl -X POST "http://localhost:8765/users?sync=true" \
+curl -X POST "http://localhost:8875/users?sync=true" \
   -H 'Content-Type: application/json' \
   -d '{
     "user_name": "alice",
@@ -230,7 +230,7 @@ curl -X POST "http://localhost:8765/users?sync=true" \
   }'
 
 # Bare filename — certs already in $PROVISION_DIR/ssl/example.com/
-curl -X POST "http://localhost:8765/users?sync=true" \
+curl -X POST "http://localhost:8875/users?sync=true" \
   -H 'Content-Type: application/json' \
   -d '{
     "user_name": "alice",
@@ -243,6 +243,35 @@ curl -X POST "http://localhost:8765/users?sync=true" \
     "fullchain": "fullchain.pem",
     "privkey": "privkey.pem"
   }'
+```
+
+**17. Subnet management — enable per-service IPAM pools**
+
+Set `SUBNET_POOLS` (comma-separated `/16` pools) on the provision stack to reserve a dedicated
+subnet for every registered service. The smallest `/30`..`/24` that fits
+`containers + HEADROOM + 1 (gateway)` is allocated from the pool with a bitmap allocator
+(`/29` minimum so `subnet-acl-nginx` can join the network). An empty/unset `SUBNET_POOLS`
+disables subnet management entirely.
+
+```bash
+export SUBNET_POOLS=100.96.0.0/16,100.97.0.0/16   # empty = disabled
+export SUBNET_HEADROOM=2                            # default 2
+export ENABLE_ACL=true                              # JWT+ACL nginx template; false = legacy auth_basic
+```
+
+```bash
+# Inspect pool usage (enabled, pools[], overall, allocations[], headroom)
+curl http://localhost:8875/subnet-pool
+```
+
+**18. Check missing deployment files (with recipe subdirectory)**
+
+`recipe_path` checks a subdirectory for multi-recipe projects (e.g. `recipes/web`). The 404
+message includes the recipe when it is not found.
+
+```bash
+curl "http://localhost:8875/services/myapp/check-missing-files?recipe_path=recipes/web"
+# → {"service_name": "myapp", "ready": true, "missing": [], "existing": ["docker-compose", "nginx.conf", "Dockerfile", ".env"]}
 ```
 
 ---
@@ -262,7 +291,7 @@ python cli/register.py \
 # Or use a full path when the project isn't under SOURCE_PROJECTS_DIR
 python cli/register.py \
   -u alice -sn myapp \
-  -pr /srv/provision/source_projects/myapp \
+  -pr /srv/provision_subnet_acl/source_projects/myapp \
   -fc docker-compose.yml \
   -fn nginx.conf \
   -d example.com
@@ -301,8 +330,8 @@ flowchart LR
     subgraph host["Docker Host"]
         subgraph upt["User Provision Tool"]
             direction TB
-            provision_api["provision-api\nFastAPI · :8765"]
-            provision_nginx["provision-nginx\nnginx · :80"]
+            provision_api["subnet-acl-provision-api\nFastAPI · :8875"]
+            provision_nginx["subnet-acl-nginx\nnginx · :8766"]
         end
 
         docker_daemon["Docker Daemon"]
@@ -348,8 +377,8 @@ flowchart LR
 # Install dependencies (requires uv)
 uv sync
 
-# Run unit + e2e + proxy + task manager tests (292 tests, no Docker needed)
-uv run pytest tests/test_unit.py tests/test_e2e.py tests/test_proxy_support.py tests/test_task_manager.py -v
+# Run unit + e2e + proxy + task manager + subnet manager tests (353 tests, no Docker needed)
+uv run pytest tests/test_unit.py tests/test_e2e.py tests/test_proxy_support.py tests/test_task_manager.py tests/test_subnet_manager.py -v
 
 # Run full integration tests (120 tests, requires Docker)
 sudo bash tests/test_integration.sh

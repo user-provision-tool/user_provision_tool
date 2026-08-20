@@ -35,8 +35,31 @@ control.
 | `{{ service_name }}` | `myapp` | Service name |
 | `{{ label }}` | `0` | Numeric label |
 | `{{ container_prefix }}` | `myapp-user_alice-0-` | Prefix for `container_name` entries |
-| `{{ volumes['key'] }}` | `/srv/provision/user-data/alice/app` | Host path for a named volume |
+| `{{ volumes['key'] }}` | `/srv/provision_subnet_acl/user-data/alice/app` | Host path for a named volume |
 | `{{ domain_name }}` | `example.com` | Domain (compose templates rarely use this) |
+| `{{ subnet }}` | `100.96.0.0/29` | Reserved subnet for this service (empty string when subnet management is disabled) |
+| `{{ gateway }}` | `100.96.0.1` | Gateway for the reserved subnet (empty string when subnet management is disabled) |
+
+### IPAM subnet block (`{% if subnet %}`)
+
+When `SUBNET_POOLS` is enabled, the rendered compose file gets an `ipam:` block under the
+user network. Guard it with `{% if subnet %}` so the template stays valid when subnet
+management is disabled (the variable renders as an empty string):
+
+```yaml
+networks:
+  {{ network_name }}:
+    name: {{ network_name }}
+    {% if subnet %}
+    ipam:
+      config:
+        - subnet: {{ subnet }}
+          gateway: {{ gateway }}
+    {% endif %}
+```
+
+`ensure_subnet_ipam_block()` auto-injects this block (backing up the original as `.bak`)
+when subnet pools are enabled and the template predates the feature.
 
 ---
 
@@ -47,10 +70,10 @@ All compose variables are available, plus:
 | Variable | Example value | Description |
 |---|---|---|
 | `{{ hostname }}` | `myapp-alice-0.example.com` | Derived as `{service}-{user}-{label}.{domain}` |
-| `{{ htpasswd_path }}` | `/srv/provision/generated/myapp.user-alice.0.htpasswd` | Absolute path to the generated `.htpasswd` file in `GENERATED_DIR` |
+| `{{ htpasswd_path }}` | `/srv/provision_subnet_acl/generated/myapp.user-alice.0.htpasswd` | Absolute path to the generated `.htpasswd` file in `GENERATED_DIR` |
 | `{{ https }}` | `True` / `False` | Boolean; `True` when HTTPS is enabled |
-| `{{ ssl_certificate_path }}` | `/srv/provision/ssl/example.com/fullchain.pem` | Path to the fullchain certificate file |
-| `{{ ssl_certificate_key_path }}` | `/srv/provision/ssl/example.com/privkey.pem` | Path to the private key file |
+| `{{ ssl_certificate_path }}` | `/srv/provision_subnet_acl/ssl/example.com/fullchain.pem` | Path to the fullchain certificate file |
+| `{{ ssl_certificate_key_path }}` | `/srv/provision_subnet_acl/ssl/example.com/privkey.pem` | Path to the private key file |
 
 ---
 
@@ -127,6 +150,72 @@ server {
 }
 {% endif %}
 ```
+
+---
+
+## ACL Enforcement (`ENABLE_ACL=true`)
+
+With `ENABLE_ACL=true`, `render_nginx_conf()` rewrites the rendered nginx conf to use
+JWT+ACL enforcement instead of the legacy `auth_basic` password dialog. The http-level maps
+(`$is_browser`, `$dashboard_host`) live once per stack in `nginx.provision.conf`; each
+per-service server block references them.
+
+What gets injected (server level):
+
+```nginx
+# JWT + ACL enforcement (server-level)
+auth_request /_auth_jwt;
+auth_request_set $service_basic $upstream_http_x_service_basic;
+auth_request_set $auth_action $upstream_http_x_auth_action;
+error_page 401 = @auth_401;
+error_page 403 = @auth_403;
+
+location @auth_401 {
+    if ($is_browser) { return 302 http://$dashboard_host/login?redirect=$scheme://$host$request_uri; }
+    return 401;
+}
+location @auth_403 {
+    if ($is_browser) { return 302 http://$dashboard_host/alert?reason=acl_denied&service=$host; }
+    return 403;
+}
+```
+
+And the internal subrequest location:
+
+```nginx
+location = /_auth_jwt {
+    internal;
+    proxy_pass http://subnet-acl-gateway:8770/api/auth/verify;
+    proxy_pass_request_body off;
+    proxy_set_header Content-Length "";
+    proxy_set_header X-Original-URI $request_uri;
+    proxy_set_header X-Provision-Token $http_x_provision_token;
+    proxy_set_header Cookie $http_cookie;
+    proxy_set_header Host $host;
+}
+```
+
+Behavior:
+- `auth_request /_auth_jwt` delegates identity/ACL verification to the gateway, forwarding
+  **both** the API client's `X-Provision-Token` header and the browser `Cookie`.
+- Browsers get redirected to the dashboard (`$dashboard_host`, default `localhost:8775`);
+  API clients get a plain `401` / `403`.
+- `auth_basic` / `auth_basic_user_file` are stripped — no password bypass.
+- The rendered conf also sets `proxy_set_header Authorization "Basic $service_basic";` before
+  the main upstream `proxy_pass`, so the gateway-provided credential reaches the app.
+
+`location = /_set_token` (injected by the converter and normalized at render time) sets the
+`provision_token` cookie and redirects back to the **same host:port** the browser came from:
+
+```nginx
+location = /_set_token {
+    add_header Set-Cookie "provision_token=$arg_token; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400";
+    return 302 $scheme://$http_host$arg_redirect;
+}
+```
+
+With `ENABLE_ACL=false` (the default), none of this is injected and the legacy
+`auth_basic` / `auth_basic_user_file` flow is preserved.
 
 ---
 
@@ -209,7 +298,7 @@ python cli/register.py -pr myapp \
   -fc docker-compose.yml -fn nginx.conf -u alice -sn myapp ...
 
 # Full path when the project is outside SOURCE_PROJECTS_DIR
-python cli/register.py -pr /srv/provision/source_projects/myapp \
+python cli/register.py -pr /srv/provision_subnet_acl/source_projects/myapp \
   -fc docker-compose.yml -fn nginx.conf -u alice -sn myapp ...
 ```
 
@@ -246,6 +335,12 @@ The converters apply these substitutions:
 | `proxy_pass` host matching a compose service name | `→ {{ container_prefix }}<name>` |
 | `proxy_pass` host NOT matching any compose service | **Rejected** — registration fails with validation error listing unknown hosts |
 | _(no `auth_basic` block present)_ | Injects `auth_basic "{{ service_name }} - {{ user_name }}";` and `auth_basic_user_file {{ htpasswd_path }};` before the first `proxy_pass` |
+| every server block | Injects `location = /_set_token` (sets `provision_token` cookie, then `return 302 $scheme://$http_host$arg_redirect;`) |
+| `return 302 $arg_redirect;` (legacy) | Normalized to `return 302 $scheme://$http_host$arg_redirect;` so the `/go/` redirect preserves the host port |
+| every server block | Injects `location = /_auth_jwt` (internal gateway subrequest) plus the ACL server-level directives (`auth_request /_auth_jwt`, `error_page 401/403` → `$dashboard_host`) |
+
+> **ACL is gated at render time** — `render_nginx_conf()` only applies the JWT+ACL rewrite when
+> `ENABLE_ACL=true`; with `false` the `auth_basic` fallback is kept (legacy behavior).
 
 > **Password stripping**: when `passwd` is empty (`""`), `render_nginx_conf()` strips all
 > `auth_basic` and `auth_basic_user_file` lines from the rendered nginx conf, so no

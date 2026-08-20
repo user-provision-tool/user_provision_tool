@@ -1,6 +1,6 @@
 # API Reference
 
-The provision-api exposes a REST API via FastAPI. By default it listens on port `8765`.
+The subnet-acl-provision-api exposes a REST API via FastAPI. By default it listens on host port `8875` (container port `8000`).
 
 Long-running operations (register, rebuild, remove) are **asynchronous by default** —
 they return a `task_id` immediately and the work runs in a background thread pool.
@@ -34,7 +34,7 @@ add `?sync=true` to any mutable endpoint.
 | `GET` | `/docker/container/{container}/exists` | Check if container exists |
 | `GET` | `/docker/container/{container}/running` | Check if container is running |
 | `POST` | `/docker/network/{network}/connect/{container}` | Connect container to network |
-| `POST` | `/docker/nginx/reload` | Reload provision-nginx |
+| `POST` | `/docker/nginx/reload` | Reload subnet-acl-nginx |
 | `GET` | `/nginx/connections` | Nginx connection state (networks, confs, upstreams) |
 | `POST` | `/nginx/reconnect-all` | Reconnect nginx to all user networks and reload |
 | `POST` | `/reconcile` | Run live nginx upstream reconciliation |
@@ -46,7 +46,8 @@ add `?sync=true` to any mutable endpoint.
 | `POST` | `/ssl-certs` | Upload SSL certificates for a domain |
 | `POST` | `/ssl-certs/{domain}/refresh` | Refresh certs from original source path |
 | `DELETE` | `/ssl-certs/{domain}` | Delete SSL certificates for a domain |
-| `GET` | `/services/{service_name}/check-missing-files` | Check which essential deployment files are missing |
+| `GET` | `/services/{service_name}/check-missing-files` | Check which essential deployment files are missing (`?recipe_path=` checks a recipe subdirectory) |
+| `GET` | `/subnet-pool` | Subnet pool usage statistics (enabled/pools/overall/allocations/headroom) |
 
 ---
 
@@ -112,7 +113,7 @@ Registers a user and starts their isolated service containers.
 **Example — async (default)**
 
 ```bash
-curl -X POST http://localhost:8765/users \
+curl -X POST http://localhost:8875/users \
   -H 'Content-Type: application/json' \
   -d '{
     "user_name": "alice",
@@ -137,7 +138,7 @@ curl -X POST http://localhost:8765/users \
 **Example — sync (blocking)**
 
 ```bash
-curl -X POST "http://localhost:8765/users?sync=true" \
+curl -X POST "http://localhost:8875/users?sync=true" \
   -H 'Content-Type: application/json' \
   -d '{...}'
 ```
@@ -151,14 +152,16 @@ curl -X POST "http://localhost:8765/users?sync=true" \
     "service_name": "myapp",
     "label": "0",
     "network_name": "myapp-user_alice-0",
-    "compose_file_path": "/srv/provision/source_projects/myapp/docker-compose.user-alice.0.yml",
+    "compose_file_path": "/srv/provision_subnet_acl/source_projects/myapp/docker-compose.user-alice.0.yml",
     "nginx_conf_path": null,
     "htpasswd_path": null,
-    "env_file_path": "/srv/provision/source_projects/myapp/.env.alice.0",
-    "volumes": { "app_data": "/srv/provision/user-data/alice/app" }
+    "env_file_path": "/srv/provision_subnet_acl/source_projects/myapp/.env.alice.0",
+    "volumes": { "app_data": "/srv/provision_subnet_acl/user-data/alice/app" },
+    "subnet": "100.96.0.0/29",
+    "gateway": "100.96.0.1"
   },
   "volume_warnings": { "missing": [], "extra": [] },
-  "copied_env": "/srv/provision/source_projects/myapp/.env.alice.0"
+  "copied_env": "/srv/provision_subnet_acl/source_projects/myapp/.env.alice.0"
 }
 ```
 
@@ -180,7 +183,7 @@ curl -X POST "http://localhost:8765/users?sync=true" \
 
 ```bash
 # Full path — certs are copied to $SSL_DIR/example.com/
-curl -X POST "http://localhost:8765/users?sync=true" \
+curl -X POST "http://localhost:8875/users?sync=true" \
   -H 'Content-Type: application/json' \
   -d '{
     "user_name": "alice",
@@ -195,7 +198,7 @@ curl -X POST "http://localhost:8765/users?sync=true" \
   }'
 
 # Bare filename — certs already in $SSL_DIR/example.com/
-curl -X POST "http://localhost:8765/users?sync=true" \
+curl -X POST "http://localhost:8875/users?sync=true" \
   -H 'Content-Type: application/json' \
   -d '{
     "user_name": "alice",
@@ -226,7 +229,7 @@ Runs `docker compose down` then removes **one** registry entry — the specific 
 
 **Example — async**
 ```bash
-curl -X DELETE http://localhost:8765/users/alice/services/myapp/0
+curl -X DELETE http://localhost:8875/users/alice/services/myapp/0
 ```
 
 **Response `202`**
@@ -264,7 +267,7 @@ Runs `docker compose build` then `docker compose up -d`.
 
 **Example — async**
 ```bash
-curl -X POST http://localhost:8765/users/alice/services/myapp/0/rebuild \
+curl -X POST http://localhost:8875/users/alice/services/myapp/0/rebuild \
   -H 'Content-Type: application/json' \
   -d '{"no_cache": true, "build_args": {"HTTP_PROXY": "http://proxy:8080"}}'
 ```
@@ -402,9 +405,12 @@ GET /users/alice
           "service_name": "myapp",
           "label": "0",
           "compose_file_path": "...",
+          "container_names": ["myapp-user_alice-0-web"],
           "healthy_containers":   { "myapp-user_alice-0-web": "Up 3 hours" },
           "unhealthy_containers": {},
-          "missing_containers":   {}
+          "missing_containers":   {},
+          "volumes": {},
+          "subnet": "100.96.0.0/29"
         }
       ],
       "unhealthy_services": [],
@@ -529,8 +535,8 @@ Used by the dashboard to show real-time progress during register/rebuild/remove 
 
 ```
 data: + docker compose -f ... up -d
-data: + docker network connect myapp-user_alice-0 provision-nginx
-data: + docker exec provision-nginx nginx -s reload
+data: + docker network connect myapp-user_alice-0 subnet-acl-nginx
+data: + docker exec subnet-acl-nginx nginx -s reload
 event: done
 data: {}
 ```
@@ -557,7 +563,7 @@ Returns all Docker containers (`docker ps -a`).
 **Response `200`**
 ```json
 [
-  { "name": "provision-nginx", "status": "Up 3 hours", "image": "nginx:alpine" },
+  { "name": "subnet-acl-nginx", "status": "Up 3 hours", "image": "nginx:alpine" },
   { "name": "myapp-user_alice-0-web", "status": "Up 2 hours", "image": "myapp:latest" }
 ]
 ```
@@ -571,7 +577,7 @@ Returns a snapshot of per-container CPU/memory usage (`docker stats --no-stream`
 **Response `200`**
 ```json
 [
-  { "name": "provision-nginx", "cpu": "0.05%", "mem": "10.5MiB / 1.94GiB" }
+  { "name": "subnet-acl-nginx", "cpu": "0.05%", "mem": "10.5MiB / 1.94GiB" }
 ]
 ```
 
@@ -636,13 +642,13 @@ These endpoints are called by the provision-gateway to reconcile state.
 
 ### `POST /docker/nginx/reload`
 
-Reloads provision-nginx (default) or a named container.
+Reloads subnet-acl-nginx (default) or a named container.
 
 **Query parameters**
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `container` | string | `provision-nginx` | Nginx container to reload |
+| `container` | string | `subnet-acl-nginx` | Nginx container to reload |
 
 **Response `200`**
 ```json
@@ -659,7 +665,7 @@ all generated `.nginx.conf` files, and parsed upstreams from each conf.
 **Response `200`**
 ```json
 {
-  "nginx_container": "provision-nginx",
+  "nginx_container": "subnet-acl-nginx",
   "connected_networks": ["myapp-user_alice-0", "myapp-user_bob-0"],
   "conf_files": ["myapp.user-alice.0.nginx.conf", "myapp.user-bob.0.nginx.conf"],
   "upstreams": [
@@ -676,7 +682,7 @@ all generated `.nginx.conf` files, and parsed upstreams from each conf.
 
 ## `POST /nginx/reconnect-all` — Reconnect Nginx to All Networks
 
-Iterates all entries in `user_registry.yml`, reconnects `provision-nginx` to each
+Iterates all entries in `user_registry.yml`, reconnects `subnet-acl-nginx` to each
 user network (idempotent), then reloads nginx.
 
 **Response `200`**
@@ -822,8 +828,8 @@ Returns domain names with expiry information (computed via `openssl x509 -enddat
   "domains": [
     {
       "domain": "example.com",
-      "fullchain_path": "/srv/provision/ssl/example.com/fullchain.pem",
-      "privkey_path": "/srv/provision/ssl/example.com/privkey.pem",
+      "fullchain_path": "/srv/provision_subnet_acl/ssl/example.com/fullchain.pem",
+      "privkey_path": "/srv/provision_subnet_acl/ssl/example.com/privkey.pem",
       "created_at": "",
       "expiry_date": "2026-10-05",
       "days_left": 89
@@ -862,8 +868,8 @@ Saves files to `SSL_DIR/{domain}/`. Overwrites existing files.
 ```json
 {
   "domain": "example.com",
-  "fullchain_path": "/srv/provision/ssl/example.com/fullchain.pem",
-  "privkey_path": "/srv/provision/ssl/example.com/privkey.pem",
+  "fullchain_path": "/srv/provision_subnet_acl/ssl/example.com/fullchain.pem",
+  "privkey_path": "/srv/provision_subnet_acl/ssl/example.com/privkey.pem",
   "expiry_date": "2026-10-05",
   "days_left": 89,
   "message": "SSL certificates saved for example.com"
@@ -887,8 +893,8 @@ Only works for certs that were originally uploaded via path mode.
 ```json
 {
   "domain": "example.com",
-  "fullchain_path": "/srv/provision/ssl/example.com/fullchain.pem",
-  "privkey_path": "/srv/provision/ssl/example.com/privkey.pem",
+  "fullchain_path": "/srv/provision_subnet_acl/ssl/example.com/fullchain.pem",
+  "privkey_path": "/srv/provision_subnet_acl/ssl/example.com/privkey.pem",
   "expiry_date": "2026-10-05",
   "days_left": 89,
   "message": "SSL certificates refreshed for example.com"
@@ -923,76 +929,162 @@ Removes the entire `SSL_DIR/{domain}/` directory tree.
 
 ---
 
+## `GET /services/{service_name}/check-missing-files` — Deployment File Readiness
+
+Checks which essential deployment files exist for a service under
+`SOURCE_PROJECTS_DIR/{service_name}`. Used by the gateway to offer LLM-based generation
+or manual upload before deployment.
+
+**Query parameters**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `recipe_path` | string | `""` | Optional recipe subdirectory for multi-recipe projects (e.g. `recipes/web`). When set, files are checked under `SOURCE_PROJECTS_DIR/{service_name}/{recipe_path}`. |
+
+Essential files checked:
+- `docker-compose.yml` (or `.yml.j2` / `.yaml.j2` template)
+- `nginx.conf` (or `.conf.j2` template)
+- `Dockerfile`
+- `.env` (recommended, but not strictly required)
+
+**Example — recipe subdirectory**
+```bash
+curl "http://localhost:8875/services/myapp/check-missing-files?recipe_path=recipes/web"
+```
+
+**Response `200`**
+```json
+{
+  "service_name": "myapp",
+  "project_root": "/srv/provision_subnet_acl/source_projects/myapp/recipes/web",
+  "ready": true,
+  "missing": [],
+  "existing": ["docker-compose", "nginx.conf", "Dockerfile", ".env"]
+}
+```
+
+**Error codes**
+
+| Code | Cause |
+|---|---|
+| `404` | Service (or recipe subdirectory) not found — the message includes the `recipe_path` when one was given |
+
+---
+
+## `GET /subnet-pool` — Subnet Pool Usage
+
+Returns subnet pool usage statistics for the dashboard. Computed from the `SUBNET_POOLS`
+environment variable plus registry entries. When `SUBNET_POOLS` is empty or unset, subnet
+management is disabled and the endpoint returns the disabled state.
+
+**Response `200`** (enabled)
+```json
+{
+  "enabled": true,
+  "pools": [
+    {
+      "cidr": "100.96.0.0/16",
+      "total_slots": 16384,
+      "used_slots": 1,
+      "free_slots": 16383,
+      "used_pct": 0.0,
+      "exhausted": false
+    }
+  ],
+  "overall": { "total_slots": 32768, "used_slots": 1, "free_slots": 32767 },
+  "allocations": [
+    { "user": "alice", "service": "myapp", "label": "0", "subnet": "100.96.0.0/29" }
+  ],
+  "headroom": 2
+}
+```
+
+**Response `200`** (disabled)
+```json
+{
+  "enabled": false,
+  "pools": [],
+  "headroom": 2,
+  "message": "Subnet management disabled"
+}
+```
+
+Slots are counted in `/30` granularity. Each registered entry's `subnet` / `gateway` is
+tracked in `user_registry.yml`; allocations for live Docker networks that fall inside a
+configured pool are also counted so parallel stacks never collide.
+
+---
+
 ## Quick Reference
 
 ```bash
 # Async register (default) — returns task_id immediately
-curl -X POST http://localhost:8765/users -H 'Content-Type: application/json' -d '{...}'
+curl -X POST http://localhost:8875/users -H 'Content-Type: application/json' -d '{...}'
 # → {"task_id": "a1b2c3d4e5f6", "status": "pending"}
 
 # Poll task status
-curl http://localhost:8765/tasks/a1b2c3d4e5f6
+curl http://localhost:8875/tasks/a1b2c3d4e5f6
 
 # List all tasks
-curl http://localhost:8765/tasks
+curl http://localhost:8875/tasks
 
 # Cancel a task
-curl -X DELETE http://localhost:8765/tasks/a1b2c3d4e5f6
+curl -X DELETE http://localhost:8875/tasks/a1b2c3d4e5f6
 
 # SSE build log stream
-curl http://localhost:8765/tasks/a1b2c3d4e5f6/log
+curl http://localhost:8875/tasks/a1b2c3d4e5f6/log
 
 # Sync register (blocking — backward compatible)
-curl -X POST "http://localhost:8765/users?sync=true" -H 'Content-Type: application/json' -d '{...}'
+curl -X POST "http://localhost:8875/users?sync=true" -H 'Content-Type: application/json' -d '{...}'
 
 # Sync rebuild
-curl -X POST "http://localhost:8765/users/alice/services/myapp/0/rebuild?sync=true" \
+curl -X POST "http://localhost:8875/users/alice/services/myapp/0/rebuild?sync=true" \
   -H 'Content-Type: application/json' -d '{"no_cache": true}'
 
 # Sync remove
-curl -X DELETE "http://localhost:8765/users/alice/services/myapp/0?sync=true"
+curl -X DELETE "http://localhost:8875/users/alice/services/myapp/0?sync=true"
 
 # Start / stop service
-curl -X POST http://localhost:8765/users/alice/services/myapp/0/up
-curl -X POST http://localhost:8765/users/alice/services/myapp/0/down
+curl -X POST http://localhost:8875/users/alice/services/myapp/0/up
+curl -X POST http://localhost:8875/users/alice/services/myapp/0/down
 
 # Change password
-curl -X PUT http://localhost:8765/users/alice/services/myapp/0/password \
+curl -X PUT http://localhost:8875/users/alice/services/myapp/0/password \
   -H 'Content-Type: application/json' -d '{"passwd": "newsecret"}'
 
 # Container logs
-curl "http://localhost:8765/users/alice/services/myapp/0/containers/web/logs?tail=50"
+curl "http://localhost:8875/users/alice/services/myapp/0/containers/web/logs?tail=50"
 
 # Reconciliation
-curl -X POST http://localhost:8765/reconcile
-curl http://localhost:8765/reconcile/status
-curl http://localhost:8765/nginx-state
+curl -X POST http://localhost:8875/reconcile
+curl http://localhost:8875/reconcile/status
+curl http://localhost:8875/nginx-state
 
 # Docker / host stats
-curl http://localhost:8765/docker/ps
-curl http://localhost:8765/docker/stats
-curl http://localhost:8765/docker/info
-curl http://localhost:8765/host/stats
+curl http://localhost:8875/docker/ps
+curl http://localhost:8875/docker/stats
+curl http://localhost:8875/docker/info
+curl http://localhost:8875/host/stats
 
 # Container / service stats (registry-scoped)
-curl http://localhost:8765/container-stats
-curl http://localhost:8765/service-stats
+curl http://localhost:8875/container-stats
+curl http://localhost:8875/service-stats
 
 # SSL certificate management
-curl http://localhost:8765/ssl-certs
-curl -X POST http://localhost:8765/ssl-certs -H 'Content-Type: application/json' -d '{"domain":"example.com","ssl_path":"/etc/letsencrypt/live/example.com"}'
-curl -X POST http://localhost:8765/ssl-certs/example.com/refresh
-curl -X DELETE http://localhost:8765/ssl-certs/example.com
+curl http://localhost:8875/ssl-certs
+curl -X POST http://localhost:8875/ssl-certs -H 'Content-Type: application/json' -d '{"domain":"example.com","ssl_path":"/etc/letsencrypt/live/example.com"}'
+curl -X POST http://localhost:8875/ssl-certs/example.com/refresh
+curl -X DELETE http://localhost:8875/ssl-certs/example.com
 
 # Reconciliation helpers
-curl http://localhost:8765/docker/container/provision-nginx/exists
-curl http://localhost:8765/docker/container/provision-nginx/running
-curl -X POST http://localhost:8765/docker/network/mynet/connect/provision-nginx
-curl -X POST http://localhost:8765/docker/nginx/reload
+curl http://localhost:8875/docker/container/subnet-acl-nginx/exists
+curl http://localhost:8875/docker/container/subnet-acl-nginx/running
+curl -X POST http://localhost:8875/docker/network/mynet/connect/subnet-acl-nginx
+curl -X POST http://localhost:8875/docker/nginx/reload
 
 # Nginx state
-curl http://localhost:8765/nginx/connections
-curl -X POST http://localhost:8765/nginx/reconnect-all
+curl http://localhost:8875/nginx/connections
+curl -X POST http://localhost:8875/nginx/reconnect-all
 ```
 
 ---
@@ -1004,4 +1096,7 @@ curl -X POST http://localhost:8765/nginx/reconnect-all
 | `GENERATED_DIR` | `./generated` | Directory for nginx conf, htpasswd, and `user_registry.yml` |
 | `REGISTRY_FILE` | `./user_registry.yml` | Path to the registry state file |
 | `DOCKER_OPS_LOG` | _(unset)_ | If set, path to a file where all docker command stdout/stderr is appended for debugging (e.g. `${PROVISION_DIR}/generated/docker_ops.log`) |
-| `PROVISION_API_PORT` | `8765` | Host port (set in `docker-compose.provision.yml`) |
+| `PROVISION_API_PORT` | `8875` | Host port (set in `docker-compose.provision.yml`) |
+| `SUBNET_POOLS` | _(empty)_ | Comma-separated `/16` pools for subnet management (e.g. `100.96.0.0/16,100.97.0.0/16`). Empty/unset = subnet management disabled |
+| `SUBNET_HEADROOM` | `2` | Extra host IPs reserved per service (added to container count + 1 gateway when sizing a subnet) |
+| `ENABLE_ACL` | `false` | `true` = per-service nginx template uses JWT+ACL enforcement (`auth_request /_auth_jwt`, dashboard redirects, no `auth_basic`); `false` = legacy `auth_basic` password dialog |

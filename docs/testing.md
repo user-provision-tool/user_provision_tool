@@ -1,6 +1,6 @@
 # Testing
 
-The test suite has four layers:
+The test suite has six layers:
 
 ```
 Integration (bash)   tests/test_integration.sh     120 tests
@@ -12,7 +12,7 @@ Integration (bash)   tests/test_integration.sh     120 tests
     async task pool, project_root resolution, build_args with MockProxy,
     per-task isolated log files (creation, content, SSE streaming)
 
-E2E (pytest)         tests/test_e2e.py              40 tests
+E2E (pytest)         tests/test_e2e.py              43 tests
   └─ exercise CLI scripts end-to-end against real files, no Docker
     includes proxy --build-arg support tests
     includes env_file_path with per-user copy + env_file: .env rewrite
@@ -20,11 +20,15 @@ E2E (pytest)         tests/test_e2e.py              40 tests
 Proxy Support        tests/test_proxy_support.py    38 tests
   └─ docker_ops, provisioner, API models, CLI parsing, MockProxy lifecycle
 
-Async Task Pool      tests/test_task_manager.py     14 tests
+Async Task Pool      tests/test_task_manager.py     16 tests
   └─ submit, complete, fail, cancel, list_all, uniqueness, per-task log file,
     TTL cleanup, max-count eviction
 
-Unit (pytest)        tests/test_unit.py             192 tests
+Subnet Manager       tests/test_subnet_manager.py   23 tests
+  └─ subnet sizing (/30../24), bitmap allocation + alignment, pool exhaustion,
+    registry/host subnet discovery, pool stats (GET /subnet-pool)
+
+Unit (pytest)        tests/test_unit.py             233 tests
   └─ individual lib/ functions in isolation, all I/O mocked
     includes provisioner proxy support tests
     includes env_file render_compose rewrite + per-user copy tests
@@ -36,6 +40,14 @@ Unit (pytest)        tests/test_unit.py             192 tests
       docker_ps_all, per-task log threading fix
     includes provisioner: start_service, stop_service, change_password,
       orphan network cleanup on remove
+    includes subnet/IPAM: ensure_subnet_ipam_block inject + .bak backup
+    includes ACL template: ENABLE_ACL=true auth_request/_auth_jwt enforcement,
+      ENABLE_ACL=false keeps auth_basic, _set_token port-preserving redirect,
+      no-ACL-locations templates left untouched
+    includes check-missing-files endpoint: response model, route, 404 for
+      missing service, all-present, j2 templates, recipe_path subdir (present,
+      missing dir 404, root files ignored)
+    includes GET /subnet-pool: stats when SUBNET_POOLS set, disabled when empty
     includes api (FastAPI TestClient): up/down/password endpoints, docker/ps,
       docker/stats, docker/info, host/stats, reconciliation helpers,
       nginx/connections, nginx/reconnect-all, container logs, task log SSE,
@@ -48,7 +60,7 @@ Unit (pytest)        tests/test_unit.py             192 tests
 ## Unit Tests
 
 **File:** `tests/test_unit.py`  
-**Covers:** `validation`, `registry`, `template_engine`, `auth`, `docker_ops`, `compose_converter`, `nginx_converter`, `provisioner` (proxy support)
+**Covers:** `validation`, `registry`, `template_engine`, `auth`, `docker_ops`, `compose_converter`, `nginx_converter`, `subnet_manager`, `provisioner` (proxy support) — plus the API endpoints for `check-missing-files` (incl. `recipe_path`) and `/subnet-pool`
 
 Run:
 ```bash
@@ -65,6 +77,26 @@ Notable patterns:
 - `TestProvisionerEnvFile` covers HTTPS, start_service, stop_service, change_password, orphan network cleanup, and `container_names` storage in registry.
 - `TestAPINewEndpoints` covers API endpoints using FastAPI `TestClient`: docker/ps, docker/stats, docker/info, host/stats, reconciliation helpers, up/down/password, nginx/connections, nginx/reconnect-all, container logs, task log SSE, health, tasks, reconcile, reconcile/status, nginx-state, container-stats, service-stats, ssl-certs (list/upload/refresh/delete).
 - `TestNginxConverter` covers deterministic proxy_pass rewriting (exact compose service name matching, no prefix stripping), SSL certificate path replacement, auth_basic injection, and HTTPS block auto-generation.
+- `TestRenderNginxConfACL` covers `ENABLE_ACL=true` — `auth_request /_auth_jwt` + `error_page 401/403` dashboard redirects injected, `auth_basic` stripped, the `_set_token` redirect preserved with `$scheme://$http_host$arg_redirect`; `ENABLE_ACL=false` keeps `auth_basic`; a template with no `location = /_auth_jwt` is left untouched.
+- `TestEnsureSubnetIpamBlock` covers `ensure_subnet_ipam_block()` — injects the `{% if subnet %}` ipam block into an old template and backs the original up as `.bak`.
+- `TestCheckMissingFiles` covers `GET /services/{service_name}/check-missing-files` — response model, route registration, 404 for missing service, all-present, `.j2` templates, and the `recipe_path` query parameter (recipe subdir present, missing recipe dir → 404, root files ignored when `recipe_path` is given).
+- `TestSubnetPoolAPI` covers `GET /subnet-pool` — returns pool stats when `SUBNET_POOLS` is set and the disabled state when it is empty.
+
+---
+
+## Subnet Manager Tests
+
+**File:** `tests/test_subnet_manager.py` — 23 tests
+
+```bash
+uv run pytest tests/test_subnet_manager.py -v
+```
+
+Covers `lib/subnet_manager.py`:
+- **Sizing** — `subnet_size_for_containers()` returns the smallest `/30`..`/24` fitting `containers + HEADROOM + 1(gateway)`; single/two/three containers → `/29` (the minimum so nginx can join), four/six → `/28`, fourteen → `/27`, thirty → `/26`, sixty-two → `/25`, larger → `/24`.
+- **Allocation** — `allocate_subnet()` picks a free block from the pool, returns `None` when disabled, raises `RuntimeError` on exhaustion, skips already-allocated subnets, and aligns blocks to their own size.
+- **Pool stats** — `get_pool_stats()` returns `enabled`/`pools`/`overall`/`allocations`/`headroom`, and the disabled state when `SUBNET_POOLS` is empty.
+- **Discovery** — `get_allocated_subnets()` / `get_host_allocated_subnets()` extract registry subnets and live Docker subnets inside the pools (empty when disabled / on Docker error).
 
 ---
 
@@ -104,7 +136,7 @@ Covers: `docker_ops.compose_build` --build-arg flags, `provisioner` build_args f
 
 ## Async Task Pool Tests
 
-**File:** `tests/test_task_manager.py` — 10 tests
+**File:** `tests/test_task_manager.py` — 16 tests
 
 ```bash
 uv run pytest tests/test_task_manager.py -v
@@ -122,8 +154,8 @@ Covers: submit → complete, submit → fail, cancel pending, cancel completed, 
 Runs the full end-to-end cycle against a real Docker daemon (120 tests):
 
 ```
-Build provision-api image
-  └─ Start provision-api container
+Build subnet-acl-provision-api image
+  └─ Start subnet-acl-provision-api container
        └─ Wait for /health
             ├─ GET  /users                              → empty list
             ├─ POST /users?sync=true (with passwd)      → register testuser/myapp/0
@@ -136,7 +168,7 @@ Build provision-api image
             ├─ docker ps                                 → containers gone
             ├─ GET  /users                              → empty list
             ├─ POST /users (re-register)                → network connectivity check
-            ├─ docker network inspect                   → provision-nginx connected
+            ├─ docker network inspect                   → subnet-acl-nginx connected
             ├─ DELETE /users (teardown)                 → network removed
             ├─ POST /users?sync=true with -fc/-fn       → auto-converted + registered
             ├─ POST /users (no compose source)          → 422
@@ -172,8 +204,8 @@ bash tests/test_integration.sh
 ### Run all tests
 
 ```bash
-# All pytest-based tests (297 tests, no Docker needed)
-uv run pytest tests/test_unit.py tests/test_e2e.py tests/test_proxy_support.py tests/test_task_manager.py -v
+# All pytest-based tests (353 tests, no Docker needed)
+uv run pytest tests/test_unit.py tests/test_e2e.py tests/test_proxy_support.py tests/test_task_manager.py tests/test_subnet_manager.py -v
 
 # Full integration (120 tests, requires Docker)
 sudo bash tests/test_integration.sh
@@ -191,10 +223,10 @@ down (containers + temp dir) on exit, even on failure.
 uv sync
 
 # Run pytest
-python -m pytest tests/test_unit.py tests/test_e2e.py -v
+python -m pytest tests/test_unit.py tests/test_e2e.py tests/test_proxy_support.py tests/test_task_manager.py tests/test_subnet_manager.py -v
 ```
 
-Expected: **297 passed** (197 unit + 40 e2e + 38 proxy + 14 task_manager + 8 api).
+Expected: **353 passed** (233 unit + 43 e2e + 38 proxy + 16 task_manager + 23 subnet).
 
 ---
 

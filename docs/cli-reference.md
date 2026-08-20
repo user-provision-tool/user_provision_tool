@@ -32,7 +32,7 @@ Start a user's containers from a Jinja2 compose template.
 | `--label` | `-l` | — | Digits only; default `0` |
 | `--domain` | `-d` | — | Domain for nginx `server_name`; default `localhost` |
 | `--https` | — | — | Enable HTTPS (requires `--fullchain` and `--privkey`) |
-| `--fullchain` | — | — | Path or bare filename to the certificate file. **Full path** (e.g. `/etc/letsencrypt/live/example.com/fullchain.pem`): copied to `/provision/ssl/{domain}/fullchain.pem`. **Bare filename** (e.g. `fullchain.pem`): used directly from `/provision/ssl/{domain}/`. Required with `--https`. |
+| `--fullchain` | — | — | Path or bare filename to the certificate file. **Full path** (e.g. `/etc/letsencrypt/live/example.com/fullchain.pem`): copied to `/srv/provision_subnet_acl/ssl/{domain}/fullchain.pem`. **Bare filename** (e.g. `fullchain.pem`): used directly from `/srv/provision_subnet_acl/ssl/{domain}/`. Required with `--https`. |
 | `--privkey` | — | — | Path or bare filename to the private key file. Same resolution rules as `--fullchain`. Required with `--https`. |
 | `--build-arg` | — | — | `KEY=VALUE` (repeatable). Passed as `--build-arg` to `docker compose build` which runs before `compose up` when provided. Stored in registry for future rebuilds. |
 
@@ -77,11 +77,11 @@ python cli/register.py \
 python cli/register.py \
   -u alice \
   -sn myapp \
-  -pr /srv/provision/source_projects/myapp \
+  -pr /srv/provision_subnet_acl/source_projects/myapp \
   -tc docker-compose.myapp.yml.j2 \
-  -v app_data=/srv/provision/user-data/alice/app \
-  -v db_data=/srv/provision/user-data/alice/db \
-  -e /srv/provision/source_projects/myapp/myapp.env \
+  -v app_data=/srv/provision_subnet_acl/user-data/alice/app \
+  -v db_data=/srv/provision_subnet_acl/user-data/alice/db \
+  -e /srv/provision_subnet_acl/source_projects/myapp/myapp.env \
   -tn myapp.nginx.conf.j2 \
   -d example.com \
   -l 0
@@ -90,10 +90,10 @@ python cli/register.py \
 python cli/register.py \
   -u alice \
   -sn myapp \
-  -pr /srv/provision/source_projects/myapp \
+  -pr /srv/provision_subnet_acl/source_projects/myapp \
   -fc docker-compose.yml \
   -fn nginx.conf \
-  -v app_data=/srv/provision/user-data/alice/app \
+  -v app_data=/srv/provision_subnet_acl/user-data/alice/app \
   -d example.com
 
 # With proxy build args (passed to docker compose build before up)
@@ -108,7 +108,7 @@ python cli/register.py \
   --build-arg HTTP_PROXY=http://proxy:8080 \
   --build-arg HTTPS_PROXY=http://proxy:8080
 
-# With HTTPS (cert files are copied to /provision/ssl/example.com/)
+# With HTTPS (cert files are copied to /srv/provision_subnet_acl/ssl/example.com/)
 python cli/register.py \
   -u alice \
   -sn myapp \
@@ -120,7 +120,7 @@ python cli/register.py \
   --fullchain /etc/letsencrypt/live/example.com/fullchain.pem \
   --privkey /etc/letsencrypt/live/example.com/privkey.pem
 
-# With HTTPS using bare filenames (files already in /provision/ssl/example.com/)
+# With HTTPS using bare filenames (files already in /srv/provision_subnet_acl/ssl/example.com/)
 python cli/register.py \
   -u alice \
   -sn myapp \
@@ -285,3 +285,6 @@ python cli/gen_nginx_template.py \
 |---|---|---|
 | `GENERATED_DIR` | `<project-root>/generated` | Where nginx conf, htpasswd, and `user_registry.yml` are written |
 | `REGISTRY_FILE` | `<project-root>/user_registry.yml` | Registry state file |
+| `SUBNET_POOLS` | _(empty)_ | Comma-separated `/16` pools for per-service subnet management (e.g. `100.96.0.0/16`). Empty/unset = disabled |
+| `SUBNET_HEADROOM` | `2` | Extra host IPs reserved per service when sizing a subnet |
+| `ENABLE_ACL` | `false` | `true` = rendered nginx conf uses JWT+ACL enforcement; `false` = legacy `auth_basic` |

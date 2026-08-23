@@ -30,6 +30,9 @@ services:
       - SUBNET_POOLS=${SUBNET_POOLS:-}
       - SUBNET_HEADROOM=${SUBNET_HEADROOM:-2}
       - ENABLE_ACL=${ENABLE_ACL:-false}
+      - PORTAL_MODE=${PORTAL_MODE:-http}
+      - PORTAL_TLS_DIR=${PORTAL_TLS_DIR:-/etc/letsencrypt/live}
+      - PORTAL_CERT_NAME=${PORTAL_CERT_NAME:-subnet-acl-gateway}
     dns:
       - 8.8.8.8
       - 8.8.4.4
@@ -45,14 +48,23 @@ services:
     volumes:
       # Same-path bind-mount so htpasswd paths in generated confs resolve correctly
       - ${PROVISION_DIR:-/srv/provision_subnet_acl}:${PROVISION_DIR:-/srv/provision_subnet_acl}:ro
+      # Unified assembly + the three v4 dirs. GENERATED_DIR is mounted at
+      # /etc/nginx/services.d so the `include /etc/nginx/services.d/*.conf;`
+      # glob picks up the generated *.nginx.conf files.
       - ./nginx.provision.conf:/etc/nginx/nginx.provision.conf:ro
+      - ${PROVISION_DIR:-/srv/provision_subnet_acl}/generated/env.d:/etc/nginx/env.d:ro
+      - ${PROVISION_DIR:-/srv/provision_subnet_acl}/generated/portal.d:/etc/nginx/portal.d:ro
+      - ${PROVISION_DIR:-/srv/provision_subnet_acl}/generated:/etc/nginx/services.d:ro
     networks:
       - subnet_acl_shared
     environment:
       - GENERATED_DIR=${PROVISION_DIR:-/srv/provision_subnet_acl}/generated
-    # envsubst substitutes only $GENERATED_DIR; all nginx $variables are left intact
+    # envsubst substitutes only $GENERATED_DIR; all nginx $variables are left intact.
+    # mkdir -p guarantees the v4 dirs exist even before the generator writes them
+    # (an empty env.d/portal.d include passes nginx -t, F2/B12).
     command: >
-      /bin/sh -c "envsubst '$$GENERATED_DIR' < /etc/nginx/nginx.provision.conf > /etc/nginx/nginx.conf && nginx -g 'daemon off;'"
+      /bin/sh -c "mkdir -p /etc/nginx/env.d /etc/nginx/portal.d /etc/nginx/services.d &&
+      envsubst '$$GENERATED_DIR' < /etc/nginx/nginx.provision.conf > /etc/nginx/nginx.conf && nginx -g 'daemon off;'"
     restart: unless-stopped
 
 networks:

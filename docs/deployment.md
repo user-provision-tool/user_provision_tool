@@ -54,7 +54,7 @@ Set these before running `docker compose up`.
 | `NGINX_CONTAINER` | — | `subnet-acl-nginx` | Name of the nginx container to connect/reload on registration (default `subnet-acl-nginx`) |
 | `SUBNET_POOLS` | — | `100.96.0.0/16,100.97.0.0/16` | Comma-separated `/16` pools for subnet management. Empty/unset = subnet management disabled |
 | `SUBNET_HEADROOM` | — | `2` | Extra host IPs reserved per service (added to container count + 1 gateway when sizing a subnet; default `2`) |
-| `ENABLE_ACL` | — | `true` | `true` = per-service nginx template uses JWT+ACL enforcement (`auth_request /_auth_jwt`, dashboard redirects, no `auth_basic`); `false` = legacy `auth_basic` password dialog (default `false`) |
+| `ENABLE_ACL` | — | `true` | v4 mode switch: `true` = env.d one-liner `set $auth_mode acl;` → per-service conf calls the gateway `/api/auth/verify` for ACL; `false` = env.d one-liner `set $auth_mode basic;` → per-service Basic dialog via `/__basic__/`. The per-service conf is **byte-identical** across modes — it is never regenerated on mode switch (default `false`). See [ACL Enforcement](#acl-enforcement-enable_acl). |
 | `DOCKER_OPS_LOG` | — | `${PROVISION_DIR}/generated/docker_ops.log` | If set, all docker command stdout/stderr is appended here for debugging |
 | `TASK_LOG_DIR` | — | `${PROVISION_DIR}/generated/task_logs` | Directory for per-task isolated `.log` files (one file per async task) |
 | `TASK_TTL_SECONDS` | — | `604800` (7 days) | How long finished tasks and their log files are retained before automatic cleanup |
@@ -94,7 +94,7 @@ services:
       - SSL_DIR=${PROVISION_DIR:-/srv/provision_subnet_acl}/ssl              # base directory for TLS certificates
       - SUBNET_POOLS=${SUBNET_POOLS:-}                  # comma-separated /16 pools; empty = disabled
       - SUBNET_HEADROOM=${SUBNET_HEADROOM:-2}           # headroom IPs per service
-      - ENABLE_ACL=${ENABLE_ACL:-false}                 # true = JWT+ACL nginx template
+      - ENABLE_ACL=${ENABLE_ACL:-false}                 # v4: env.d one-liner mode switch (acl|basic); per-service conf is byte-identical
     dns:
       - 8.8.8.8
       - 8.8.4.4
@@ -133,12 +133,6 @@ The `nginx.provision.conf` includes all per-user virtual-host confs at startup:
 http {
     include ${GENERATED_DIR}/*.nginx.conf;   # ← envsubst fills GENERATED_DIR
 
-    # ACL browser/API discriminator — drives the 401/403 redirects
-    map $http_accept $is_browser {
-        "~text/html"  1;
-        default       0;
-    }
-
     # Dashboard host:port for ACL redirect targets (http level so per-service
     # server blocks can reference $dashboard_host instead of a hardcoded host:port)
     map $host $dashboard_host {
@@ -146,6 +140,10 @@ http {
     }
 }
 ```
+
+> The legacy `map $http_accept $is_browser` discriminator was **removed in v4 (QA2)** — the per-service
+> confs no longer reference `$is_browser`. Client-type detection (browser vs API) is decided by the
+> gateway `/api/auth/verify` hybrid rule (`X-Client-Type`) instead.
 
 Each `*.nginx.conf` file is written by subnet-acl-provision-api when a user registers. After writing
 the file, subnet-acl-provision-api calls `docker exec subnet-acl-nginx nginx -s reload` so the new
@@ -246,25 +244,33 @@ gets its own dedicated subnet reserved from the pool instead of Docker auto-assi
 
 ## ACL Enforcement (`ENABLE_ACL`)
 
-With `ENABLE_ACL=true`, the per-service nginx template switches from legacy basic-auth to
-JWT+ACL enforcement:
+**v4 model:** `ENABLE_ACL` does **not** change the per-service nginx template. `render_nginx_conf()`
+always renders the same v4 server scaffold (byte-identical conf for `ENABLE_ACL` true/false — test
+`test_render_nginx_conf_byte_identical_across_enable_acl`). The switch happens at the env.d level:
 
-- `auth_request /_auth_jwt` delegates identity/ACL verification to the gateway
-  (`subnet-acl-gateway:8770/api/auth/verify`), forwarding both the API client's
-  `X-Provision-Token` header and the browser cookie.
-- `error_page 401/403` redirect browsers to the dashboard (`http://$dashboard_host/login?...`
-  and `http://$dashboard_host/alert?reason=acl_denied&service=$host`); API clients get a plain
-  `401` / `403`.
-- `auth_basic` / `auth_basic_user_file` are stripped — a denied viewer cannot bypass via the
-  shared password.
-- `location = /_set_token` sets the `provision_token` cookie and redirects with a
-  port-preserving `return 302 $scheme://$http_host$arg_redirect;` so the `/go/` flow lands on the
-  same host:port the browser came from.
+- `write_env_d` writes a one-liner into `env.d/*.env`: `set $auth_mode acl;` (ACL) or
+  `set $auth_mode basic;` (Basic). `env.d` is `include`d at **server** level (an http-level `set`
+  is invalid nginx), so the mode can be toggled by swapping the env.d file — no per-service conf
+  regeneration, no nginx `-t` churn.
+- `ENABLE_ACL=true` → ACL mode: `location /` runs `if ($auth_mode != "acl") rewrite` +
+  `auth_request /_auth_jwt`, which delegates identity/ACL verification to the gateway
+  (`subnet-acl-gateway:8770/api/auth/verify`) using the v4 hybrid `X-Client-Type` rule (API via
+  `X-Provision-Token` header, browser via `provision_token` cookie). `error_page 401/403` redirect
+  browsers to the dashboard (`http://$dashboard_host/...`); API clients get a plain `401`/`403`.
+- `ENABLE_ACL=false` (the default) → Basic mode: `$auth_mode` is `basic`, so `location /`
+  rewrites to the internal `location /__basic__/` — the **only** place `auth_basic` /
+  `auth_basic_user_file` live — with **0 gateway subrequests** (minimal deployments start clean).
+- `location = /_set_token` is a plain variable proxy to the gateway exchange
+  (`/api/auth/exchange`); it swaps the 30s HMAC exchange code for the `provision_token` cookie and
+  redirects with a port-preserving `return 302 $scheme://$http_host$arg_redirect;` so the `/go/`
+  flow lands on the same host:port the browser came from. **No JWT appears in any URL.**
 - `$dashboard_host` is an http-level `map` in `nginx.provision.conf` (default `localhost:8775`);
   update that one line to move the dashboard.
+- The legacy `map $http_accept $is_browser` discriminator was removed in v4 (QA2); nginx confs no
+  longer reference `$is_browser`. Client-type is decided by the gateway verify hybrid rule.
 
-With `ENABLE_ACL=false` (the default), the legacy `auth_basic` password dialog is preserved and
-no `auth_request` is injected.
+Deployed confs are kept in sync via `reconciliation.regenerate_nginx_confs()` (re-renders registry
+confs with the v4 renderer and strips `is_browser` from orphan confs; `POST /nginx/regenerate`).
 
 ---
 

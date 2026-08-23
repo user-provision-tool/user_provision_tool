@@ -236,141 +236,15 @@ def convert_nginx(
                 out_blocks.append(p["text"])
         text = ''.join(out_blocks)
 
-    # --- Inject _set_token location block (for GET /go/{hostname} cookie flow) ---
-    # Added to every server block so the dashboard /go/ redirect can set the
-    # provision_token cookie before redirecting to /.
-    token_location = (
-        "\n    # _set_token — sets provision_token cookie, then redirects\n"
-        "    location = /_set_token {\n"
-        '        add_header Set-Cookie "provision_token=$arg_token; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400";\n'
-        "        return 302 $scheme://$http_host$arg_redirect;\n"
-        "    }\n"
-    )
-    parts = _split_server_blocks(text)
-    out_blocks: list[str] = []
-    for p in parts:
-        if p["is_server"]:
-            block = p["text"]
-            # Insert _set_token location before the first existing location or after listen
-            if 'location = /_set_token' not in block:
-                # Insert after first listen directive
-                block = re.sub(
-                    r'(listen\s+[^;]+;)',
-                    r'\1' + token_location,
-                    block,
-                    count=1,
-                )
-            out_blocks.append(block)
-        else:
-            out_blocks.append(p["text"])
-    text = ''.join(out_blocks)
-
-    # --- Inject ACL auth_request, redirect logic, and bypass (for ENABLE_ACL feature) ---
-    # These directives are always included in the template — they are guarded by
-    # ENABLE_ACL at the gateway level. When ACL is disabled, the gateway returns
-    # 200 with no headers, and nginx falls through to auth_basic as before.
-    #
-    # Server-level directives:
-    #   - auth_request /_auth_jwt;          delegates identity verification to gateway
-    #   - auth_request_set $has_basic ...   captures X-Service-Basic header from gateway
-    #   - auth_request_set $auth_action ... captures X-Auth-Action header from gateway
-    #   - if ($auth_action = ...)           redirect blocks for expired/denied tokens
-    #   - if ($has_basic) {...}             bypass rewrite for valid JWT + ACL OK
-    #
-    # Location-level blocks:
-    #   - /_auth_jwt  (internal)            proxies to gateway /api/auth/verify
-    #   - /__bypass__/ (internal)           injects Basic credential from gateway
-    # Compute the bypass upstream target: first compose service + port from the
-    # source conf's first proxy_pass, templated with container_prefix so it
-    # resolves to the deployed container at render time (never the old
-    # provision-* host). Falls back to the literal upstream when no compose
-    # service names are known.
-    _m_bypass_port = re.search(r'proxy_pass\s+https?://[^;\n]+:(\d+)\s*;', text)
-    _bypass_port = _m_bypass_port.group(1) if _m_bypass_port else "80"
-    if compose_service_names:
-        _bypass_svc = compose_service_names[0]
-        _bypass_target = f"http://{{{{ container_prefix }}}}{_bypass_svc}:{_bypass_port};"
-    else:
-        _m_bypass_up = re.search(r'proxy_pass\s+https?://([^:;\s]+)(?::(\d+))?', text)
-        if _m_bypass_up:
-            _bypass_target = f"http://{_m_bypass_up.group(1)}:{_m_bypass_up.group(2) or '80'};"
-        else:
-            _bypass_target = "http://localhost:80;"
-
-    # Server-level ACL directives (placed after listen/set_token, before locations).
-    # Gap 11 (acl-enforcement-design-v2): use error_page + named locations (NOT the
-    # broken if/rewrite in the REWRITE phase) so the redirect actually fires. Only
-    # $is_browser (from $http_accept, a built-in variable) is a http-level map;
-    # $auth_action/$service_basic are consumed directly here.
-    acl_server_directives = (
-        "\n    # JWT + ACL enforcement (server-level)\n"
-        "    auth_request /_auth_jwt;\n"
-        "    auth_request_set $service_basic $upstream_http_x_service_basic;\n"
-        "    auth_request_set $auth_action $upstream_http_x_auth_action;\n"
-        "    error_page 401 = @auth_401;\n"
-        "    error_page 403 = @auth_403;\n"
-        "\n"
-        "    location @auth_401 {\n"
-        "        if ($is_browser) { return 302 http://$dashboard_host/login?redirect=$scheme://$host$request_uri; }\n"
-        "        return 401;\n"
-        "    }\n"
-        "    location @auth_403 {\n"
-        "        if ($is_browser) { return 302 http://$dashboard_host/alert?reason=acl_denied&service=$host; }\n"
-        "        return 403;\n"
-        "    }\n"
-    )
-    acl_locations = (
-        "\n    # JWT/ACL subrequest location (internal only)\n"
-        "    location = /_auth_jwt {\n"
-        "        internal;\n"
-        "        proxy_pass http://subnet-acl-gateway:8770/api/auth/verify;\n"
-        "        proxy_pass_request_body off;\n"
-        "        proxy_set_header Content-Length \"\";\n"
-        "        proxy_set_header X-Original-URI $request_uri;\n"
-        "        proxy_set_header X-Provision-Token $http_x_provision_token;\n"
-        "        proxy_set_header Cookie $http_cookie;\n"
-        "        proxy_set_header Host $host;\n"
-        "    }\n"
-    )
-    parts = _split_server_blocks(text)
-    out_blocks = []
-    for p in parts:
-        if p["is_server"]:
-            block = p["text"]
-            if 'location = /_auth_jwt' not in block:
-                # Insert server-level directives and locations after _set_token or listen
-                if 'location = /_set_token' in block:
-                    block = re.sub(
-                        r'(location = /_set_token \{[^}]*\})',
-                        r'\1' + acl_server_directives + acl_locations,
-                        block,
-                        count=1,
-                        flags=re.DOTALL,
-                    )
-                else:
-                    block = re.sub(
-                        r'(listen\s+[^;]+;)',
-                        r'\1' + acl_server_directives + acl_locations,
-                        block,
-                        count=1,
-                    )
-            out_blocks.append(block)
-        else:
-            out_blocks.append(p["text"])
-    text = ''.join(out_blocks)
-
-    # --- Normalize legacy _set_token redirects ---
-    # Templates generated before the port-preserving redirect was introduced
-    # contain `return 302 $arg_redirect;`. nginx normalizes a relative redirect
-    # to `$scheme://$host` which DROPS the nginx host port, so /go/ links land
-    # on :80 instead of :{NGINX_HTTP_PORT}. Upgrade any such directive to
-    # preserve the Host header (which includes the port).
-    text = re.sub(
-        r'return\s+302\s+\$arg_redirect\s*;',
-        'return 302 $scheme://$http_host$arg_redirect;',
-        text,
-    )
-
+    # ------------------------------------------------------------------
+    # v4 (acl-enforcement-design-v4 §10.3 F2): the per-service conf is
+    # byte-identical across modes, and the JWT/ACL scaffolding (set $auth_mode,
+    # include env.d, auth_request, /__basic__/, @auth_401/@auth_403, the plain
+    # _set_token proxy, the variable /_auth_jwt) is injected by
+    # template_engine.render_nginx_conf at RENDER time — NOT here. Keeping this
+    # converter ACL-free means templates stay mode-independent and re-conversion
+    # of an already-v4 conf is idempotent (no stale scaffolding to strip).
+    # ------------------------------------------------------------------
     return text
 
 

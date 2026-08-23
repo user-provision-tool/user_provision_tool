@@ -41,9 +41,9 @@ Unit (pytest)        tests/test_unit.py             233 tests
     includes provisioner: start_service, stop_service, change_password,
       orphan network cleanup on remove
     includes subnet/IPAM: ensure_subnet_ipam_block inject + .bak backup
-    includes ACL template: ENABLE_ACL=true auth_request/_auth_jwt enforcement,
-      ENABLE_ACL=false keeps auth_basic, _set_token port-preserving redirect,
-      no-ACL-locations templates left untouched
+    includes v4 ACL template: byte-identical per-service conf across ENABLE_ACL
+      (test_render_nginx_conf_byte_identical_across_enable_acl), env.d one-liner
+      mode switch (set $auth_mode acl;|basic;), _set_token port-preserving redirect
     includes check-missing-files endpoint: response model, route, 404 for
       missing service, all-present, j2 templates, recipe_path subdir (present,
       missing dir 404, root files ignored)
@@ -77,7 +77,7 @@ Notable patterns:
 - `TestProvisionerEnvFile` covers HTTPS, start_service, stop_service, change_password, orphan network cleanup, and `container_names` storage in registry.
 - `TestAPINewEndpoints` covers API endpoints using FastAPI `TestClient`: docker/ps, docker/stats, docker/info, host/stats, reconciliation helpers, up/down/password, nginx/connections, nginx/reconnect-all, container logs, task log SSE, health, tasks, reconcile, reconcile/status, nginx-state, container-stats, service-stats, ssl-certs (list/upload/refresh/delete).
 - `TestNginxConverter` covers deterministic proxy_pass rewriting (exact compose service name matching, no prefix stripping), SSL certificate path replacement, auth_basic injection, and HTTPS block auto-generation.
-- `TestRenderNginxConfACL` covers `ENABLE_ACL=true` — `auth_request /_auth_jwt` + `error_page 401/403` dashboard redirects injected, `auth_basic` stripped, the `_set_token` redirect preserved with `$scheme://$http_host$arg_redirect`; `ENABLE_ACL=false` keeps `auth_basic`; a template with no `location = /_auth_jwt` is left untouched.
+- `TestRenderNginxConfACL` / `test_render_nginx_conf_byte_identical_across_enable_acl` cover the v4 model — the per-service conf is **byte-identical** for `ENABLE_ACL` true/false (the v4 server scaffold with `auth_request /_auth_jwt`, `@auth_401/@auth_403` and `location /__basic__/` is always injected); the auth mode is switched only by the env.d one-liner (`set $auth_mode acl;|basic;`), and `_set_token` redirect is preserved with `$scheme://$http_host$arg_redirect`.
 - `TestEnsureSubnetIpamBlock` covers `ensure_subnet_ipam_block()` — injects the `{% if subnet %}` ipam block into an old template and backs the original up as `.bak`.
 - `TestCheckMissingFiles` covers `GET /services/{service_name}/check-missing-files` — response model, route registration, 404 for missing service, all-present, `.j2` templates, and the `recipe_path` query parameter (recipe subdir present, missing recipe dir → 404, root files ignored when `recipe_path` is given).
 - `TestSubnetPoolAPI` covers `GET /subnet-pool` — returns pool stats when `SUBNET_POOLS` is set and the disabled state when it is empty.

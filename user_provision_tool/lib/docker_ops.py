@@ -186,6 +186,17 @@ def nginx_reload(container: str) -> None:
     _run(["docker", "exec", container, "nginx", "-s", "reload"], check=False)
 
 
+def nginx_restart(container: str) -> None:
+    """Restart the nginx *container*.
+
+    Re-runs its entrypoint (envsubst ``nginx.provision.conf`` → ``nginx.conf``
+    then ``nginx``), so freshly regenerated confs are loaded even when the
+    master process is crash-looping and can't accept a reload signal. Used by
+    ``POST /nginx/regenerate`` for a deterministic recovery.
+    """
+    _run(["docker", "restart", container], check=False)
+
+
 def docker_info() -> dict[str, Any]:
     """Return docker system info including container counts."""
     result = subprocess.run(

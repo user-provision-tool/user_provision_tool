@@ -159,10 +159,44 @@ from contextlib import asynccontextmanager
 _log = logging.getLogger("provision-api")
 
 
+def _write_v4_nginx_dirs() -> None:
+    """Write the v4 env.d mode-switch one-liner + portal.d block (F1/F6).
+
+    ENABLE_ACL affects ONLY the env.d one-liner (and the gateway); PORTAL_MODE
+    selects the portal block. These files are what make the per-service
+    byte-identical conf switch modes at runtime — they must be written before
+    nginx is reloaded.
+    """
+    enable_acl = os.environ.get("ENABLE_ACL", "false").lower() == "true"
+    portal_mode = os.environ.get("PORTAL_MODE", "http")
+    try:
+        env_file = template_engine.write_env_d(
+            str(GENERATED_DIR), enable_acl=enable_acl,
+            portal_scheme="https" if portal_mode.lower() == "https" else "http",
+            dashboard_host=os.environ.get(
+                "DASHBOARD_HOST", f"localhost:{os.environ.get('NGINX_HTTP_PORT', '8775')}"
+            ),
+        )
+        _log.info("v4 env.d written: %s", env_file)
+    except Exception:
+        _log.exception("write_env_d failed")
+    try:
+        portal_file = template_engine.write_portal_d(
+            str(GENERATED_DIR), portal_mode=portal_mode,
+            portal_tls_dir=os.environ.get("PORTAL_TLS_DIR", "/etc/letsencrypt/live"),
+            portal_cert_name=os.environ.get("PORTAL_CERT_NAME", "subnet-acl-gateway"),
+        )
+        _log.info("v4 portal.d written: %s", portal_file)
+    except Exception:
+        _log.exception("write_portal_d failed")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: reconnect nginx to all user networks from registry."""
-    _log.info("provision-api starting — running nginx network recovery")
+    """Startup: write the v4 nginx dirs, then reconnect nginx to all user
+    networks from registry."""
+    _log.info("provision-api starting — writing v4 env.d/portal.d + nginx recovery")
+    _write_v4_nginx_dirs()
     try:
         result = reconciliation.recover_on_startup()
         _log.info(
@@ -288,6 +322,18 @@ def network_connect_ep(network: str, container: str) -> dict[str, Any]:
 def nginx_reload_ep(container: str = "subnet-acl-nginx") -> dict[str, Any]:
     docker_ops.nginx_reload(container)
     return {"reloaded": True}
+
+
+@app.post("/docker/nginx/env")
+def nginx_env_ep(container: str = "subnet-acl-nginx") -> dict[str, Any]:
+    """Rewrite env.d/portal.d from the current env vars and reload nginx.
+
+    v4 F1: ENABLE_ACL affects ONLY the env.d one-liner + the gateway — toggling
+    ACL on a running stack just rewrites mode.env and reloads nginx (the
+    per-service confs are never regenerated)."""
+    _write_v4_nginx_dirs()
+    docker_ops.nginx_reload(container)
+    return {"reloaded": True, "env_d_written": True}
 
 
 # ---------------------------------------------------------------------------
@@ -656,6 +702,33 @@ def reconnect_all() -> dict[str, Any]:
         "total_networks": len(networks),
         "reconnected": reconnected,
         "nginx_reloaded": True,
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /nginx/regenerate  — v3→v4 stale-conf migration + nginx restart
+# ---------------------------------------------------------------------------
+
+@app.post("/nginx/regenerate")
+def regenerate_nginx() -> dict[str, Any]:
+    """Re-render all registered per-service nginx confs with the v4 renderer,
+    surgically strip any leftover ``$is_browser`` references, then restart
+    nginx.
+
+    Recovery path for a crash-looping nginx: v4 removed the http-level
+    ``$is_browser`` Accept map from nginx.provision.conf, so confs generated
+    by v3 abort nginx at startup with ``[emerg] unknown "is_browser" variable``.
+    This rewrites the deployed confs in place (no Docker state change) and
+    restarts nginx to load them.
+    """
+    try:
+        report = reconciliation.regenerate_nginx_confs()
+    except Exception as e:
+        raise HTTPException(500, f"Conf regeneration failed: {e}")
+    docker_ops.nginx_restart(NGINX_CONTAINER)
+    return {
+        "message": "nginx confs regenerated; nginx restarted.",
+        "report": report,
     }
 
 

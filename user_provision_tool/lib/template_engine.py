@@ -274,6 +274,133 @@ def _rewrite_env_file_refs_legacy(yaml_text: str, per_user_env_name: str) -> str
     return "\n".join(result)
 
 
+# ---------------------------------------------------------------------------
+# v4 Service-ACL scaffolding (acl-enforcement-design-v4 §5, §10.3 F2)
+# ---------------------------------------------------------------------------
+# The per-service conf is byte-identical for ENABLE_ACL true/false, minimal
+# and fullset, HTTP/HTTPS — generated once and NEVER regenerated on mode
+# toggle (F1). The mode-switch lives in env.d (`set $auth_mode acl;`/`basic;`)
+# written by write_env_d(); the gateway and that one-liner are the ONLY things
+# ENABLE_ACL affects. Client type comes from the gateway (X-Client-Type) — no
+# Accept map anywhere (GAP-11).
+# ---------------------------------------------------------------------------
+
+
+def _split_server_blocks(t: str) -> list[tuple[bool, str]]:
+    """Split nginx config text into (is_server, text) chunks via brace counting."""
+    blocks = re.split(r"(^[ \t]*server\s*\{)", t, flags=re.MULTILINE)
+    result: list[tuple[bool, str]] = []
+    i = 0
+    while i < len(blocks):
+        chunk = blocks[i]
+        if re.match(r"^[ \t]*server\s*\{", chunk):
+            block = chunk
+            depth = chunk.count("{") - chunk.count("}")
+            i += 1
+            while i < len(blocks) and depth > 0:
+                nxt = blocks[i]
+                depth += nxt.count("{") - nxt.count("}")
+                block += nxt
+                i += 1
+            result.append((True, block))
+        else:
+            if chunk:
+                result.append((False, chunk))
+            i += 1
+    return result
+
+
+def _first_proxy_target(block: str) -> str | None:
+    """Return 'host:port' (or bare host) of the first proxy_pass in a server block."""
+    m = re.search(r"proxy_pass\s+https?://([^:;\s/]+)(?::(\d+))?", block)
+    if not m:
+        return None
+    host = m.group(1)
+    port = m.group(2)
+    return f"{host}:{port}" if port else host
+
+
+_V4_SERVER_SCAFFOLD = """\
+    # v4 Service-ACL scaffolding — byte-identical across modes (F1/F2). The
+    # mode-switch (`set $auth_mode acl;`/`basic;`) and $portal_scheme /
+    # $dashboard_host constants are injected from env.d at deploy time.
+    set $auth_mode "";
+    set $portal_scheme "";
+    set $dashboard_host "";
+    set $upstream {upstream};
+    include /etc/nginx/env.d/*.env;
+
+    # _set_token — plain proxy to the gateway exchange (F7/A1). The 30s code is
+    # exchanged for a provision_token cookie; the 302 + Set-Cookie pass through
+    # verbatim. Never a JWT in the URL (GAP-10). Variable proxy_pass + resolver
+    # so a minimal (gateway-less) deployment still starts cleanly (B12).
+    location = /_set_token {{
+        resolver 127.0.0.11 valid=30s ipv6=off;
+        set $gw subnet-acl-gateway:8770;
+        proxy_pass http://$gw/api/auth/exchange;
+        proxy_set_header Host $host;
+    }}
+
+    # _auth_jwt — internal JWT/ACL verify subrequest. Variable proxy_pass +
+    # resolver so the gateway DNS resolves at request time (missing gateway does
+    # not hang startup). auth_request is scoped to location /, so this is only
+    # reached in ACL mode.
+    location = /_auth_jwt {{
+        internal;
+        resolver 127.0.0.11 valid=30s ipv6=off;
+        set $auth_gw subnet-acl-gateway:8770;
+        proxy_pass http://$auth_gw/api/auth/verify;
+        proxy_set_header X-Original-URI $request_uri;
+        proxy_set_header X-Provision-Token $http_x_provision_token;
+        proxy_set_header Cookie $http_cookie;
+        proxy_set_header Host $host;
+    }}
+
+    # /__basic__/ — native Basic-dialog short-circuit (B5/B12). The credential
+    # directives live ONLY here (GAP-28: stripped when htpasswd_path is empty ⇒
+    # open). Reached via the mode-switch rewrite in location /; auth_request is
+    # scoped to location /, so a non-ACL / minimal deployment never calls the
+    # gateway (0 subrequests, F5).
+    location /__basic__/ {{
+        internal;
+{basic_auth}        proxy_pass http://$upstream/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }}
+
+    # API-first error handling (GAP-14): WWW-Authenticate always on the 401
+    # branch (GAP-27); API clients get a bare 401/403, browsers get a clean
+    # redirect to the portal login / alert with no back-ref query param (A2/B3).
+    # The 403 browser→alert redirect fires only when the gateway reported
+    # X-Auth-Action=acl_denied; any other 403 stays a bare 403 (D6).
+    location @auth_401 {{
+        add_header WWW-Authenticate 'Basic realm="subnet-acl"' always;
+        if ($client_type != "browser") {{ return 401; }}
+        return 302 $portal_scheme://$dashboard_host/login;
+    }}
+    location @auth_403 {{
+        if ($client_type != "browser") {{ return 403; }}
+        if ($auth_action != "acl_denied") {{ return 403; }}
+        return 302 $portal_scheme://$dashboard_host/alert?reason=acl_denied&service=$host;
+    }}
+"""
+
+_LOCATION_ROOT_PREFIX = """\
+\n        # Mode switch (rewrite phase, before access-phase auth_request ⇒ the
+        # gateway is never called when auth_mode != "acl", F5/B12).
+        if ($auth_mode != "acl") {{ rewrite ^ /__basic__$request_uri last; }}
+        auth_request /_auth_jwt;
+        auth_request_set $service_basic $upstream_http_x_service_basic;
+        auth_request_set $auth_action $upstream_http_x_auth_action;
+        auth_request_set $client_type $upstream_http_x_client_type;
+        error_page 401 = @auth_401;
+        error_page 403 = @auth_403;
+        proxy_set_header Authorization "Basic $service_basic";
+"""
+
+
 def render_nginx_conf(
     template_path: str,
     output_path: str,
@@ -292,6 +419,12 @@ def render_nginx_conf(
       - ``{{ https }}``                  — boolean True
       - ``{{ ssl_certificate_path }}``   — absolute path to fullchain.pem
       - ``{{ ssl_certificate_key_path }}`` — absolute path to privkey.pem
+
+    The rendered conf is ALWAYS post-processed into the v4 Service-ACL form:
+    byte-identical scaffolding (F2) with ``auth_basic`` relocated into the
+    internal ``location /__basic__/`` and the mode-switch rewrite in
+    ``location /``. This is independent of ENABLE_ACL / PORTAL_MODE — those
+    only affect the env.d one-liner written by :func:`write_env_d`.
     """
     env, tpl_name = _make_env(template_path)
     prefix = container_prefix(service_name, user_name, label)
@@ -309,23 +442,43 @@ def render_nginx_conf(
         "ssl_certificate_key_path": ssl_certificate_key_path,
     }
     rendered = env.get_template(tpl_name).render(**ctx)
-    if not htpasswd_path:
-        # Strip auth_basic directives — no password was set for this user
-        rendered = re.sub(r'[ \t]*auth_basic[^\n]*\n', '', rendered)
 
-    # ------------------------------------------------------------------
-    # Gap 9: fix the _set_token redirect to preserve the host port. The
-    # dashboard /go/ flow redirects the browser to the service hostname at the
-    # subnet-acl nginx host port (e.g. :8766), then /_set_token must redirect
-    # back to that SAME host:port. A bare `return 302 $arg_redirect;` expands to
-    # http://$host/ (nginx uses $host, which drops the port), so the browser
-    # would land on :80 instead of the subnet-acl port. $http_host preserves the
-    # exact Host header the browser sent (including the non-default port).
-    # ------------------------------------------------------------------
-    rendered = rendered.replace(
-        "return 302 $arg_redirect;",
-        "return 302 $scheme://$http_host$arg_redirect;",
+    # --- Capture the auth_basic realm for /__basic__/ (F2 / GAP-28) ---
+    basic_realm = None
+    m_realm = re.search(r'[ \t]*auth_basic[ \t]+"([^"]*)"', rendered)
+    if m_realm:
+        basic_realm = m_realm.group(1)
+
+    # --- auth_basic moves out of the main path into /__basic__/ (F2) ---
+    # Not line-anchored so single-line `location / { auth_basic "x"; ...; }`
+    # blocks are handled too.
+    rendered = re.sub(r'[ \t]*auth_basic[ \t]+"[^"]*"[ \t]*;', "", rendered)
+    # auth_basic_user_file with an empty path (htpasswd_path="") and with a path.
+    rendered = re.sub(r"[ \t]*auth_basic_user_file[ \t]*;", "", rendered)
+    rendered = re.sub(r"[ \t]*auth_basic_user_file[ \t]+\S+[ \t]*;", "", rendered)
+
+    # --- Strip stale v2/v3 ACL scaffolding so re-generation is idempotent ---
+    rendered = re.sub(r"[ \t]*auth_request[ \t]+[^\n;]*;[ \t]*\r?\n", "", rendered)
+    rendered = re.sub(r"[ \t]*auth_request_set[ \t]+\$[^\n;]*;[ \t]*\r?\n", "", rendered)
+    rendered = re.sub(r"[ \t]*error_page[ \t]+[^\n;]*;[ \t]*\r?\n", "", rendered)
+    rendered = re.sub(
+        r'[ \t]*if \(\$auth_mode != "acl"\)[ \t]*\{.*?\}[ \t]*\r?\n',
+        "", rendered, flags=re.DOTALL,
     )
+    rendered = re.sub(
+        r"[ \t]*set \$(auth_mode|portal_scheme|dashboard_host|upstream|upstream_\d+)"
+        r"[ \t]+[^\n;]*;[ \t]*\r?\n",
+        "", rendered,
+    )
+    for _loc in (
+        r"location = /_set_token",
+        r"location = /_auth_jwt",
+        r"location /__bypass__/",
+        r"location /__basic__/",
+        r"location @auth_401",
+        r"location @auth_403",
+    ):
+        rendered = re.sub(r"[ \t]*" + _loc + r"[ \t]*\{.*?\}[ \t]*\r?\n", "", rendered, flags=re.DOTALL)
 
     # ------------------------------------------------------------------
     # Rewrite static proxy_pass → variable-based for per-request DNS
@@ -336,8 +489,8 @@ def render_nginx_conf(
     # starts/reloads cleanly regardless of upstream state.
     #
     #  Before:  proxy_pass http://myapp-user_alice-0-web:80;
-    #  After:   set $upstream_abc12 myapp-user_alice-0-web:80;
-    #           proxy_pass http://$upstream_abc12;
+    #  After:   set $upstream_0000 myapp-user_alice-0-web:80;
+    #           proxy_pass http://$upstream_0000;
     # ------------------------------------------------------------------
     _upstream_counter = 0
 
@@ -361,79 +514,185 @@ def render_nginx_conf(
         flags=re.MULTILINE,
     )
 
-    # ------------------------------------------------------------------
-    # Gap 11 (acl-enforcement-design-v2): when ENABLE_ACL=true, apply full
-    # JWT+ACL enforcement with NO auth_basic (so a denied viewer cannot bypass
-    # via the shared password). The http-level maps ($is_browser,
-    # $auth_redirect_url, $auth_header) live in nginx.provision.conf (once per
-    # stack), not per service. When ENABLE_ACL=false, the template keeps its
-    # auth_basic fallback (today's behavior).
-    # ------------------------------------------------------------------
-    enable_acl = os.environ.get("ENABLE_ACL", "false").lower() == "true"
-    if enable_acl and "location = /_auth_jwt" in rendered:
-        # Strip any stale server-level ACL directives and the dead /__bypass__/
-        # location, so we re-inject cleanly (handles both old and new templates).
-        rendered = re.sub(r"[ \t]*auth_request /_auth_jwt;[^\n]*\n", "", rendered)
-        rendered = re.sub(r"[ \t]*auth_request_set \$[A-Za-z_]+ [^\n]*\n", "", rendered)
-        rendered = re.sub(r"[ \t]*error_page[^\n]*\n", "", rendered)
-        rendered = re.sub(r"[ \t]*location /__bypass__/ \{.*?\n[ \t]*\}\n", "", rendered, flags=re.DOTALL)
-
-        # Fix the /_auth_jwt subrequest to forward BOTH the API client's
-        # X-Provision-Token header AND the browser's cookie (stale templates
-        # forward only $cookie_provision_token, which drops the API client token).
-        rendered = rendered.replace(
-            "proxy_set_header X-Provision-Token $cookie_provision_token;",
-            "proxy_set_header X-Provision-Token $http_x_provision_token;\n"
-            "        proxy_set_header Cookie $http_cookie;",
-        )
-
-        acl_directives = (
-            "\n    # JWT + ACL enforcement (server-level)\n"
-            "    auth_request /_auth_jwt;\n"
-            "    auth_request_set $service_basic $upstream_http_x_service_basic;\n"
-            "    auth_request_set $auth_action $upstream_http_x_auth_action;\n"
-            "    error_page 401 = @auth_401;\n"
-            "    error_page 403 = @auth_403;\n"
-            "\n"
-            "    location @auth_401 {\n"
-            "        if ($is_browser) { return 302 http://$dashboard_host/login?redirect=$scheme://$host$request_uri; }\n"
-            "        return 401;\n"
-            "    }\n"
-            "    location @auth_403 {\n"
-            "        if ($is_browser) { return 302 http://$dashboard_host/alert?reason=acl_denied&service=$host; }\n"
-            "        return 403;\n"
-            "    }\n"
-        )
-        if "location = /_set_token" in rendered:
-            rendered = re.sub(
-                r"(location = /_set_token \{[^}]*\})",
-                r"\1" + acl_directives,
-                rendered,
-                count=1,
-                flags=re.DOTALL,
-            )
-        else:
-            rendered = re.sub(
-                r"(listen\s+[^;]+;)",
-                r"\1" + acl_directives,
-                rendered,
-                count=1,
-            )
-
-        # Remove auth_basic — JWT+ACL is the only auth (no password bypass).
-        rendered = re.sub(r"[ \t]*auth_basic[^\n]*\n", "", rendered)
-        rendered = re.sub(r"[ \t]*auth_basic_user_file[^\n]*\n", "", rendered)
-
-        # Inject the credential via proxy_set_header before the main upstream
-        # proxy_pass (the variable-based one, i.e. `proxy_pass http://$upstream_`).
-        rendered = re.sub(
-            r"([ \t]*)(proxy_pass\s+https?://\$upstream_)",
-            r'\1proxy_set_header Authorization "Basic $service_basic";\n\1\2',
-            rendered,
-            count=1,
-        )
+    # --- Inject the v4 scaffolding into every service server block ---
+    parts = _split_server_blocks(rendered)
+    out: list[str] = []
+    for is_server, block in parts:
+        if is_server and "proxy_pass" in block:
+            target = _first_proxy_target(block) or "localhost:80"
+            basic_auth = ""
+            if htpasswd_path:
+                realm = basic_realm or f"{service_name} - {user_name}"
+                basic_auth = (
+                    f'        auth_basic "{realm}";\n'
+                    f"        auth_basic_user_file {htpasswd_path};\n"
+                )
+            scaffold = _V4_SERVER_SCAFFOLD.format(upstream=target, basic_auth=basic_auth)
+            # Insert the server-level scaffolding after the first server_name line.
+            m_name = re.search(r"^([ \t]*server_name[^\n;]*;[ \t]*\r?\n)", block, flags=re.MULTILINE)
+            if m_name:
+                block = block[: m_name.end()] + scaffold + block[m_name.end():]
+            else:
+                block = block.replace("server {", "server {" + scaffold, 1)
+            # Inject the location / prefix (mode-switch + auth_request + error_page).
+            # Matches both multi-line and single-line `location / { ... }`.
+            m_root = re.search(r"([ \t]*location / \{)", block)
+            if m_root:
+                block = block[: m_root.end()] + _LOCATION_ROOT_PREFIX.format() + block[m_root.end():]
+        out.append(block)
+    rendered = "".join(out)
 
     with open(output_path, "w") as f:
         f.write(rendered)
     # Mark rendered nginx conf as generated
     Path(str(output_path) + ".generated").write_text("")
+
+
+def write_env_d(
+    generated_dir: str,
+    enable_acl: bool,
+    portal_scheme: str = "http",
+    dashboard_host: str = "localhost:8775",
+) -> Path:
+    """Write the env.d mode-switch one-liner + portal constants (v4 F1/F6).
+
+    ENABLE_ACL affects ONLY this one-liner (``set $auth_mode acl;`` /
+    ``basic;``) and the gateway — the per-service conf is byte-identical. The
+    fullset deployment also carries ``$portal_scheme`` / ``$dashboard_host``
+    constants via env.d so the per-service @auth_401/@auth_403 redirects know
+    where the portal lives (GAP-14).
+
+    Returns the path of the written ``mode.env``.
+    """
+    env_dir = Path(generated_dir) / "env.d"
+    env_dir.mkdir(parents=True, exist_ok=True)
+    mode = "acl" if enable_acl else "basic"
+    mode_file = env_dir / "mode.env"
+    mode_file.write_text(
+        f"set $auth_mode {mode};\n"
+        f"set $portal_scheme {portal_scheme};\n"
+        f"set $dashboard_host {dashboard_host};\n"
+    )
+    return mode_file
+
+
+_PORTAL_SERVER_HEADER = """\
+    # Deferred DNS (B12): the gateway/dashboard may not be up when nginx
+    # starts (minimal, gateway-less deployment). Variables + resolver defer
+    # hostname resolution to request time so nginx always starts cleanly.
+    resolver 127.0.0.11 valid=30s ipv6=off;
+    set $portal_api subnet-acl-gateway:8770;
+    set $portal_dash subnet-acl-dashboard:80;
+"""
+
+
+def _portal_locations() -> str:
+    return (
+        "    # Internal-only endpoints must not be reachable via the portal (GAP-31).\n"
+        "    location = /api/auth/verify { return 404; }\n"
+        "    location = /api/auth/exchange { return 404; }\n"
+        "\n"
+        "    # API routes → provision-gateway\n"
+        "    location /api/ {\n"
+        "        proxy_pass http://$portal_api;\n"
+        "        proxy_set_header Host $host;\n"
+        "        proxy_set_header X-Real-IP $remote_addr;\n"
+        "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
+        "        proxy_set_header X-Forwarded-Proto $scheme;\n"
+        "    }\n"
+        "\n"
+        "    # Service redirect (GET /go/{hostname}) → provision-gateway /api/auth/go/{hostname}\n"
+        "    location /go/ {\n"
+        "        rewrite ^/go/(.*) /api/auth/go/$1 break;\n"
+        "        proxy_pass http://$portal_api;\n"
+        "        proxy_set_header Host $host;\n"
+        "        proxy_set_header X-Real-IP $remote_addr;\n"
+        "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
+        "        proxy_set_header X-Forwarded-Proto $scheme;\n"
+        "    }\n"
+        "\n"
+        "    # Login page / POST → provision-gateway\n"
+        "    location /login {\n"
+        "        proxy_pass http://$portal_api;\n"
+        "        proxy_set_header Host $host;\n"
+        "        proxy_set_header X-Real-IP $remote_addr;\n"
+        "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
+        "        proxy_set_header X-Forwarded-Proto $scheme;\n"
+        "    }\n"
+        "\n"
+        "    # Alert pages (token_expired, acl_denied) → provision-dashboard SPA\n"
+        "    location /alert {\n"
+        "        proxy_pass http://$portal_dash;\n"
+        "        proxy_set_header Host $host;\n"
+        "        proxy_set_header X-Real-IP $remote_addr;\n"
+        "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
+        "        proxy_set_header X-Forwarded-Proto $scheme;\n"
+        "    }\n"
+        "\n"
+        "    # Dashboard SPA root → provision-dashboard (lowest priority catch-all)\n"
+        "    location / {\n"
+        "        proxy_pass http://$portal_dash;\n"
+        "        proxy_set_header Host $host;\n"
+        "        proxy_set_header X-Real-IP $remote_addr;\n"
+        "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
+        "        proxy_set_header X-Forwarded-Proto $scheme;\n"
+        "    }\n"
+    )
+
+
+_PORTAL_HTTP = (
+    "# Portal management block (PORTAL_MODE=http) — v4 §5.2, §10.3 F6.\n"
+    "server {\n"
+    "    listen 80;\n"
+    "    server_name subnet-acl-gateway.*;\n"
+    + _PORTAL_SERVER_HEADER
+    + _portal_locations()
+    + "}\n"
+)
+
+
+def write_portal_d(
+    generated_dir: str,
+    portal_mode: str = "http",
+    portal_tls_dir: str = "/etc/letsencrypt/live",
+    portal_cert_name: str = "subnet-acl-gateway",
+) -> Path:
+    """Write the portal block(s) into portal.d/ based on PORTAL_MODE (v4 §5.2/F6).
+
+    - ``http``  → single :80 management block (today's behavior).
+    - ``https`` → :443 ssl portal-cert block + a :80 ``301`` HTTPS redirect.
+
+    Both variants ``return 404`` for ``/api/auth/verify`` and
+    ``/api/auth/exchange`` (internal-only endpoints, GAP-31).
+
+    Returns the path of the written ``portal.conf``.
+    """
+    portal_dir = Path(generated_dir) / "portal.d"
+    portal_dir.mkdir(parents=True, exist_ok=True)
+    portal_file = portal_dir / "portal.conf"
+    if portal_mode.lower() != "https":
+        portal_file.write_text(_PORTAL_HTTP)
+        return portal_file
+
+    cert_name = portal_cert_name or "subnet-acl-gateway"
+    fullchain = f"{portal_tls_dir}/{cert_name}/fullchain.pem"
+    privkey = f"{portal_tls_dir}/{cert_name}/privkey.pem"
+    https = (
+        "# Portal management block (PORTAL_MODE=https) — v4 §5.2, §10.3 F6.\n"
+        "server {\n"
+        "    listen 80;\n"
+        "    server_name subnet-acl-gateway.*;\n"
+        "    return 301 https://$host$request_uri;\n"
+        "}\n"
+        "\n"
+        "server {\n"
+        "    listen 443 ssl;\n"
+        "    server_name subnet-acl-gateway.*;\n"
+        f"    ssl_certificate {fullchain};\n"
+        f"    ssl_certificate_key {privkey};\n"
+        + _PORTAL_SERVER_HEADER
+        + _portal_locations()
+        + "}\n"
+    )
+    portal_file.write_text(https)
+    return portal_file

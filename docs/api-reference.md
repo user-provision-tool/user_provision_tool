@@ -1099,4 +1099,4 @@ curl -X POST http://localhost:8875/nginx/reconnect-all
 | `PROVISION_API_PORT` | `8875` | Host port (set in `docker-compose.provision.yml`) |
 | `SUBNET_POOLS` | _(empty)_ | Comma-separated `/16` pools for subnet management (e.g. `100.96.0.0/16,100.97.0.0/16`). Empty/unset = subnet management disabled |
 | `SUBNET_HEADROOM` | `2` | Extra host IPs reserved per service (added to container count + 1 gateway when sizing a subnet) |
-| `ENABLE_ACL` | `false` | `true` = per-service nginx template uses JWT+ACL enforcement (`auth_request /_auth_jwt`, dashboard redirects, no `auth_basic`); `false` = legacy `auth_basic` password dialog |
+| `ENABLE_ACL` | `false` | v4 mode switch: `true` = env.d one-liner `set $auth_mode acl;` → per-service conf calls the gateway `/api/auth/verify` for ACL; `false` = env.d one-liner `set $auth_mode basic;` → Basic dialog via `/__basic__/`. The per-service conf is **byte-identical** across modes (never regenerated on mode switch) |

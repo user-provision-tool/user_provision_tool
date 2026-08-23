@@ -153,69 +153,48 @@ server {
 
 ---
 
-## ACL Enforcement (`ENABLE_ACL=true`)
+## ACL Enforcement (`ENABLE_ACL`) — v4 mode switch
 
-With `ENABLE_ACL=true`, `render_nginx_conf()` rewrites the rendered nginx conf to use
-JWT+ACL enforcement instead of the legacy `auth_basic` password dialog. The http-level maps
-(`$is_browser`, `$dashboard_host`) live once per stack in `nginx.provision.conf`; each
-per-service server block references them.
+**v4 model:** `ENABLE_ACL` does **not** rewrite the rendered nginx conf. `render_nginx_conf()`
+always renders the same v4 server scaffold (the per-service conf is **byte-identical** for
+`ENABLE_ACL` true/false — test `test_render_nginx_conf_byte_identical_across_enable_acl`).
+The auth mode is switched at the **env.d** level by `write_env_d`, which writes a one-liner
+(`set $auth_mode acl;|basic;`) into `env.d/*.env`, `include`d per-service at **server** level.
 
-What gets injected (server level):
-
-```nginx
-# JWT + ACL enforcement (server-level)
-auth_request /_auth_jwt;
-auth_request_set $service_basic $upstream_http_x_service_basic;
-auth_request_set $auth_action $upstream_http_x_auth_action;
-error_page 401 = @auth_401;
-error_page 403 = @auth_403;
-
-location @auth_401 {
-    if ($is_browser) { return 302 http://$dashboard_host/login?redirect=$scheme://$host$request_uri; }
-    return 401;
-}
-location @auth_403 {
-    if ($is_browser) { return 302 http://$dashboard_host/alert?reason=acl_denied&service=$host; }
-    return 403;
-}
-```
-
-And the internal subrequest location:
+The always-injected v4 scaffold (server level):
 
 ```nginx
-location = /_auth_jwt {
-    internal;
-    proxy_pass http://subnet-acl-gateway:8770/api/auth/verify;
-    proxy_pass_request_body off;
-    proxy_set_header Content-Length "";
-    proxy_set_header X-Original-URI $request_uri;
-    proxy_set_header X-Provision-Token $http_x_provision_token;
-    proxy_set_header Cookie $http_cookie;
-    proxy_set_header Host $host;
-}
+# v4 server scaffold (always present — not gated on ENABLE_ACL)
+set $auth_mode acl;                    # ← set by env.d one-liner (acl|basic)
+set $portal_scheme http;
+set $dashboard_host localhost:8775;
+set $upstream_0000 ...:80;             # variable-based proxy_pass target
+
+include /etc/nginx/env.d/*.env;        # per-service env.d one-liner (server level)
+
+location = /_set_token { ... }         # plain variable proxy to gateway exchange
+location = /_auth_jwt { internal; proxy_pass http://subnet-acl-gateway:8770/api/auth/verify; ... }
+location /__basic__/ { internal; auth_basic "..."; auth_basic_user_file ...; ... }  # ONLY auth_basic
+location @auth_401 { ... }             # browser → dashboard login; API → 401
+location @auth_403 { ... }             # browser → dashboard alert; API → 403
 ```
 
 Behavior:
-- `auth_request /_auth_jwt` delegates identity/ACL verification to the gateway, forwarding
-  **both** the API client's `X-Provision-Token` header and the browser `Cookie`.
-- Browsers get redirected to the dashboard (`$dashboard_host`, default `localhost:8775`);
-  API clients get a plain `401` / `403`.
-- `auth_basic` / `auth_basic_user_file` are stripped — no password bypass.
-- The rendered conf also sets `proxy_set_header Authorization "Basic $service_basic";` before
-  the main upstream `proxy_pass`, so the gateway-provided credential reaches the app.
-
-`location = /_set_token` (injected by the converter and normalized at render time) sets the
-`provision_token` cookie and redirects back to the **same host:port** the browser came from:
-
-```nginx
-location = /_set_token {
-    add_header Set-Cookie "provision_token=$arg_token; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400";
-    return 302 $scheme://$http_host$arg_redirect;
-}
-```
-
-With `ENABLE_ACL=false` (the default), none of this is injected and the legacy
-`auth_basic` / `auth_basic_user_file` flow is preserved.
+- **ACL mode** (`$auth_mode = acl`): `location /` runs `if ($auth_mode != "acl") rewrite` +
+  `auth_request /_auth_jwt`. The gateway `/api/auth/verify` uses the v4 **hybrid `X-Client-Type`
+  rule** (API via `X-Provision-Token` header, browser via `provision_token` cookie; `X-Client-Type`
+  on every response). `error_page 401/403` redirect browsers to the dashboard
+  (`$dashboard_host`, default `localhost:8775`); API clients get a plain `401`/`403`.
+- **Basic mode** (`$auth_mode = basic`): `location /` rewrites to the internal
+  `location /__basic__/` — the **only** place `auth_basic`/`auth_basic_user_file` live — with
+  **0 gateway subrequests** (minimal deployments start clean).
+- The legacy `map $http_accept $is_browser` discriminator was removed in v4 (QA2) — no conf
+  references `$is_browser`.
+- `location = /_set_token` is a **plain variable proxy** to the gateway exchange
+  (`/api/auth/exchange`) — no live bearer JWT in any URL. The exchange swaps the 30s HMAC code for
+  the `provision_token` cookie (Max-Age=604800, `PROVISION_COOKIE_TTL`) and returns a
+  port-preserving `302 $scheme://$http_host$arg_redirect;` so the `/go/` flow lands on the same
+  host:port the browser came from.
 
 ---
 
@@ -335,12 +314,13 @@ The converters apply these substitutions:
 | `proxy_pass` host matching a compose service name | `→ {{ container_prefix }}<name>` |
 | `proxy_pass` host NOT matching any compose service | **Rejected** — registration fails with validation error listing unknown hosts |
 | _(no `auth_basic` block present)_ | Injects `auth_basic "{{ service_name }} - {{ user_name }}";` and `auth_basic_user_file {{ htpasswd_path }};` before the first `proxy_pass` |
-| every server block | Injects `location = /_set_token` (sets `provision_token` cookie, then `return 302 $scheme://$http_host$arg_redirect;`) |
+| every server block | Injects the v4 scaffold `location = /_set_token` (plain variable proxy to the gateway exchange) plus `return 302 $scheme://$http_host$arg_redirect;` |
 | `return 302 $arg_redirect;` (legacy) | Normalized to `return 302 $scheme://$http_host$arg_redirect;` so the `/go/` redirect preserves the host port |
-| every server block | Injects `location = /_auth_jwt` (internal gateway subrequest) plus the ACL server-level directives (`auth_request /_auth_jwt`, `error_page 401/403` → `$dashboard_host`) |
+| every server block | Injects the v4 scaffold: `location = /_auth_jwt` (internal gateway subrequest), `location /__basic__/`, `@auth_401/@auth_403`, `set $auth_mode` + `include env.d`, `if ($auth_mode != "acl") rewrite` + `auth_request /_auth_jwt` (mode-switch scoped to `location /`) |
 
-> **ACL is gated at render time** — `render_nginx_conf()` only applies the JWT+ACL rewrite when
-> `ENABLE_ACL=true`; with `false` the `auth_basic` fallback is kept (legacy behavior).
+> **v4: no ENABLE_ACL branch at render time** — the v4 server scaffold is **always** injected
+> (byte-identical per-service conf). The auth mode is switched exclusively by the env.d one-liner
+> (`set $auth_mode acl;|basic;`), never by regenerating the per-service conf.
 
 > **Password stripping**: when `passwd` is empty (`""`), `render_nginx_conf()` strips all
 > `auth_basic` and `auth_basic_user_file` lines from the rendered nginx conf, so no

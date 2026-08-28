@@ -287,4 +287,4 @@ python cli/gen_nginx_template.py \
 | `REGISTRY_FILE` | `<project-root>/user_registry.yml` | Registry state file |
 | `SUBNET_POOLS` | _(empty)_ | Comma-separated `/16` pools for per-service subnet management (e.g. `100.96.0.0/16`). Empty/unset = disabled |
 | `SUBNET_HEADROOM` | `2` | Extra host IPs reserved per service when sizing a subnet |
-| `ENABLE_ACL` | `false` | v4 env.d mode switch: `true` → env.d one-liner `set $auth_mode acl;` (ACL via gateway verify); `false` → `set $auth_mode basic;` (Basic via `/__basic__/`). Rendered per-service nginx conf is **byte-identical** across modes |
+| `ENABLE_ACL` | `false` | v5 (F7): read only by the gateway + the edge `-nginx-acl`; the `-api` no longer reads it (no env.d mode switch). Toggle = recreate the edge + restart the gateway. Rendered per-service nginx conf is SIMPLE ACL-free and **byte-identical** across modes |

@@ -160,11 +160,11 @@ source_project/service_1/          ← project root (-pr), resolved from bare na
 │  (when passwd='': auth_basic* lines stripped post-render;  │
 │   no .htpasswd written; htpasswd_path=null in registry)    │
 │                                                             │
-│  (v4: ENABLE_ACL does NOT rewrite the conf — the v4 server  │
-│   scaffold is always injected; per-service conf is          │
-│   byte-identical across modes. Mode switched by the env.d   │
-│   one-liner set $auth_mode acl;|basic;. _set_token is a     │
-│   plain proxy to the gateway exchange — no JWT in URL.)     │
+│  (v5: ENABLE_ACL does NOT rewrite the conf — the SIMPLE      │
+│   per-service conf is always rendered, byte-identical        │
+│   across modes. No env.d/v4 scaffold; the ACL gate lives on  │
+│   the edge -nginx-acl; _set_token on the edge is a plain     │
+│   proxy to the gateway exchange — no JWT in URL.)            │
 └─────────────────────────────────────────────────────────────┘
       │
       ▼
@@ -201,9 +201,9 @@ source_project/service_1/          ← project root (-pr), resolved from bare na
 Two distinct substitution phases:
 
 - **Steps 0a–3** — `{{ var }}` Jinja2 expressions: registration-time, per-user values (names, paths, network, hostname, subnet/gateway)
-- **Step 0b note** — if the source nginx conf has **no** `auth_basic` block, `nginx_converter` automatically injects `auth_basic "{{ service_name }} - {{ user_name }}";` and `auth_basic_user_file {{ htpasswd_path }};` before the first `proxy_pass`. It also injects `location = /_set_token` into every server block and normalizes legacy `return 302 $arg_redirect;` → `$scheme://$http_host$arg_redirect;` (port-preserving), plus the `location = /_auth_jwt` gateway subrequest.
+- **Step 0b note** — if the source nginx conf has **no** `auth_basic` block, `nginx_converter` automatically injects `auth_basic "{{ service_name }} - {{ user_name }}";` and `auth_basic_user_file {{ htpasswd_path }};` before the first `proxy_pass`. It normalizes legacy `return 302 $arg_redirect;` → `$scheme://$http_host$arg_redirect;` (port-preserving). v5: the `location = /_set_token` and `location = /_auth_jwt` gateway subrequests are NO LONGER injected into internal confs — they moved to the edge `-nginx-acl` (F3/F8).
 - **Step 1 note** — when `SUBNET_POOLS` is set, `subnet_manager.allocate_subnet()` sizes and reserves a subnet (`/30`..`/24`, `/29` minimum) and `compose_converter.ensure_subnet_ipam_block()` re-injects the `{% if subnet %}` ipam block into old templates (backing up as `.bak`). The registry entry records `subnet` / `gateway`.
-- **Step 3 note** — when `passwd=''`, `render_nginx_conf()` strips all `auth_basic*` lines from the rendered output and skips writing the `.htpasswd` file; `htpasswd_path` is stored as `null` in the registry. Also, all static `proxy_pass` directives are post-processed to use nginx variables (`set $upstream_XXXX`) for per-request DNS resolution — this lets nginx reload cleanly even when upstream containers are missing. **v4:** `ENABLE_ACL` does **not** apply a JWT+ACL rewrite — the v4 server scaffold is always injected (byte-identical per-service conf); the auth mode is switched only by the env.d one-liner (`set $auth_mode acl;|basic;`).
+- **Step 3 note** — when `passwd=''`, `render_nginx_conf()` strips all `auth_basic*` lines from the rendered output and skips writing the `.htpasswd` file; `htpasswd_path` is stored as `null` in the registry. Also, all static `proxy_pass` directives are post-processed to use nginx variables (`set $upstream_XXXX`) for per-request DNS resolution — this lets nginx reload cleanly even when upstream containers are missing. **v5:** `ENABLE_ACL` does **not** apply a JWT+ACL rewrite — the SIMPLE per-service conf is always rendered (byte-identical per-service conf); ACL enforcement is delegated to the edge `-nginx-acl` (F3/F8), no env.d one-liner.
 - **Step 4** — `${VAR}` shell env vars: runtime secrets/config supplied via `--env-file`, shared across all users of the same service
 - **Step 5** — post-compose networking: runs unconditionally; subnet-acl-nginx is connected to the new isolated network and reloaded
 

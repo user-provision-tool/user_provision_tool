@@ -3,9 +3,9 @@
 The test suite has six layers:
 
 ```
-Integration (bash)   tests/test_integration.sh     120 tests
+Integration (bash)   tests/test_integration.sh     44 test sections (requires Docker)
   └─ full Docker round-trip: build image → start API → register → rebuild → remove
-    also covers container-stats, service-stats, nginx resilience (missing upstreams),
+    also covers nginx resilience (missing upstreams),
     up/down, password change, container logs, SSE per-task log streaming,
     docker/host stats, nginx connections, reconnect-all, reconciliation,
     HTTPS registration, proxy_pass compose name detection, env_file handling,
@@ -28,7 +28,7 @@ Subnet Manager       tests/test_subnet_manager.py   23 tests
   └─ subnet sizing (/30../24), bitmap allocation + alignment, pool exhaustion,
     registry/host subnet discovery, pool stats (GET /subnet-pool)
 
-Unit (pytest)        tests/test_unit.py             233 tests
+Unit (pytest)        tests/test_unit.py             268 tests
   └─ individual lib/ functions in isolation, all I/O mocked
     includes provisioner proxy support tests
     includes env_file render_compose rewrite + per-user copy tests
@@ -41,9 +41,10 @@ Unit (pytest)        tests/test_unit.py             233 tests
     includes provisioner: start_service, stop_service, change_password,
       orphan network cleanup on remove
     includes subnet/IPAM: ensure_subnet_ipam_block inject + .bak backup
-    includes v4 ACL template: byte-identical per-service conf across ENABLE_ACL
-      (test_render_nginx_conf_byte_identical_across_enable_acl), env.d one-liner
-      mode switch (set $auth_mode acl;|basic;), _set_token port-preserving redirect
+    includes v5 ACL template: SIMPLE byte-identical per-service conf across ENABLE_ACL
+      (TestV5SimpleNginxSyntax — no auth_request/WWW-Authenticate/@auth_401/@auth_403/
+      env.d/$client_type), strip_v4_scaffold (migrate_v5 sweeps v4 tokens; 0 remain),
+      _set_token port-preserving redirect (on the edge)
     includes check-missing-files endpoint: response model, route, 404 for
       missing service, all-present, j2 templates, recipe_path subdir (present,
       missing dir 404, root files ignored)
@@ -51,8 +52,7 @@ Unit (pytest)        tests/test_unit.py             233 tests
     includes api (FastAPI TestClient): up/down/password endpoints, docker/ps,
       docker/stats, docker/info, host/stats, reconciliation helpers,
       nginx/connections, nginx/reconnect-all, container logs, task log SSE,
-      health, tasks list, container-stats, service-stats,
-      ssl-certs (list/upload/refresh/delete) — all with mocked docker_ops
+      health, tasks list — all with mocked docker_ops
 ```
 
 ---
@@ -75,9 +75,9 @@ Notable patterns:
 - `TestNginxConverter` covers server_name, auth_basic, proxy_pass, htpasswd_path substitutions, and SSL certificate path conversion with `{% if https %}` block wrapping.
 - `TestProvisionerProxySupport` covers `build_args` storage in registry and rebuild fallback.
 - `TestProvisionerEnvFile` covers HTTPS, start_service, stop_service, change_password, orphan network cleanup, and `container_names` storage in registry.
-- `TestAPINewEndpoints` covers API endpoints using FastAPI `TestClient`: docker/ps, docker/stats, docker/info, host/stats, reconciliation helpers, up/down/password, nginx/connections, nginx/reconnect-all, container logs, task log SSE, health, tasks, reconcile, reconcile/status, nginx-state, container-stats, service-stats, ssl-certs (list/upload/refresh/delete).
+- `TestAPINewEndpoints` covers API endpoints using FastAPI `TestClient`: docker/ps, docker/stats, docker/info, host/stats, reconciliation helpers, up/down/password, nginx/connections, nginx/reconnect-all, container logs, task log SSE, health, tasks, reconcile, reconcile/status, nginx-state.
 - `TestNginxConverter` covers deterministic proxy_pass rewriting (exact compose service name matching, no prefix stripping), SSL certificate path replacement, auth_basic injection, and HTTPS block auto-generation.
-- `TestRenderNginxConfACL` / `test_render_nginx_conf_byte_identical_across_enable_acl` cover the v4 model — the per-service conf is **byte-identical** for `ENABLE_ACL` true/false (the v4 server scaffold with `auth_request /_auth_jwt`, `@auth_401/@auth_403` and `location /__basic__/` is always injected); the auth mode is switched only by the env.d one-liner (`set $auth_mode acl;|basic;`), and `_set_token` redirect is preserved with `$scheme://$http_host$arg_redirect`.
+- `TestV5SimpleNginxSyntax` / `test_render_nginx_conf_byte_identical_across_enable_acl` cover the v5 model — the per-service conf is SIMPLE ACL-free and **byte-identical** for `ENABLE_ACL` true/false (no auth_request/WWW-Authenticate/`@auth_401`/`@auth_403`/env.d/`$client_type`); the v4 server scaffold is removed and `strip_v4_scaffold` cleans stale v4 tokens (migrate_v5 swept 33 confs, 0 remain); the `_set_token` redirect is preserved on the edge with `$scheme://$http_host$arg_redirect`.
 - `TestEnsureSubnetIpamBlock` covers `ensure_subnet_ipam_block()` — injects the `{% if subnet %}` ipam block into an old template and backs the original up as `.bak`.
 - `TestCheckMissingFiles` covers `GET /services/{service_name}/check-missing-files` — response model, route registration, 404 for missing service, all-present, `.j2` templates, and the `recipe_path` query parameter (recipe subdir present, missing recipe dir → 404, root files ignored when `recipe_path` is given).
 - `TestSubnetPoolAPI` covers `GET /subnet-pool` — returns pool stats when `SUBNET_POOLS` is set and the disabled state when it is empty.
@@ -151,7 +151,7 @@ Covers: submit → complete, submit → fail, cancel pending, cancel completed, 
 **File:** `tests/test_integration.sh`  
 **Requires:** Docker, `curl`; `jq` optional (falls back to Python).
 
-Runs the full end-to-end cycle against a real Docker daemon (120 tests):
+Runs the full end-to-end cycle against a real Docker daemon (44 test sections):
 
 ```
 Build subnet-acl-provision-api image
@@ -185,9 +185,6 @@ Build subnet-acl-provision-api image
             ├─ GET  /tasks/{nonexistent}                → 404
             ├─ POST /users?sync=true (hyphenated user)  → hyphen allowed, container prefix correct
             ├─ POST /users?sync=true (plain conf + https)→ auto-HTTPS generation from HTTP conf
-            ├─ GET  /container-stats                    → registry-scoped container stats
-            ├─ GET  /service-stats                      → registry-scoped service stats
-            ├─ POST /ssl-certs + GET + DELETE           → SSL cert lifecycle
             ├─ per-task log output verification         → docker output captured in logs
             └─ nginx resilience with missing upstreams  → reload succeeds with stopped/removed containers
 ```
@@ -204,10 +201,10 @@ bash tests/test_integration.sh
 ### Run all tests
 
 ```bash
-# All pytest-based tests (353 tests, no Docker needed)
+# All pytest-based tests (388 tests, no Docker needed)
 uv run pytest tests/test_unit.py tests/test_e2e.py tests/test_proxy_support.py tests/test_task_manager.py tests/test_subnet_manager.py -v
 
-# Full integration (120 tests, requires Docker)
+# Full integration (44 test sections, requires Docker)
 sudo bash tests/test_integration.sh
 ```
 
@@ -226,7 +223,19 @@ uv sync
 python -m pytest tests/test_unit.py tests/test_e2e.py tests/test_proxy_support.py tests/test_task_manager.py tests/test_subnet_manager.py -v
 ```
 
-Expected: **353 passed** (233 unit + 43 e2e + 38 proxy + 16 task_manager + 23 subnet).
+Expected: **388 passed, 0 failed** (full python suite — verified 2026-08-24, cycle 20260824T173309Z: QA iter-3 pytest 388/0, F3/F15 regression tests included).
+
+---
+
+### Known coverage gaps
+
+The following provision-api endpoints have **no automated test** (verify via `curl` against a live
+stack):
+- `GET /container-stats` and `GET /service-stats` (registry-scoped counts)
+- SSL certificate management — `GET/POST /ssl-certs`, `POST /ssl-certs/{domain}/refresh`,
+  `DELETE /ssl-certs/{domain}`
+
+They are not exercised by `test_unit.py`, `test_e2e.py`, or `test_integration.sh`.
 
 ---
 

@@ -54,12 +54,26 @@ Set these before running `docker compose up`.
 | `NGINX_CONTAINER` | — | `subnet-acl-nginx` | Name of the nginx container to connect/reload on registration (default `subnet-acl-nginx`) |
 | `SUBNET_POOLS` | — | `100.96.0.0/16,100.97.0.0/16` | Comma-separated `/16` pools for subnet management. Empty/unset = subnet management disabled |
 | `SUBNET_HEADROOM` | — | `2` | Extra host IPs reserved per service (added to container count + 1 gateway when sizing a subnet; default `2`) |
-| `ENABLE_ACL` | — | `true` | v4 mode switch: `true` = env.d one-liner `set $auth_mode acl;` → per-service conf calls the gateway `/api/auth/verify` for ACL; `false` = env.d one-liner `set $auth_mode basic;` → per-service Basic dialog via `/__basic__/`. The per-service conf is **byte-identical** across modes — it is never regenerated on mode switch (default `false`). See [ACL Enforcement](#acl-enforcement-enable_acl). |
+| `ENABLE_ACL` | — | `true` | v5 (F7): read only by the gateway + the edge `-nginx-acl`; the `-api` no longer reads it and there is no env.d mode switch. Toggle = recreate the edge + restart the gateway (default `false`). The internal per-service conf is SIMPLE ACL-free and byte-identical across modes. See [ACL Enforcement](#acl-enforcement-enable_acl). |
 | `DOCKER_OPS_LOG` | — | `${PROVISION_DIR}/generated/docker_ops.log` | If set, all docker command stdout/stderr is appended here for debugging |
 | `TASK_LOG_DIR` | — | `${PROVISION_DIR}/generated/task_logs` | Directory for per-task isolated `.log` files (one file per async task) |
 | `TASK_TTL_SECONDS` | — | `604800` (7 days) | How long finished tasks and their log files are retained before automatic cleanup |
 | `TASK_MAX_COUNT` | — | `1000` | Maximum number of tasks retained in memory; oldest completed tasks are evicted when exceeded |
 | `SSL_DIR` | — | `${PROVISION_DIR}/ssl` | Base directory for SSL certificates (default `${PROVISION_DIR}/ssl`). Created automatically. |
+
+---
+
+## Fullset deployment (edge + gateway + dashboard)
+
+This document's topology and env vars describe the **minimal** deployment (provision-api + internal
+`-nginx`). In the **fullset** deployment the gateway + dashboard + edge `-nginx-acl` (from the gateway
+repo) are added, and the **edge becomes the sole client-facing entry**:
+
+- The edge is published on `${ACL_HTTP_PORT:-8767}` / `${ACL_HTTPS_PORT:-8768}` (gateway compose), and
+  `NGINX_HTTP_PORT` / `NGINX_HTTPS_PORT` (used by `/go/`, the service URL, and system info) are the
+  **edge's** client-facing ports — not the internal nginx's.
+- The internal nginx stays services-only (simple per-service confs; no host ports published in fullset).
+- See `_provision_gateway/docs/architecture.md` for the fullset topology and the edge `-nginx-acl` role.
 
 ---
 
@@ -94,7 +108,7 @@ services:
       - SSL_DIR=${PROVISION_DIR:-/srv/provision_subnet_acl}/ssl              # base directory for TLS certificates
       - SUBNET_POOLS=${SUBNET_POOLS:-}                  # comma-separated /16 pools; empty = disabled
       - SUBNET_HEADROOM=${SUBNET_HEADROOM:-2}           # headroom IPs per service
-      - ENABLE_ACL=${ENABLE_ACL:-false}                 # v4: env.d one-liner mode switch (acl|basic); per-service conf is byte-identical
+      - ENABLE_ACL=${ENABLE_ACL:-false}                 # v5: -api no longer reads it (env.d mode switch removed, F7/F10); gateway+edge read it
     dns:
       - 8.8.8.8
       - 8.8.4.4
@@ -129,21 +143,19 @@ networks:
 The `nginx.provision.conf` includes all per-user virtual-host confs at startup:
 
 ```nginx
-# nginx.provision.conf (simplified)
+# nginx.provision.conf (simplified, v5 services-only — F9)
 http {
     include ${GENERATED_DIR}/*.nginx.conf;   # ← envsubst fills GENERATED_DIR
-
-    # Dashboard host:port for ACL redirect targets (http level so per-service
-    # server blocks can reference $dashboard_host instead of a hardcoded host:port)
-    map $host $dashboard_host {
-        default "localhost:8775";
-    }
 }
 ```
 
 > The legacy `map $http_accept $is_browser` discriminator was **removed in v4 (QA2)** — the per-service
 > confs no longer reference `$is_browser`. Client-type detection (browser vs API) is decided by the
-> gateway `/api/auth/verify` hybrid rule (`X-Client-Type`) instead.
+> gateway `/api/auth/verify` hybrid rule (`X-Client-Type`) instead. In v5 (cycle 20260824T173309Z, F9)
+> the internal `nginx.provision.conf` is **services-only**: the v4 `map $host $dashboard_host` block
+> ("Dashboard host:port for ACL redirect targets") was **REMOVED** — portal/ACL redirects and the
+> 401/403 challenges now live on the edge `-nginx-acl` (F4/F8), and the internal per-service confs are
+> simple ACL-free and never reference `$dashboard_host`.
 
 Each `*.nginx.conf` file is written by subnet-acl-provision-api when a user registers. After writing
 the file, subnet-acl-provision-api calls `docker exec subnet-acl-nginx nginx -s reload` so the new
@@ -244,33 +256,31 @@ gets its own dedicated subnet reserved from the pool instead of Docker auto-assi
 
 ## ACL Enforcement (`ENABLE_ACL`)
 
-**v4 model:** `ENABLE_ACL` does **not** change the per-service nginx template. `render_nginx_conf()`
-always renders the same v4 server scaffold (byte-identical conf for `ENABLE_ACL` true/false — test
-`test_render_nginx_conf_byte_identical_across_enable_acl`). The switch happens at the env.d level:
+**v5 model (cycle 20260824T173309Z, F8):** `ENABLE_ACL` no longer changes the per-service nginx
+template and no longer drives an env.d mode switch. `render_nginx_conf()` always renders the SIMPLE
+ACL-free form (`server_name` + `auth_basic` + variable `proxy_pass`) — byte-identical for
+`ENABLE_ACL` true/false (`TestV5SimpleNginxSyntax`: no auth_request/WWW-Authenticate/`@auth_401`/
+`@auth_403`/env.d/`$client_type`). The v4 server scaffold, `env.d` one-liner and `/__basic__/`
+short-circuit are REMOVED; `strip_v4_scaffold` sweeps stale v4 tokens from deployed confs.
 
-- `write_env_d` writes a one-liner into `env.d/*.env`: `set $auth_mode acl;` (ACL) or
-  `set $auth_mode basic;` (Basic). `env.d` is `include`d at **server** level (an http-level `set`
-  is invalid nginx), so the mode can be toggled by swapping the env.d file — no per-service conf
-  regeneration, no nginx `-t` churn.
-- `ENABLE_ACL=true` → ACL mode: `location /` runs `if ($auth_mode != "acl") rewrite` +
-  `auth_request /_auth_jwt`, which delegates identity/ACL verification to the gateway
-  (`subnet-acl-gateway:8770/api/auth/verify`) using the v4 hybrid `X-Client-Type` rule (API via
-  `X-Provision-Token` header, browser via `provision_token` cookie). `error_page 401/403` redirect
-  browsers to the dashboard (`http://$dashboard_host/...`); API clients get a plain `401`/`403`.
-- `ENABLE_ACL=false` (the default) → Basic mode: `$auth_mode` is `basic`, so `location /`
-  rewrites to the internal `location /__basic__/` — the **only** place `auth_basic` /
-  `auth_basic_user_file` live — with **0 gateway subrequests** (minimal deployments start clean).
-- `location = /_set_token` is a plain variable proxy to the gateway exchange
-  (`/api/auth/exchange`); it swaps the 30s HMAC exchange code for the `provision_token` cookie and
-  redirects with a port-preserving `return 302 $scheme://$http_host$arg_redirect;` so the `/go/`
-  flow lands on the same host:port the browser came from. **No JWT appears in any URL.**
-- `$dashboard_host` is an http-level `map` in `nginx.provision.conf` (default `localhost:8775`);
-  update that one line to move the dashboard.
+- `ENABLE_ACL=true` → ACL mode: the edge `-nginx-acl` (gateway repo) is the entry; its `location /`
+  runs `auth_request /_auth_jwt` → gateway `/api/auth/verify` (v4 hybrid `X-Client-Type` rule;
+  `error_page 401/403` → browser 302 dashboard, API `401`/`403`; `WWW-Authenticate:
+  Basic realm="subnet-acl"` `always` on 401, GAP-16).
+- `ENABLE_ACL=false` (the default) → ACL-off mode: the edge passes traffic straight through to the
+  internal native Basic (`auth_basic` on the simple per-service conf) — non-certed service over
+  http → 401 native Basic dialog (`realm="example-service - alice"`, B5/F6).
+- `/_set_token` on the edge is a plain variable proxy to the gateway exchange (`/api/auth/exchange`);
+  it swaps the 30s HMAC exchange code for the `provision_token` cookie and redirects with a
+  port-preserving `return 302 $scheme://$http_host$arg_redirect;` so the `/go/` flow lands on the
+  same host:port the browser came from. **No JWT appears in any URL.**
 - The legacy `map $http_accept $is_browser` discriminator was removed in v4 (QA2); nginx confs no
   longer reference `$is_browser`. Client-type is decided by the gateway verify hybrid rule.
 
 Deployed confs are kept in sync via `reconciliation.regenerate_nginx_confs()` (re-renders registry
-confs with the v4 renderer and strips `is_browser` from orphan confs; `POST /nginx/regenerate`).
+confs with the v5 SIMPLE renderer and `strip_v4_scaffold` strips stale v4 tokens; `POST
+/nginx/regenerate`). Migrate existing confs with `migrate_v5.py`
+(`cd _users_provision && uv run python -m user_provision_tool.migrate_v5 --dry-run`, F15).
 
 ---
 

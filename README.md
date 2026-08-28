@@ -256,7 +256,7 @@ disables subnet management entirely.
 ```bash
 export SUBNET_POOLS=100.96.0.0/16,100.97.0.0/16   # empty = disabled
 export SUBNET_HEADROOM=2                            # default 2
-export ENABLE_ACL=true                              # JWT+ACL nginx template; false = legacy auth_basic
+export ENABLE_ACL=true                              # v5: read by gateway+edge -nginx-acl (edge ACL gate); false = internal native Basic
 ```
 
 ```bash

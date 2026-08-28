@@ -59,7 +59,7 @@ differently depending on the `?sync` query parameter:
 | Mode | Query | HTTP status | Response body |
 |---|---|---|---|
 | **Async** (default) | _(none)_ | `202 Accepted` | `{"task_id": "...", "status": "pending", "type": "...", "message": "..."}` |
-| **Sync** | `?sync=true` | `201` / `200` | legacy response (`{"status": "registered", ...}` etc.) |
+| **Sync** | `?sync=true` | `202` | legacy response (`{"status": "registered", ...}` etc.) |
 
 In async mode, errors that can be detected before queuing (validation, not-found, permission)
 return immediately as `4xx`.  Runtime errors (docker build failures, etc.) are stored in the
@@ -143,7 +143,7 @@ curl -X POST "http://localhost:8875/users?sync=true" \
   -d '{...}'
 ```
 
-**Response `201` (sync only)**
+**Response `202` (sync only)**
 ```json
 {
   "status": "registered",
@@ -292,7 +292,7 @@ curl -X POST http://localhost:8875/users/alice/services/myapp/0/rebuild \
 ## `GET /tasks` — List All Tasks
 
 Returns all tasks in the pool, newest first.  Completed/failed/cancelled tasks are
-auto-cleaned after 1 hour.
+auto-cleaned after `TASK_TTL_SECONDS` (default 7 days).
 
 **Response `200`**
 ```json
@@ -653,6 +653,35 @@ Reloads subnet-acl-nginx (default) or a named container.
 **Response `200`**
 ```json
 { "reloaded": true }
+```
+
+---
+
+## `POST /docker/nginx/env` — Deprecated (410)
+
+**Removed in v5.** `ENABLE_ACL` no longer drives an `env.d`/`portal.d` mode switch on the internal
+nginx. The endpoint now always returns **410 Gone** — `ENABLE_ACL` is read only by the gateway and the
+edge `-nginx-acl`; toggling it means recreating the edge + restarting the gateway (no per-service conf
+change).
+
+---
+
+## `POST /nginx/regenerate` — Regenerate Service Confs
+
+Re-renders every registered service's nginx conf via the v5 SIMPLE renderer and strips any stale v4
+scaffold tokens (`env.d`/`portal.d`/`auth_request`/`is_browser`) from deployed confs. Used as a
+recovery/migration path (e.g. after `migrate_v5.py`).
+
+**Response `200`**
+```json
+{
+  "message": "nginx confs regenerated; nginx restarted.",
+  "report": {
+    "regenerated": 24,
+    "stripped": 0,
+    "errors": []
+  }
+}
 ```
 
 ---
@@ -1099,4 +1128,4 @@ curl -X POST http://localhost:8875/nginx/reconnect-all
 | `PROVISION_API_PORT` | `8875` | Host port (set in `docker-compose.provision.yml`) |
 | `SUBNET_POOLS` | _(empty)_ | Comma-separated `/16` pools for subnet management (e.g. `100.96.0.0/16,100.97.0.0/16`). Empty/unset = subnet management disabled |
 | `SUBNET_HEADROOM` | `2` | Extra host IPs reserved per service (added to container count + 1 gateway when sizing a subnet) |
-| `ENABLE_ACL` | `false` | v4 mode switch: `true` = env.d one-liner `set $auth_mode acl;` → per-service conf calls the gateway `/api/auth/verify` for ACL; `false` = env.d one-liner `set $auth_mode basic;` → Basic dialog via `/__basic__/`. The per-service conf is **byte-identical** across modes (never regenerated on mode switch) |
+| `ENABLE_ACL` | `false` | v5 (F7): read only by the gateway + the edge `-nginx-acl`; the `-api` no longer reads it (no env.d mode switch). Toggle = recreate the edge + restart the gateway. The internal per-service conf is SIMPLE ACL-free and byte-identical across modes |

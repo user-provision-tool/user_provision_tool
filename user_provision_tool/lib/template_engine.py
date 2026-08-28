@@ -275,130 +275,80 @@ def _rewrite_env_file_refs_legacy(yaml_text: str, per_user_env_name: str) -> str
 
 
 # ---------------------------------------------------------------------------
-# v4 Service-ACL scaffolding (acl-enforcement-design-v4 §5, §10.3 F2)
+# v5 simple per-service conf (acl-enforcement-design-v5 §5, decisions 6/8)
 # ---------------------------------------------------------------------------
-# The per-service conf is byte-identical for ENABLE_ACL true/false, minimal
-# and fullset, HTTP/HTTPS — generated once and NEVER regenerated on mode
-# toggle (F1). The mode-switch lives in env.d (`set $auth_mode acl;`/`basic;`)
-# written by write_env_d(); the gateway and that one-liner are the ONLY things
-# ENABLE_ACL affects. Client type comes from the gateway (X-Client-Type) — no
-# Accept map anywhere (GAP-11).
+# The per-service conf is the simple, ACL-free form — byte-identical between
+# minimal and fullset, HTTP/HTTPS (F8):
+#   server_name + auth_basic + auth_basic_user_file + location / proxy_pass
+# The ACL gate lives ENTIRELY at the edge (-nginx-acl). No auth_request,
+# /_auth_jwt, /_set_token, /__basic__/, @auth_401/@auth_403, error_page,
+# env.d include, or $auth_mode ever appear in an internal conf (v5 §5).
 # ---------------------------------------------------------------------------
 
 
-def _split_server_blocks(t: str) -> list[tuple[bool, str]]:
-    """Split nginx config text into (is_server, text) chunks via brace counting."""
-    blocks = re.split(r"(^[ \t]*server\s*\{)", t, flags=re.MULTILINE)
-    result: list[tuple[bool, str]] = []
+def strip_v4_scaffold(content: str) -> str:
+    """Remove stale v2/v3/v4 ACL scaffolding from a rendered per-service conf.
+
+    Used by the v5 migration (:func:`migrate_v5`) and startup recovery for
+    confs that have no registry template to re-render from. Brace-balanced so
+    ``@auth_401``/``@auth_403`` blocks with nested ``if`` are fully removed.
+    The variable proxy_pass form (``set $upstream_0000 …``, decision 8) is
+    preserved — only the scaffold's bare ``set $upstream <target>;`` is dropped.
+    """
+    # auth_request / auth_request_set / error_page lines.
+    content = re.sub(r"[ \t]*auth_request[ \t]+[^\n;]*;[ \t]*\r?\n", "", content)
+    content = re.sub(r"[ \t]*auth_request_set[ \t]+\$[^\n;]*;[ \t]*\r?\n", "", content)
+    content = re.sub(r"[ \t]*error_page[ \t]+[^\n;]*;[ \t]*\r?\n", "", content)
+    # mode-switch rewrite (rewrite phase).
+    content = re.sub(
+        r'[ \t]*if \(\$auth_mode != "acl"\)[ \t]*\{.*?\}[ \t]*\r?\n',
+        "", content, flags=re.DOTALL,
+    )
+    # scaffold `set $auth_mode / $portal_scheme / $dashboard_host` lines.
+    content = re.sub(
+        r"[ \t]*set \$(auth_mode|portal_scheme|dashboard_host)\b[^\n;]*;[ \t]*\r?\n",
+        "", content,
+    )
+    # the v4 scaffold's `set $upstream <target>;` (bare name `upstream`, NOT
+    # the variable proxy_pass `upstream_0000` form).
+    content = re.sub(r"[ \t]*set \$upstream\s+[^\n;]*;[ \t]*\r?\n", "", content)
+    # env.d include + the edge-only credential-injection header.
+    content = re.sub(r"[ \t]*include /etc/nginx/env\.d/\*\.env;[ \t]*\r?\n", "", content)
+    content = re.sub(
+        r'[ \t]*proxy_set_header Authorization "Basic \$service_basic";[ \t]*\r?\n',
+        "", content,
+    )
+    # Brace-balanced removal of scaffold location blocks.
+    for prefix in (
+        "location = /_set_token",
+        "location = /_auth_jwt",
+        "location /__bypass__/",
+        "location /__basic__/",
+        "location @auth_401",
+        "location @auth_403",
+    ):
+        content = _strip_location_blocks(content, prefix)
+    return content
+
+
+def _strip_location_blocks(content: str, prefix: str) -> str:
+    """Remove ``location … { … }`` blocks (brace-balanced) starting with *prefix*."""
+    pattern = re.compile(r"^([ \t]*)" + re.escape(prefix), re.MULTILINE)
+    lines = content.split("\n")
+    out: list[str] = []
     i = 0
-    while i < len(blocks):
-        chunk = blocks[i]
-        if re.match(r"^[ \t]*server\s*\{", chunk):
-            block = chunk
-            depth = chunk.count("{") - chunk.count("}")
+    while i < len(lines):
+        line = lines[i]
+        if pattern.match(line):
+            depth = line.count("{") - line.count("}")
             i += 1
-            while i < len(blocks) and depth > 0:
-                nxt = blocks[i]
-                depth += nxt.count("{") - nxt.count("}")
-                block += nxt
+            while i < len(lines) and depth > 0:
+                depth += lines[i].count("{") - lines[i].count("}")
                 i += 1
-            result.append((True, block))
-        else:
-            if chunk:
-                result.append((False, chunk))
-            i += 1
-    return result
-
-
-def _first_proxy_target(block: str) -> str | None:
-    """Return 'host:port' (or bare host) of the first proxy_pass in a server block."""
-    m = re.search(r"proxy_pass\s+https?://([^:;\s/]+)(?::(\d+))?", block)
-    if not m:
-        return None
-    host = m.group(1)
-    port = m.group(2)
-    return f"{host}:{port}" if port else host
-
-
-_V4_SERVER_SCAFFOLD = """\
-    # v4 Service-ACL scaffolding — byte-identical across modes (F1/F2). The
-    # mode-switch (`set $auth_mode acl;`/`basic;`) and $portal_scheme /
-    # $dashboard_host constants are injected from env.d at deploy time.
-    set $auth_mode "";
-    set $portal_scheme "";
-    set $dashboard_host "";
-    set $upstream {upstream};
-    include /etc/nginx/env.d/*.env;
-
-    # _set_token — plain proxy to the gateway exchange (F7/A1). The 30s code is
-    # exchanged for a provision_token cookie; the 302 + Set-Cookie pass through
-    # verbatim. Never a JWT in the URL (GAP-10). Variable proxy_pass + resolver
-    # so a minimal (gateway-less) deployment still starts cleanly (B12).
-    location = /_set_token {{
-        resolver 127.0.0.11 valid=30s ipv6=off;
-        set $gw subnet-acl-gateway:8770;
-        proxy_pass http://$gw/api/auth/exchange;
-        proxy_set_header Host $host;
-    }}
-
-    # _auth_jwt — internal JWT/ACL verify subrequest. Variable proxy_pass +
-    # resolver so the gateway DNS resolves at request time (missing gateway does
-    # not hang startup). auth_request is scoped to location /, so this is only
-    # reached in ACL mode.
-    location = /_auth_jwt {{
-        internal;
-        resolver 127.0.0.11 valid=30s ipv6=off;
-        set $auth_gw subnet-acl-gateway:8770;
-        proxy_pass http://$auth_gw/api/auth/verify;
-        proxy_set_header X-Original-URI $request_uri;
-        proxy_set_header X-Provision-Token $http_x_provision_token;
-        proxy_set_header Cookie $http_cookie;
-        proxy_set_header Host $host;
-    }}
-
-    # /__basic__/ — native Basic-dialog short-circuit (B5/B12). The credential
-    # directives live ONLY here (GAP-28: stripped when htpasswd_path is empty ⇒
-    # open). Reached via the mode-switch rewrite in location /; auth_request is
-    # scoped to location /, so a non-ACL / minimal deployment never calls the
-    # gateway (0 subrequests, F5).
-    location /__basic__/ {{
-        internal;
-{basic_auth}        proxy_pass http://$upstream/;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }}
-
-    # API-first error handling (GAP-14): WWW-Authenticate always on the 401
-    # branch (GAP-27); API clients get a bare 401/403, browsers get a clean
-    # redirect to the portal login / alert with no back-ref query param (A2/B3).
-    # The 403 browser→alert redirect fires only when the gateway reported
-    # X-Auth-Action=acl_denied; any other 403 stays a bare 403 (D6).
-    location @auth_401 {{
-        add_header WWW-Authenticate 'Basic realm="subnet-acl"' always;
-        if ($client_type != "browser") {{ return 401; }}
-        return 302 $portal_scheme://$dashboard_host/login;
-    }}
-    location @auth_403 {{
-        if ($client_type != "browser") {{ return 403; }}
-        if ($auth_action != "acl_denied") {{ return 403; }}
-        return 302 $portal_scheme://$dashboard_host/alert?reason=acl_denied&service=$host;
-    }}
-"""
-
-_LOCATION_ROOT_PREFIX = """\
-\n        # Mode switch (rewrite phase, before access-phase auth_request ⇒ the
-        # gateway is never called when auth_mode != "acl", F5/B12).
-        if ($auth_mode != "acl") {{ rewrite ^ /__basic__$request_uri last; }}
-        auth_request /_auth_jwt;
-        auth_request_set $service_basic $upstream_http_x_service_basic;
-        auth_request_set $auth_action $upstream_http_x_auth_action;
-        auth_request_set $client_type $upstream_http_x_client_type;
-        error_page 401 = @auth_401;
-        error_page 403 = @auth_403;
-        proxy_set_header Authorization "Basic $service_basic";
-"""
+            continue
+        out.append(line)
+        i += 1
+    return "\n".join(out)
 
 
 def render_nginx_conf(
@@ -413,18 +363,22 @@ def render_nginx_conf(
     ssl_certificate_path: str = "",
     ssl_certificate_key_path: str = "",
 ) -> None:
-    """Render a nginx conf template and write the output file.
+    """Render a nginx conf template and write the output file (v5 simple form).
 
     When *https* is True, the template can reference:
       - ``{{ https }}``                  — boolean True
       - ``{{ ssl_certificate_path }}``   — absolute path to fullchain.pem
       - ``{{ ssl_certificate_key_path }}`` — absolute path to privkey.pem
 
-    The rendered conf is ALWAYS post-processed into the v4 Service-ACL form:
-    byte-identical scaffolding (F2) with ``auth_basic`` relocated into the
-    internal ``location /__basic__/`` and the mode-switch rewrite in
-    ``location /``. This is independent of ENABLE_ACL / PORTAL_MODE — those
-    only affect the env.d one-liner written by :func:`write_env_d`.
+    The rendered conf is the v5 simple, ACL-free form (decision 6 / F8): the
+    template's ``server_name + auth_basic + auth_basic_user_file + location /
+    proxy_pass`` is kept verbatim at server level. When *htpasswd_path* is
+    empty the ``auth_basic`` directives are dropped (open service). Stale
+    v2/v3/v4 ACL scaffolding in the template is stripped (idempotent
+    regeneration) and static ``proxy_pass`` is rewritten to the variable form
+    (decision 8) so nginx defers upstream resolution to request time. NO ACL
+    scaffolding is ever injected (the gate lives at the edge). Independent of
+    ``ENABLE_ACL`` / ``PORTAL_MODE``.
     """
     env, tpl_name = _make_env(template_path)
     prefix = container_prefix(service_name, user_name, label)
@@ -443,50 +397,22 @@ def render_nginx_conf(
     }
     rendered = env.get_template(tpl_name).render(**ctx)
 
-    # --- Capture the auth_basic realm for /__basic__/ (F2 / GAP-28) ---
-    basic_realm = None
-    m_realm = re.search(r'[ \t]*auth_basic[ \t]+"([^"]*)"', rendered)
-    if m_realm:
-        basic_realm = m_realm.group(1)
+    # --- auth_basic lives at server level (v5 §5). Empty htpasswd → open. ---
+    if not htpasswd_path:
+        rendered = re.sub(r'[ \t]*auth_basic[ \t]+"[^"]*"[ \t]*;', "", rendered)
+        rendered = re.sub(r"[ \t]*auth_basic_user_file[ \t]*;", "", rendered)
+        rendered = re.sub(r"[ \t]*auth_basic_user_file[ \t]+\S+[ \t]*;", "", rendered)
 
-    # --- auth_basic moves out of the main path into /__basic__/ (F2) ---
-    # Not line-anchored so single-line `location / { auth_basic "x"; ...; }`
-    # blocks are handled too.
-    rendered = re.sub(r'[ \t]*auth_basic[ \t]+"[^"]*"[ \t]*;', "", rendered)
-    # auth_basic_user_file with an empty path (htpasswd_path="") and with a path.
-    rendered = re.sub(r"[ \t]*auth_basic_user_file[ \t]*;", "", rendered)
-    rendered = re.sub(r"[ \t]*auth_basic_user_file[ \t]+\S+[ \t]*;", "", rendered)
-
-    # --- Strip stale v2/v3 ACL scaffolding so re-generation is idempotent ---
-    rendered = re.sub(r"[ \t]*auth_request[ \t]+[^\n;]*;[ \t]*\r?\n", "", rendered)
-    rendered = re.sub(r"[ \t]*auth_request_set[ \t]+\$[^\n;]*;[ \t]*\r?\n", "", rendered)
-    rendered = re.sub(r"[ \t]*error_page[ \t]+[^\n;]*;[ \t]*\r?\n", "", rendered)
-    rendered = re.sub(
-        r'[ \t]*if \(\$auth_mode != "acl"\)[ \t]*\{.*?\}[ \t]*\r?\n',
-        "", rendered, flags=re.DOTALL,
-    )
-    rendered = re.sub(
-        r"[ \t]*set \$(auth_mode|portal_scheme|dashboard_host|upstream|upstream_\d+)"
-        r"[ \t]+[^\n;]*;[ \t]*\r?\n",
-        "", rendered,
-    )
-    for _loc in (
-        r"location = /_set_token",
-        r"location = /_auth_jwt",
-        r"location /__bypass__/",
-        r"location /__basic__/",
-        r"location @auth_401",
-        r"location @auth_403",
-    ):
-        rendered = re.sub(r"[ \t]*" + _loc + r"[ \t]*\{.*?\}[ \t]*\r?\n", "", rendered, flags=re.DOTALL)
+    # --- Strip stale v2/v3/v4 ACL scaffolding (idempotent regeneration) ---
+    rendered = strip_v4_scaffold(rendered)
 
     # ------------------------------------------------------------------
     # Rewrite static proxy_pass → variable-based for per-request DNS
-    # resolution.  Without this, nginx resolves the upstream hostname
-    # ONCE at startup and caches the IP forever.  If the container
-    # restarts or is missing at reload time, nginx hangs.  With
-    # variables, resolution is deferred to request time and nginx
-    # starts/reloads cleanly regardless of upstream state.
+    # resolution (decision 8).  Without this, nginx resolves the upstream
+    # hostname ONCE at startup and caches the IP forever.  If the container
+    # restarts or is missing at reload time, nginx hangs.  With variables,
+    # resolution is deferred to request time and nginx starts/reloads
+    # cleanly regardless of upstream state.
     #
     #  Before:  proxy_pass http://myapp-user_alice-0-web:80;
     #  After:   set $upstream_0000 myapp-user_alice-0-web:80;
@@ -514,34 +440,6 @@ def render_nginx_conf(
         flags=re.MULTILINE,
     )
 
-    # --- Inject the v4 scaffolding into every service server block ---
-    parts = _split_server_blocks(rendered)
-    out: list[str] = []
-    for is_server, block in parts:
-        if is_server and "proxy_pass" in block:
-            target = _first_proxy_target(block) or "localhost:80"
-            basic_auth = ""
-            if htpasswd_path:
-                realm = basic_realm or f"{service_name} - {user_name}"
-                basic_auth = (
-                    f'        auth_basic "{realm}";\n'
-                    f"        auth_basic_user_file {htpasswd_path};\n"
-                )
-            scaffold = _V4_SERVER_SCAFFOLD.format(upstream=target, basic_auth=basic_auth)
-            # Insert the server-level scaffolding after the first server_name line.
-            m_name = re.search(r"^([ \t]*server_name[^\n;]*;[ \t]*\r?\n)", block, flags=re.MULTILINE)
-            if m_name:
-                block = block[: m_name.end()] + scaffold + block[m_name.end():]
-            else:
-                block = block.replace("server {", "server {" + scaffold, 1)
-            # Inject the location / prefix (mode-switch + auth_request + error_page).
-            # Matches both multi-line and single-line `location / { ... }`.
-            m_root = re.search(r"([ \t]*location / \{)", block)
-            if m_root:
-                block = block[: m_root.end()] + _LOCATION_ROOT_PREFIX.format() + block[m_root.end():]
-        out.append(block)
-    rendered = "".join(out)
-
     with open(output_path, "w") as f:
         f.write(rendered)
     # Mark rendered nginx conf as generated
@@ -554,15 +452,15 @@ def write_env_d(
     portal_scheme: str = "http",
     dashboard_host: str = "localhost:8775",
 ) -> Path:
-    """Write the env.d mode-switch one-liner + portal constants (v4 F1/F6).
+    """DEPRECATED (v5, decision 1/6) — ``env.d`` disappears from the internal side.
 
-    ENABLE_ACL affects ONLY this one-liner (``set $auth_mode acl;`` /
-    ``basic;``) and the gateway — the per-service conf is byte-identical. The
-    fullset deployment also carries ``$portal_scheme`` / ``$dashboard_host``
-    constants via env.d so the per-service @auth_401/@auth_403 redirects know
-    where the portal lives (GAP-14).
+    v5 moves the ACL gate entirely to the edge ``-nginx-acl`` and the internal
+    per-service confs are the simple ACL-free form (§5). ``ENABLE_ACL`` touches
+    only the gateway and the edge. This writer is retained only so existing
+    callers (older ``-api`` versions) fail gracefully; the current ``-api`` no
+    longer calls it. Do not use in new code.
 
-    Returns the path of the written ``mode.env``.
+    Returns the path of the written ``mode.env`` (v4 behaviour, unchanged).
     """
     env_dir = Path(generated_dir) / "env.d"
     env_dir.mkdir(parents=True, exist_ok=True)
@@ -587,6 +485,7 @@ _PORTAL_SERVER_HEADER = """\
 
 
 def _portal_locations() -> str:
+    """DEPRECATED (v5, decision 5/15) — the portal moves to the edge ``-nginx-acl``."""
     return (
         "    # Internal-only endpoints must not be reachable via the portal (GAP-31).\n"
         "    location = /api/auth/verify { return 404; }\n"
@@ -657,13 +556,15 @@ def write_portal_d(
     portal_tls_dir: str = "/etc/letsencrypt/live",
     portal_cert_name: str = "subnet-acl-gateway",
 ) -> Path:
-    """Write the portal block(s) into portal.d/ based on PORTAL_MODE (v4 §5.2/F6).
+    """DEPRECATED on the internal (v5, decision 5/15) — the portal moves to the edge.
 
-    - ``http``  → single :80 management block (today's behavior).
+    v5 serves the portal host from the edge ``-nginx-acl`` (§4.3 portal blocks);
+    the internal ``-nginx`` is services-only (§5) and no longer includes
+    ``portal.d``. This writer is retained for backward compatibility; the
+    current ``-api`` no longer calls it. Do not use in new code.
+
+    - ``http``  → single :80 management block (v4 behavior).
     - ``https`` → :443 ssl portal-cert block + a :80 ``301`` HTTPS redirect.
-
-    Both variants ``return 404`` for ``/api/auth/verify`` and
-    ``/api/auth/exchange`` (internal-only endpoints, GAP-31).
 
     Returns the path of the written ``portal.conf``.
     """

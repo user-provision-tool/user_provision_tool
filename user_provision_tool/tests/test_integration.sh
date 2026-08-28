@@ -258,7 +258,12 @@ teardown() {
 
     echo "Cleaned up."
 }
-trap teardown EXIT
+# Teardown must fire on signals too, not just normal exit: this script swaps the
+# LIVE provision stack's PROVISION_DIR to a mktemp dir, so an EXIT-only trap
+# leaves subnet-acl-provision-api/subnet-acl-nginx mounted from the temp dir when
+# the run is SIGTERM/SIGINT-killed (observed 2026-08-27: all services 502 +
+# orphaned myapp-* containers). TERM/INT/HUP + the _torn_down guard self-heal.
+trap teardown EXIT TERM INT HUP
 
 # ---------------------------------------------------------------------------
 # Build & start the provision API container

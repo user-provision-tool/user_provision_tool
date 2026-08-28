@@ -29,10 +29,8 @@ services:
       - SSL_DIR=${PROVISION_DIR:-/srv/provision_subnet_acl}/ssl
       - SUBNET_POOLS=${SUBNET_POOLS:-}
       - SUBNET_HEADROOM=${SUBNET_HEADROOM:-2}
-      - ENABLE_ACL=${ENABLE_ACL:-false}
-      - PORTAL_MODE=${PORTAL_MODE:-http}
-      - PORTAL_TLS_DIR=${PORTAL_TLS_DIR:-/etc/letsencrypt/live}
-      - PORTAL_CERT_NAME=${PORTAL_CERT_NAME:-subnet-acl-gateway}
+      # v5 (decision 1): -api does NOT read ENABLE_ACL / PORTAL_MODE — they touch
+      # only the gateway and the edge -nginx-acl. The internal confs are simple.
     dns:
       - 8.8.8.8
       - 8.8.4.4
@@ -42,28 +40,29 @@ services:
     image: nginx:alpine
     container_name: subnet-acl-nginx
     ports:
+      # Minimal deployment (v5 §2.2): the internal nginx is the exposed entry.
+      # In fullset the edge -nginx-acl is the entry; suppressing these host
+      # ports is deferred (v5 §14 — override/profile mechanics), so minimal and
+      # fullset share this base file and the internal confs are byte-identical.
       - "${NGINX_HTTP_PORT:-8080}:80"
       - "${NGINX_HTTPS_PORT:-8443}:443"
       - "${NGINX_STREAM_PORT:-8769}:7687"
     volumes:
       # Same-path bind-mount so htpasswd paths in generated confs resolve correctly
       - ${PROVISION_DIR:-/srv/provision_subnet_acl}:${PROVISION_DIR:-/srv/provision_subnet_acl}:ro
-      # Unified assembly + the three v4 dirs. GENERATED_DIR is mounted at
+      # Services-only assembly (v5 §5, §11.4): GENERATED_DIR is mounted at
       # /etc/nginx/services.d so the `include /etc/nginx/services.d/*.conf;`
-      # glob picks up the generated *.nginx.conf files.
+      # glob picks up the generated *.nginx.conf files. NO env.d / portal.d
+      # mounts — the portal and ACL moved to the edge -nginx-acl.
       - ./nginx.provision.conf:/etc/nginx/nginx.provision.conf:ro
-      - ${PROVISION_DIR:-/srv/provision_subnet_acl}/generated/env.d:/etc/nginx/env.d:ro
-      - ${PROVISION_DIR:-/srv/provision_subnet_acl}/generated/portal.d:/etc/nginx/portal.d:ro
       - ${PROVISION_DIR:-/srv/provision_subnet_acl}/generated:/etc/nginx/services.d:ro
     networks:
       - subnet_acl_shared
     environment:
       - GENERATED_DIR=${PROVISION_DIR:-/srv/provision_subnet_acl}/generated
     # envsubst substitutes only $GENERATED_DIR; all nginx $variables are left intact.
-    # mkdir -p guarantees the v4 dirs exist even before the generator writes them
-    # (an empty env.d/portal.d include passes nginx -t, F2/B12).
     command: >
-      /bin/sh -c "mkdir -p /etc/nginx/env.d /etc/nginx/portal.d /etc/nginx/services.d &&
+      /bin/sh -c "mkdir -p /etc/nginx/services.d &&
       envsubst '$$GENERATED_DIR' < /etc/nginx/nginx.provision.conf > /etc/nginx/nginx.conf && nginx -g 'daemon off;'"
     restart: unless-stopped
 

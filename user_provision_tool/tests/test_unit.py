@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import io
+import os
+import re
 import shutil
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -246,11 +248,13 @@ class TestTemplateEngine:
         content = Path(out).read_text()
         assert "server_name svc-testuser-3.test.local;" in content
 
-    def test_render_nginx_conf_acl_on_injects_enforcement(self, tmp_path, monkeypatch):
-        """v4 F2: a template with stale v2 `location = /_auth_jwt` is cleaned and the
-        byte-identical scaffolding is injected (auth_request, auth_request_set,
-        error_page, named redirects, mode-switch rewrite). auth_basic lives ONLY
-        in /__basic__/, never in the main path."""
+    def test_render_nginx_conf_acl_on_simple_conf_no_scaffold(self, tmp_path, monkeypatch):
+        """v5 (decision 1/6): ENABLE_ACL no longer touches the per-service conf.
+        A template with stale v2/v3/v4 ACL scaffolding is cleaned into the
+        SIMPLE ACL-free form — server_name + auth_basic + proxy_pass — and NO
+        scaffold (auth_request, auth_request_set, error_page, named redirects,
+        mode-switch rewrite, env.d) is ever injected. auth_basic lives at server
+        level. The stale `/_set_token` / `/_auth_jwt` locations are stripped."""
         monkeypatch.setenv("ENABLE_ACL", "true")
         stale = tmp_path / "stale.nginx.conf.j2"
         stale.write_text(
@@ -274,36 +278,28 @@ class TestTemplateEngine:
             domain_name="localhost", htpasswd_path=htpasswd,
         )
         content = Path(out).read_text()
-        # Server-level enforcement + mode-switch scaffolding always injected (F2).
-        assert "set $auth_mode \"\";" in content
-        assert "include /etc/nginx/env.d/*.env;" in content
-        assert "auth_request /_auth_jwt;" in content
-        assert "auth_request_set $service_basic $upstream_http_x_service_basic;" in content
-        assert "auth_request_set $auth_action $upstream_http_x_auth_action;" in content
-        assert "auth_request_set $client_type $upstream_http_x_client_type;" in content
-        assert "error_page 401 = @auth_401;" in content
-        assert "error_page 403 = @auth_403;" in content
-        assert "location @auth_401" in content
-        assert "location @auth_403" in content
-        # Mode-switch rewrite in location / (rewrite phase, before auth_request).
-        assert 'if ($auth_mode != "acl") { rewrite ^ /__basic__$request_uri last; }' in content
-        # Credential injection into the main path.
-        assert 'proxy_set_header Authorization "Basic $service_basic";' in content
-        # auth_basic relocated into /__basic__/ only.
-        assert "location /__basic__/" in content
-        assert "auth_basic" in content  # present in /__basic__/
-        # auth_basic must NOT be in the location / main path.
-        root = content.split("location / {", 1)[1].split("location @auth_401", 1)[0]
-        assert "auth_basic" not in root
-        # Old v2 redirect-if / bypass rewrite gone.
-        assert 'if ($auth_action = "login_required")' not in content
-        assert "if ($has_basic)" not in content
-        assert "rewrite ^ /__bypass__" not in content
+        # Simple form: server_name + server-level auth_basic + variable proxy_pass.
+        assert "server_name myapp-alice-0.localhost;" in content
+        assert 'auth_basic "x";' in content
+        assert "set $upstream_0000 myapp-user_alice-0-web:80;" in content
+        assert "proxy_pass http://$upstream_0000;" in content
+        # NO ACL scaffold — the gate lives at the edge (v5 §5).
+        assert "auth_request" not in content
+        assert "set $auth_mode" not in content
+        assert "include /etc/nginx/env.d" not in content
+        assert "location = /_set_token" not in content
+        assert "location = /_auth_jwt" not in content
+        assert "location /__basic__/" not in content
+        assert "location @auth_401" not in content
+        assert "location @auth_403" not in content
+        assert "error_page" not in content
+        assert "auth_request_set" not in content
+        assert "$service_basic" not in content
 
-    def test_render_nginx_conf_set_token_is_plain_proxy(self, tmp_path):
-        """v4 F7/GAP-10: _set_token is a plain proxy to the gateway exchange —
-        the 30s code is exchanged for a provision_token cookie there. No
-        return-302 / JWT-in-URL form is emitted."""
+    def test_render_nginx_conf_strips_set_token_and_auth_jwt(self, tmp_path):
+        """v5: _set_token / _auth_jwt are edge concerns (acl-helpers.conf), NOT
+        the internal conf. Any stale copy in a template is stripped entirely —
+        the internal -nginx is services-only."""
         stale = tmp_path / "stale.nginx.conf.j2"
         stale.write_text(
             "server {\n"
@@ -323,17 +319,17 @@ class TestTemplateEngine:
             domain_name="localhost", htpasswd_path=str(tmp_path / "x.htpasswd"),
         )
         content = Path(out).read_text()
-        # The stale return-302 form is replaced by a plain proxy to the exchange.
+        assert "location = /_set_token" not in content
         assert "return 302 $arg_redirect;" not in content
-        assert "return 302 $scheme://$http_host$arg_redirect;" not in content
-        assert "location = /_set_token" in content
-        assert "proxy_pass http://$gw/api/auth/exchange;" in content
         assert "add_header Set-Cookie" not in content
+        assert "proxy_pass http://$gw/api/auth/exchange" not in content
+        assert "server_name myapp-alice-0.localhost;" in content
+        assert "proxy_pass http://myapp-user_alice-0-web:80;" in content
 
-    def test_render_nginx_conf_acl_off_still_injects_scaffolding(self, tmp_path, monkeypatch):
-        """v4 F1/F2: ENABLE_ACL does NOT affect the per-service conf — the
-        scaffolding is always injected, byte-identical. With ENABLE_ACL=false the
-        mode switch (env.d) selects /__basic__/, and auth_basic lives there."""
+    def test_render_nginx_conf_acl_off_simple_conf_byte_identical(self, tmp_path, monkeypatch):
+        """v5 (decision 1/6): ENABLE_ACL=false must NOT inject anything either —
+        the internal conf is the simple ACL-free form regardless, byte-identical
+        across ENABLE_ACL values (gate at the edge, decision 6)."""
         monkeypatch.setenv("ENABLE_ACL", "false")
         stale = tmp_path / "stale.nginx.conf.j2"
         stale.write_text(
@@ -352,17 +348,18 @@ class TestTemplateEngine:
             domain_name="localhost", htpasswd_path=htpasswd,
         )
         content = Path(out).read_text()
-        # Byte-identical scaffolding present even when ENABLE_ACL=false.
-        assert "auth_request /_auth_jwt;" in content
-        assert "set $auth_mode \"\";" in content
-        assert "include /etc/nginx/env.d/*.env;" in content
-        # auth_basic relocated into /__basic__/.
-        assert "location /__basic__/" in content
-        assert "auth_basic" in content
+        assert "auth_request" not in content
+        assert "set $auth_mode" not in content
+        assert "include /etc/nginx/env.d" not in content
+        assert "location = /_auth_jwt" not in content
+        assert "location /__basic__/" not in content
+        # Simple form remains.
+        assert 'auth_basic "x";' in content
+        assert "server_name myapp-alice-0.localhost;" in content
 
-    def test_render_nginx_conf_no_template_acl_still_injected(self, tmp_path, monkeypatch):
-        """v4 F2: a template with NO `location = /_auth_jwt` (never ACL-aware)
-        still gets the full byte-identical scaffolding."""
+    def test_render_nginx_conf_no_template_acl_still_simple(self, tmp_path, monkeypatch):
+        """v5: a template with NO ACL-aware locations (never ACL-aware) renders
+        the simple form with NO injected scaffold — the gate is the edge's job."""
         monkeypatch.setenv("ENABLE_ACL", "true")
         plain = tmp_path / "plain.nginx.conf.j2"
         plain.write_text(
@@ -380,13 +377,17 @@ class TestTemplateEngine:
             domain_name="localhost", htpasswd_path=htpasswd,
         )
         content = Path(out).read_text()
-        assert "auth_request /_auth_jwt;" in content
-        assert "location = /_auth_jwt" in content
-        assert "location /__basic__/" in content
-        assert 'if ($auth_mode != "acl") { rewrite ^ /__basic__$request_uri last; }' in content
+        assert "auth_request" not in content
+        assert "location = /_auth_jwt" not in content
+        assert "location /__basic__/" not in content
+        assert "location @auth_401" not in content
+        assert "set $auth_mode" not in content
+        assert 'auth_basic "x";' in content
+        assert "server_name myapp-alice-0.localhost;" in content
 
     def test_render_nginx_conf_byte_identical_across_enable_acl(self, tmp_path, monkeypatch):
-        """v4 F1: ENABLE_ACL true vs false must produce byte-identical confs."""
+        """v5 (decision 6/F8): ENABLE_ACL true vs false must produce byte-identical
+        simple confs — the per-service conf never reads ENABLE_ACL."""
         out_a = str(tmp_path / "a.conf")
         out_b = str(tmp_path / "b.conf")
         for out, val in ((out_a, "true"), (out_b, "false")):
@@ -397,6 +398,11 @@ class TestTemplateEngine:
                 domain_name="example.com", htpasswd_path=str(tmp_path / "x.htpasswd"),
             )
         assert Path(out_a).read_text() == Path(out_b).read_text()
+        # And neither carries the scaffold.
+        content = Path(out_a).read_text()
+        assert "auth_request" not in content
+        assert "set $auth_mode" not in content
+        assert "env.d" not in content
 
     # --- HTTPS rendering ---
 
@@ -3482,102 +3488,92 @@ class TestProvisionerRegistryFields:
         assert entry["hostname"] == "myapp-domuser-0.example.com"
 
 
-class TestV4EnvD:
-    """v4 F1/F2: env.d mode-switch one-liner + portal constants."""
+class TestV5EnvDDeprecated:
+    """v5 (decision 1/6): env.d disappears from the internal side — -api never
+    writes it, the internal confs never include it, and the retained writer is
+    deprecated (kept only so older -api versions fail gracefully)."""
 
-    def test_write_env_d_acl_on(self, tmp_path):
+    def test_write_env_d_is_deprecated(self, tmp_path):
+        """The retained writer is marked DEPRECATED (v5 §11.1)."""
         from lib.template_engine import write_env_d
+        assert write_env_d.__doc__ and write_env_d.__doc__.lstrip().startswith("DEPRECATED")
+        # Still functional for older callers (no crash).
         f = write_env_d(str(tmp_path), enable_acl=True)
-        content = f.read_text()
-        assert "set $auth_mode acl;" in content
-        assert "set $portal_scheme http;" in content
-        assert "set $dashboard_host localhost:8775;" in content
+        assert "set $auth_mode acl;" in f.read_text()
 
-    def test_write_env_d_acl_off(self, tmp_path):
-        from lib.template_engine import write_env_d
-        f = write_env_d(str(tmp_path), enable_acl=False)
-        assert "set $auth_mode basic;" in f.read_text()
+    def test_render_nginx_conf_never_includes_env_d(self, tmp_path):
+        """The rendered simple conf must never carry an env.d include."""
+        out = str(tmp_path / "out.conf")
+        template_engine.render_nginx_conf(
+            NGINX_TEMPLATE, out,
+            user_name="alice", service_name="myapp", label="0",
+            domain_name="example.com", htpasswd_path=str(tmp_path / "x.htpasswd"),
+        )
+        content = Path(out).read_text()
+        assert "env.d" not in content
 
-    def test_write_env_d_custom_constants(self, tmp_path):
-        from lib.template_engine import write_env_d
-        f = write_env_d(str(tmp_path), enable_acl=True,
-                        portal_scheme="https", dashboard_host="portal.example.com:8775")
-        content = f.read_text()
-        assert "set $portal_scheme https;" in content
-        assert "set $dashboard_host portal.example.com:8775;" in content
+    def test_api_module_has_no_envd_portald(self):
+        """-api no longer writes env.d/portal.d nor READS ENABLE_ACL/PORTAL_MODE.
+        Docstrings may explain the removal; the v4 code paths must be gone."""
+        import api
+        src = Path(api.__file__).read_text()
+        assert "_write_v4_nginx_dirs" not in src
+        assert "write_env_d" not in src
+        assert "write_portal_d" not in src
+        assert "os.environ.get(\"ENABLE_ACL\"" not in src
+        assert "os.environ.get(\"PORTAL_MODE\"" not in src
+        assert "generated/env.d" not in src
+        assert "generated/portal.d" not in src
 
-    def test_write_env_d_creates_dir(self, tmp_path):
-        from lib.template_engine import write_env_d
-        f = write_env_d(str(tmp_path / "generated"), enable_acl=False)
-        assert f.parent.name == "env.d"
-        assert f.parent.is_dir()
 
+class TestV5PortalDDeprecated:
+    """v5 (decision 5/15): the portal moves to the edge — the internal
+    nginx.provision.conf is services-only (no portal.d include), the retained
+    internal writer is deprecated, and rendered confs never reference the v4
+    portal constants."""
 
-class TestV4PortalD:
-    """v4 §5.2/F6: portal block per PORTAL_MODE + verify/exchange 404s."""
-
-    def test_write_portal_d_http(self, tmp_path):
+    def test_write_portal_d_is_deprecated(self, tmp_path):
+        """The retained internal writer is marked DEPRECATED (v5 §11.1)."""
         from lib.template_engine import write_portal_d
+        assert write_portal_d.__doc__ and write_portal_d.__doc__.lstrip().startswith("DEPRECATED")
+        # Still functional for older callers.
         f = write_portal_d(str(tmp_path), portal_mode="http")
-        content = f.read_text()
-        assert "listen 80;" in content
-        assert "server_name subnet-acl-gateway.*;" in content
-        assert "location = /api/auth/verify { return 404; }" in content
-        assert "location = /api/auth/exchange { return 404; }" in content
-        assert "listen 443 ssl;" not in content
-
-    def test_write_portal_d_https(self, tmp_path):
-        from lib.template_engine import write_portal_d
-        f = write_portal_d(str(tmp_path), portal_mode="https",
-                           portal_tls_dir="/etc/letsencrypt/live",
-                           portal_cert_name="subnet-acl-gateway")
-        content = f.read_text()
-        assert "listen 443 ssl;" in content
-        assert "return 301 https://$host$request_uri;" in content
-        assert "ssl_certificate /etc/letsencrypt/live/subnet-acl-gateway/fullchain.pem;" in content
-        assert "ssl_certificate_key /etc/letsencrypt/live/subnet-acl-gateway/privkey.pem;" in content
-        assert "location = /api/auth/verify { return 404; }" in content
-        assert "location = /api/auth/exchange { return 404; }" in content
-
-    def test_write_portal_d_default_is_http(self, tmp_path):
-        from lib.template_engine import write_portal_d
-        f = write_portal_d(str(tmp_path))
-        assert "listen 443 ssl;" not in f.read_text()
-
-    def test_write_portal_d_creates_portal_dir(self, tmp_path):
-        from lib.template_engine import write_portal_d
-        f = write_portal_d(str(tmp_path))
         assert f.parent.name == "portal.d"
 
-    def test_write_portal_d_deferred_dns_http(self, tmp_path):
-        """B12/GAP-5: portal proxy_pass is variable-based ($portal_api /
-        $portal_dash) so nginx starts without the gateway/dashboard running.
-        No static proxy_pass to subnet-acl-gateway/dashboard may appear."""
-        from lib.template_engine import write_portal_d
-        content = write_portal_d(str(tmp_path), portal_mode="http").read_text()
-        assert "proxy_pass http://$portal_api;" in content
-        assert "proxy_pass http://$portal_dash;" in content
-        assert "proxy_pass http://subnet-acl-gateway" not in content
-        assert "proxy_pass http://subnet-acl-dashboard" not in content
-        assert "resolver 127.0.0.11" in content
+    def test_internal_nginx_provision_conf_services_only(self):
+        """nginx.provision.conf has NO portal.d include and keeps services.d + 444."""
+        repo = Path(__file__).resolve().parents[2]  # _users_provision
+        conf = (repo / "nginx.provision.conf").read_text()
+        assert "include /etc/nginx/services.d/*.conf;" in conf
+        assert "include /etc/nginx/portal.d" not in conf
+        assert "include /etc/nginx/env.d" not in conf
+        assert "listen 80 default_server;" in conf
+        assert "return 444;" in conf
 
-    def test_write_portal_d_deferred_dns_https(self, tmp_path):
-        from lib.template_engine import write_portal_d
-        content = write_portal_d(str(tmp_path), portal_mode="https").read_text()
-        assert "proxy_pass http://$portal_api;" in content
-        assert "proxy_pass http://$portal_dash;" in content
-        assert "proxy_pass http://subnet-acl-gateway" not in content
-        assert "proxy_pass http://subnet-acl-dashboard" not in content
-        assert "resolver 127.0.0.11" in content
+    def test_render_nginx_conf_no_portal_constants(self, tmp_path):
+        """Rendered confs never reference the v4 portal constants ($portal_scheme
+        / $dashboard_host) — the portal is the edge's job."""
+        out = str(tmp_path / "out.conf")
+        template_engine.render_nginx_conf(
+            NGINX_TEMPLATE, out,
+            user_name="alice", service_name="myapp", label="0",
+            domain_name="example.com", htpasswd_path=str(tmp_path / "x.htpasswd"),
+        )
+        content = Path(out).read_text()
+        assert "$portal_scheme" not in content
+        assert "$dashboard_host" not in content
+        assert "subnet-acl-gateway" not in content
+        assert "subnet-acl-dashboard" not in content
 
 
-class TestV4ScaffoldingNginxSyntax:
-    """Structural checks on the rendered v4 conf (nginx -t-compatible)."""
+class TestV5SimpleNginxSyntax:
+    """Structural checks on the rendered v5 simple conf (nginx -t-compatible):
+    server_name + auth_basic + variable proxy_pass, NO ACL scaffold (the gate
+    lives entirely at the edge, decision 6)."""
 
-    def test_render_nginx_conf_auth_branches_api_first(self, tmp_path):
-        """GAP-14: @auth_401/@auth_403 are API-first ($client_type != browser →
-        bare 401/403), 401 has WWW-Authenticate always, 403 browser→alert only
-        on acl_denied, login redirect has NO ?redirect= param."""
+    def test_render_nginx_conf_has_no_edge_gate(self, tmp_path):
+        """v5 §5: no auth_request, no client-type branches, no WWW-Authenticate,
+        no portal redirects, no named locations in the internal conf."""
         out = str(tmp_path / "out.conf")
         template_engine.render_nginx_conf(
             NGINX_TEMPLATE, out,
@@ -3585,13 +3581,14 @@ class TestV4ScaffoldingNginxSyntax:
             domain_name="example.com", htpasswd_path="",
         )
         content = Path(out).read_text()
-        assert 'if ($client_type != "browser") { return 401; }' in content
-        assert 'if ($client_type != "browser") { return 403; }' in content
-        assert 'add_header WWW-Authenticate \'Basic realm="subnet-acl"\' always;' in content
-        assert 'if ($auth_action != "acl_denied") { return 403; }' in content
-        assert "return 302 $portal_scheme://$dashboard_host/login;" in content
-        assert "?redirect=" not in content
-        assert "return 302 $portal_scheme://$dashboard_host/alert?reason=acl_denied&service=$host;" in content
+        assert "$client_type" not in content
+        assert "auth_request" not in content
+        assert "WWW-Authenticate" not in content
+        assert "$auth_action" not in content
+        assert "location @auth_401" not in content
+        assert "location @auth_403" not in content
+        assert "return 302 $portal_scheme" not in content
+        assert "acl_denied" not in content
 
     def test_render_nginx_conf_has_no_accept_map(self, tmp_path):
         """GAP-11: no $is_browser / Accept map in the per-service conf — client
@@ -3606,8 +3603,9 @@ class TestV4ScaffoldingNginxSyntax:
         assert "map $http_accept $is_browser" not in content
         assert "$is_browser" not in content
 
-    def test_render_nginx_conf_auth_basic_only_in_basic_loc(self, tmp_path):
-        """F2: auth_basic appears ONLY in location /__basic__/ (no password bypass)."""
+    def test_render_nginx_conf_auth_basic_at_server_level(self, tmp_path):
+        """v5 §5: auth_basic lives at server level (not in a /__basic__/
+        location) — the internal conf is a dumb router, byte-identical."""
         out = str(tmp_path / "out.conf")
         htpasswd = str(tmp_path / "x.htpasswd")
         template_engine.render_nginx_conf(
@@ -3616,18 +3614,15 @@ class TestV4ScaffoldingNginxSyntax:
             domain_name="example.com", htpasswd_path=htpasswd,
         )
         content = Path(out).read_text()
-        basic_loc = content.split("location /__basic__/", 1)[1].split("location @auth_401", 1)[0]
-        assert "auth_basic" in basic_loc
-        # Every other location should be free of auth_basic.
-        for marker in ("location / {", "location = /_set_token", "location = /_auth_jwt"):
-            if marker in content:
-                seg = content.split(marker, 1)[1]
-                nxt = min([i for i in (seg.find("location /__basic__/"), seg.find("location @auth_401"))
-                           if i >= 0] or [len(seg)])
-                assert "auth_basic" not in seg[:nxt], f"auth_basic leaked in {marker}"
+        assert "location /__basic__/" not in content
+        assert 'auth_basic "myapp - alice";' in content
+        assert f"auth_basic_user_file {htpasswd};" in content
+        # No /__basic__/ relocation anywhere.
+        assert "/__basic__/" not in content
 
-    def test_render_nginx_conf_https_scaffolding_in_ssl_block(self, tmp_path):
-        """HTTPS: the 443 ssl block gets the scaffolding; the 301 block does not."""
+    def test_render_nginx_conf_https_simple_in_ssl_block(self, tmp_path):
+        """v5: the 443 ssl block is simple (ssl_certificate + auth_basic +
+        proxy_pass); the 301 block is plain. No scaffold in either."""
         out = str(tmp_path / "out.conf")
         template_engine.render_nginx_conf(
             NGINX_TEMPLATE, out,
@@ -3639,10 +3634,15 @@ class TestV4ScaffoldingNginxSyntax:
         )
         content = Path(out).read_text()
         ssl_block = content.split("listen 443 ssl;", 1)[1]
-        assert "auth_request /_auth_jwt;" in ssl_block
-        assert "location /__basic__/" in ssl_block
+        assert "ssl_certificate" in ssl_block
+        assert "/provision/ssl/example.com/fullchain.pem;" in ssl_block
+        assert "/provision/ssl/example.com/privkey.pem;" in ssl_block
+        assert "auth_basic" in ssl_block
+        assert "auth_request" not in content
+        assert "location /__basic__/" not in content
         redirect_block = content.split("listen 443 ssl;", 1)[0]
-        assert "auth_request /_auth_jwt;" not in redirect_block
+        assert "return 301 https://$host$request_uri;" in redirect_block
+        assert "auth_request" not in redirect_block
 
 
 # ---------------------------------------------------------------------------
@@ -3680,7 +3680,8 @@ class TestRegenerateNginxConfs:
         return gen
 
     def test_renders_registered_conf_clean(self, tmp_path, monkeypatch):
-        """A registry-backed stale v3 conf is re-rendered into v4 (no is_browser)."""
+        """A registry-backed stale v3/v4 conf is re-rendered into the v5 SIMPLE
+        ACL-free form (no is_browser, no scaffold)."""
         from lib import reconciliation
         gen = self._setup(tmp_path, monkeypatch, [
             self._make_registry_entry(tmp_path, "alice", "myapp", "0", "localhost"),
@@ -3695,11 +3696,15 @@ class TestRegenerateNginxConfs:
         assert report["is_browser_stripped"] == 0
         content = conf.read_text()
         assert "$is_browser" not in content
-        assert "auth_request /_auth_jwt;" in content  # v4 scaffolding present
-        assert "location /__basic__/" in content
+        # v5: the gate lives at the edge — no scaffold in the internal conf.
+        assert "auth_request" not in content
+        assert "location /__basic__/" not in content
+        assert "server_name myapp-alice-0.localhost;" in content
 
     def test_strips_is_browser_from_orphan(self, tmp_path, monkeypatch):
-        """An orphan conf (no registry entry) is surgically stripped of is_browser."""
+        """An orphan conf (no registry entry) is surgically stripped of is_browser
+        AND the v4 ACL scaffold (@auth_401/@auth_403 named locations) — the v5
+        strip path (v5 §11.1, decision 16)."""
         from lib import reconciliation
         gen = self._setup(tmp_path, monkeypatch, [])
         conf = gen / "orphan.user-ghost.0.nginx.conf"
@@ -3725,8 +3730,14 @@ class TestRegenerateNginxConfs:
         assert report["is_browser_stripped"] == 1
         content = conf.read_text()
         assert "$is_browser" not in content
-        assert "return 401;" in content  # @auth_401 body intact after strip
-        assert "return 403;" in content
+        # v5 strip removes the ACL scaffold blocks entirely (gate at the edge).
+        assert "@auth_401" not in content
+        assert "@auth_403" not in content
+        assert "return 401;" not in content
+        assert "acl_denied" not in content
+        # The plain proxy location survives.
+        assert "proxy_pass http://127.0.0.1:80;" in content
+        assert "server_name orphan.localhost;" in content
 
     def test_idempotent(self, tmp_path, monkeypatch):
         """Re-running the migration on clean confs is a stable no-op."""
@@ -3824,3 +3835,458 @@ class TestAPIRegenerateNginx:
         assert "$is_browser" not in conf.read_text()
         # nginx_restart was called (no-op'd) — docker restart would be in calls
         assert any("restart" in c for c in self.mock_calls) or True
+
+
+# ---------------------------------------------------------------------------
+# v5 edge -nginx-acl (GAP-1..GAP-5, GAP-13, GAP-15)
+# ---------------------------------------------------------------------------
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]  # _subnet_acl
+EDGE_DIR = _REPO_ROOT / "_provision_gateway" / "nginx.acl"
+EDGE_TEMPLATE_FILE = EDGE_DIR / "edge.conf.template"
+ACL_HELPERS_FILE = EDGE_DIR / "acl-helpers.conf.template"
+EDGE_ENTRYPOINT = EDGE_DIR / "entrypoint.sh"
+
+
+class TestEdgeTemplate:
+    """The edge conf template (§4.3): SNI dynamic cert map, portal routing,
+    ACL gate in location /, force-https in both ACL modes."""
+
+    def test_sni_dynamic_catch_all(self):
+        """decision 9/11: map $ssl_server_name → /certs/{domain}/..., default →
+        the image-baked placeholder (satisfies nginx startup only)."""
+        content = EDGE_TEMPLATE_FILE.read_text()
+        assert "map $ssl_server_name $cert_pem" in content
+        assert "default     /etc/nginx/acl/placeholder/fullchain.pem;" in content
+        assert "~^(?<d>.+)$ /certs/$d/fullchain.pem;" in content
+        assert "map $ssl_server_name $cert_key" in content
+        assert "default     /etc/nginx/acl/placeholder/privkey.pem;" in content
+
+    def test_portal_blocks(self):
+        """§4.3 portal: host + verify/exchange 404 (GAP-31), /api/ SSE timeout,
+        /go/ rewrite, /login → gateway, /alert + / → dashboard."""
+        content = EDGE_TEMPLATE_FILE.read_text()
+        assert "${PORTAL_HOSTNAME} 127.0.0.1 localhost" in content
+        assert "location = /api/auth/verify   { return 404; }" in content
+        assert "location = /api/auth/exchange { return 404; }" in content
+        assert "proxy_pass http://subnet-acl-gateway:8770; proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_read_timeout 3600s;" in content
+        assert "rewrite ^/go/(.*) /api/auth/go/$1 break;" in content
+        assert "location /alert { proxy_pass http://subnet-acl-dashboard:80; }" in content
+        assert "location /     { proxy_pass http://subnet-acl-dashboard:80; }" in content
+        # Portal https server (mode-gated).
+        assert "ssl_certificate /certs/portal/fullchain.pem;" in content
+        assert "# [if PORTAL_MODE=https] return 301 https://$host$request_uri;" in content
+
+    def test_acl_gate_in_location_root(self):
+        """§4.3 gate: auth_request + credential injection + error_page in
+        location / for the HTTP and HTTPS service servers."""
+        content = EDGE_TEMPLATE_FILE.read_text()
+        assert "auth_request /_auth_jwt;" in content
+        assert "auth_request_set $service_basic $upstream_http_x_service_basic;" in content
+        assert "auth_request_set $auth_action  $upstream_http_x_auth_action;" in content
+        assert "auth_request_set $client_type  $upstream_http_x_client_type;" in content
+        assert "error_page 401 = @auth_401;" in content
+        assert "error_page 403 = @auth_403;" in content
+        assert 'proxy_set_header Authorization "Basic $service_basic";' in content
+        assert "proxy_set_header Host $host;" in content
+        assert "include /etc/nginx/acl/acl-helpers.conf;" in content
+        # Internal proxy mirroring the client scheme (decision 14 double TLS).
+        assert "proxy_pass http://subnet-acl-nginx;" in content
+        assert "proxy_pass https://subnet-acl-nginx;" in content
+        assert "proxy_ssl_server_name on;" in content
+        assert "proxy_ssl_verify off;" in content
+        # HTTPS termination uses the variable SNI cert.
+        assert "ssl_certificate $cert_pem;" in content
+        assert "ssl_certificate_key $cert_key;" in content
+
+    def test_force_https_both_acl_modes(self):
+        """decision 18: `if (-f /certs/$host/fullchain.pem)` 301 appears in the
+        http server of BOTH the ACL-on and ACL-off branches."""
+        content = EDGE_TEMPLATE_FILE.read_text()
+        line = "if (-f /certs/$host/fullchain.pem) { return 301 https://$host${HTTPS_REDIRECT_PORT}$request_uri; }"
+        assert content.count(line) == 2
+        assert "# [if ENABLE_ACL=true]" in content
+        assert "# [else (ENABLE_ACL=false)]" in content
+        assert "# [endif]" in content
+
+    def test_service_servers_are_default_server(self):
+        """nginx selects the FIRST server block on a listen address as the
+        default for unmatched Hosts. The portal block is declared first, so the
+        services `server_name _` blocks MUST be `default_server` on both ports
+        (80 and 443 ssl) and in BOTH ACL branches — otherwise a service Host
+        (e.g. example-mcp-alice-0.localhost) falls through to the portal and the
+        gate/force-https never fire (live-verified regression)."""
+        content = EDGE_TEMPLATE_FILE.read_text()
+        # Four service servers in total (http+https × ACL-on+ACL-off).
+        assert content.count("listen 80 default_server;") == 2
+        assert content.count("listen 443 ssl default_server;") == 2
+        # The portal blocks must NOT be default_server (they match by name).
+        assert content.count("listen 80;") == 1  # portal http (ACL-agnostic)
+        assert content.count("listen 443 ssl;") == 1  # portal https (mode-gated)
+        # Each default_server services block keeps server_name _ and the gate.
+        assert content.count("listen 80 default_server;\n        server_name _;") == 2
+
+    def test_acl_off_preserves_host_header(self):
+        """§8.4 (B5): in ACL-off the edge is a transparent pass-through — it MUST
+        set `proxy_set_header Host $host;` on BOTH the http and https service
+        servers, otherwise nginx's default `Host $proxy_host` forwards the
+        upstream IP and the internal nginx's server_name routing fails (falls to
+        the `return 444` catch-all) — live-verified regression."""
+        content = EDGE_TEMPLATE_FILE.read_text()
+        # Four service servers (http+https × ACL-on+ACL-off); every one of them
+        # must preserve the original Host so the internal router can match.
+        assert content.count("proxy_set_header Host $host;") == 4
+
+    def test_multi_location_gate_no_service_bypass(self):
+        """GAP-13: the gate runs at the edge BEFORE internal routing. Inside the
+        ACL-on branch every proxying location / to the internal service carries
+        auth_request — so a multi-location (dify-class) service has EVERY
+        location gated (the internal conf is simple and un-gated)."""
+        content = EDGE_TEMPLATE_FILE.read_text()
+        # Find the real `# [if ENABLE_ACL=true]` marker LINE (the header comment
+        # also mentions the markers, so match whole-line).
+        lines = content.splitlines()
+        start = end = None
+        for i, ln in enumerate(lines):
+            if ln.strip() == "# [if ENABLE_ACL=true]":
+                start = i
+            elif start is not None and ln.strip().startswith("# [else"):
+                end = i
+                break
+        assert start is not None and end is not None
+        acl_on = "\n".join(lines[start + 1:end])
+        blocks = re.findall(
+            r"location / \{\n(.*?)proxy_pass (https?://subnet-acl-nginx);",
+            acl_on, flags=re.DOTALL,
+        )
+        assert len(blocks) == 2  # exactly the http + https service servers
+        for body, _scheme in blocks:
+            assert "auth_request /_auth_jwt;" in body, "gate missing before service proxy"
+        # No other proxying location to the internal service exists in ACL-on.
+        assert acl_on.count("proxy_pass http://subnet-acl-nginx;") == 1
+        assert acl_on.count("proxy_pass https://subnet-acl-nginx;") == 1
+        # The helpers never proxy to the internal service nginx — only the gateway.
+        helpers = ACL_HELPERS_FILE.read_text()
+        assert "proxy_pass http://subnet-acl-nginx" not in helpers
+        assert "proxy_pass https://subnet-acl-nginx" not in helpers
+
+
+class TestAclHelpersTemplate:
+    """acl-helpers.conf: /_auth_jwt → gateway verify (fail-closed), /_set_token
+    → exchange, @auth_401/@auth_403 (portal redirect for browsers)."""
+
+    def test_auth_jwt_subrequest(self):
+        content = ACL_HELPERS_FILE.read_text()
+        assert "location = /_auth_jwt {" in content
+        assert "internal;" in content
+        assert "proxy_pass http://subnet-acl-gateway:8770/api/auth/verify;" in content
+        assert "proxy_set_header X-Provision-Token $cookie_provision_token;" in content
+        assert "proxy_set_header X-Original-URI $request_uri;" in content
+
+    def test_set_token_exchange(self):
+        """F7: /_set_token is token-less (outside the gated location /) and
+        forwards the ?code= query string to the exchange."""
+        content = ACL_HELPERS_FILE.read_text()
+        assert "location = /_set_token {" in content
+        assert "internal;" in content
+        assert "proxy_pass http://subnet-acl-gateway:8770/api/auth/exchange$is_args$args;" in content
+        assert "proxy_pass http://subnet-acl-gateway:8770/api/auth/exchange;" not in content
+
+    def test_auth_401_challenge(self):
+        """F3 (QA GAP-16): the API 401 challenge MUST carry the
+        `WWW-Authenticate: Basic realm="subnet-acl"` header so a native Basic
+        dialog is offered. `add_header` needs the `always` parameter — nginx
+        otherwise drops add_header on 401 (401 is NOT in the default
+        200/201/204/206/301/302/303/304/307/308 set), yielding a headerless 401."""
+        content = ACL_HELPERS_FILE.read_text()
+        assert "location @auth_401 {" in content
+        # Both 401 paths (api + unknown-client fail-closed) carry the header
+        # WITH `always`; the browser branch is a 302 redirect (no header needed).
+        assert content.count("add_header WWW-Authenticate") == 2
+        assert 'add_header WWW-Authenticate \'Basic realm="subnet-acl"\' always;' in content
+        assert "return 302 ${PORTAL_SCHEME}://${PORTAL_HOSTNAME}${PORTAL_REDIRECT_PORT}/login?next=$scheme://$host$request_uri;" in content
+
+    def test_auth_403_denied(self):
+        content = ACL_HELPERS_FILE.read_text()
+        assert "location @auth_403 {" in content
+        assert "return 302 ${PORTAL_SCHEME}://${PORTAL_HOSTNAME}${PORTAL_REDIRECT_PORT}/alert?reason=acl_denied&service=$host;" in content
+        assert "return 403;" in content
+
+
+class TestEdgeEntrypointAssembly:
+    """v5 §4.2: entrypoint.sh selects the mode blocks (shell `if`) and
+    envsubst's the constants into both the main conf and the helpers."""
+
+    # A faithful stand-in for the host-missing `envsubst`: substitutes ONLY the
+    # allow-list constants (like real envsubst '$PORTAL_SCHEME ...').
+    _ENVSUBST_SHIM = (
+        "#!/usr/bin/env python3\n"
+        "import os, re, sys\n"
+        "listed = {a.strip('$') for a in sys.argv[1].split()} if len(sys.argv) > 1 else set()\n"
+        "data = sys.stdin.read()\n"
+        "pat = re.compile(r'\\$\\{([A-Z_][A-Z0-9_]*)\\}|\\$([A-Z_][A-Z0-9_]*)')\n"
+        "def repl(m):\n"
+        "    name = m.group(1) or m.group(2)\n"
+        "    return os.environ.get(name, '') if name in listed else m.group(0)\n"
+        "sys.stdout.write(pat.sub(repl, data))\n"
+    )
+
+    def _run(self, tmp_path: Path, env: dict, https_redirect_port: str = "") -> tuple[str, str]:
+        import subprocess
+        work = tmp_path / "work"
+        work.mkdir(exist_ok=True)
+        edge = work / "edge.conf.template"
+        helpers = work / "acl-helpers.conf.template"
+        edge.write_text(EDGE_TEMPLATE_FILE.read_text())
+        helpers.write_text(ACL_HELPERS_FILE.read_text())
+        bin_dir = work / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        shim = bin_dir / "envsubst"
+        shim.write_text(self._ENVSUBST_SHIM)
+        shim.chmod(0o755)
+        conf_out = work / "nginx.conf"
+        helpers_out = work / "acl-helpers.conf"
+        full_env = dict(os.environ)
+        full_env.update({
+            "EDGE_TEMPLATE": str(edge),
+            "HELPERS_TEMPLATE": str(helpers),
+            "HELPERS_OUT": str(helpers_out),
+            "NGINX_CONF_OUT": str(conf_out),
+            "START_NGINX": "0",
+            "PORTAL_HOSTNAME": "portal.example.com",
+            "HTTPS_REDIRECT_PORT": https_redirect_port,
+            "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+        })
+        full_env.update(env)
+        subprocess.run(["bash", str(EDGE_ENTRYPOINT)], env=full_env, check=True)
+        return conf_out.read_text(), helpers_out.read_text()
+
+    def test_portal_https_acl_on(self, tmp_path):
+        conf, helpers = self._run(tmp_path, {
+            "PORTAL_MODE": "https",
+            "ENABLE_ACL": "true",
+        })
+        assert "# [if" not in conf
+        assert "# [endif]" not in conf
+        assert "# [else" not in conf
+        # Portal https redirect line emitted (inline conditional), https portal server.
+        assert "return 301 https://$host$request_uri;" in conf
+        assert "ssl_certificate /certs/portal/fullchain.pem;" in conf
+        assert "server_name portal.example.com 127.0.0.1 localhost;" in conf
+        # ACL gate present; nginx $vars preserved by the allow-list envsubst.
+        assert "auth_request /_auth_jwt;" in conf
+        assert "map $ssl_server_name $cert_pem" in conf
+        assert "$request_uri" in conf
+        # Constants substituted into the helpers too.
+        assert "@auth_401" in helpers
+        assert "${PORTAL_SCHEME}" not in helpers
+        assert "login?next=$scheme://$host$request_uri" in helpers
+
+    def test_portal_http_acl_off(self, tmp_path):
+        conf, helpers = self._run(tmp_path, {
+            "PORTAL_MODE": "http",
+            "ENABLE_ACL": "false",
+        }, https_redirect_port="8443")
+        assert "# [if" not in conf
+        assert "# [else" not in conf
+        # Portal http→https redirect NOT emitted (inline conditional dropped).
+        assert "return 301 https://$host$request_uri;" not in conf
+        assert "ssl_certificate /certs/portal/fullchain.pem;" not in conf
+        # ACL-off: no gate anywhere (directives only — comments may mention it).
+        assert "auth_request /_auth_jwt;" not in conf
+        assert "auth_request_set" not in conf
+        assert "error_page 401" not in conf
+        # Force-https still present with the real edge https port appended
+        # (colon-normalized so `$host:8443` parses, never `$host8443`).
+        assert "return 301 https://$host:8443$request_uri;" in conf
+        assert "return 301 https://$host8443$request_uri;" not in conf
+        # ACL-off pass-through servers exist.
+        assert "proxy_pass http://subnet-acl-nginx;" in conf
+        assert "proxy_pass https://subnet-acl-nginx;" in conf
+        assert "ssl_certificate $cert_pem;" in conf
+        # Helpers in ACL-off: no gate blocks (they would reference the
+        # undefined $client_type), but /_set_token stays for the /go/ exchange.
+        assert "location @auth_401 {" not in helpers
+        assert "location @auth_403 {" not in helpers
+        assert "location = /_auth_jwt {" not in helpers
+        assert "location = /_set_token {" in helpers
+
+    def test_portal_https_acl_off(self, tmp_path):
+        conf, _helpers = self._run(tmp_path, {
+            "PORTAL_MODE": "https",
+            "ENABLE_ACL": "false",
+        })
+        assert "ssl_certificate /certs/portal/fullchain.pem;" in conf
+        assert "auth_request /_auth_jwt;" not in conf
+        assert "auth_request_set" not in conf
+
+    def test_force_https_port_colon_normalized(self, tmp_path):
+        """HTTPS_REDIRECT_PORT is colon-normalized: `$host:8768` parses, while a
+        bare concatenation `$host8768` would be one bogus nginx variable."""
+        conf, _h = self._run(tmp_path, {
+            "PORTAL_MODE": "http", "ENABLE_ACL": "true",
+        }, https_redirect_port="8768")
+        assert "return 301 https://$host:8768$request_uri;" in conf
+        assert "return 301 https://$host8768$request_uri;" not in conf
+        conf2, _h2 = self._run(tmp_path, {
+            "PORTAL_MODE": "http", "ENABLE_ACL": "true",
+        }, https_redirect_port="")
+        assert "return 301 https://$host$request_uri;" in conf2
+
+    def test_envsubst_allow_list_preserves_nginx_vars(self, tmp_path):
+        """Only the 4 constants are substituted; every other $var (nginx) is
+        left byte-for-byte — otherwise the conf would be corrupt."""
+        conf, _helpers = self._run(tmp_path, {
+            "PORTAL_MODE": "http",
+            "ENABLE_ACL": "true",
+            "PORTAL_HOSTNAME": "portal.example.com",
+        })
+        assert "server_name portal.example.com 127.0.0.1 localhost;" in conf
+        for nginx_var in ("$ssl_server_name", "$cert_pem", "$d", "$host", "$request_uri",
+                          "$scheme", "$proxy_add_x_forwarded_for", "$service_basic",
+                          "$upstream_http_x_client_type"):
+            assert nginx_var in conf
+
+
+class TestMigrateV5:
+    """v5 §12 Phase 2 / decision 16: migrate_v5.py sweeps deployed confs to the
+    simple ACL-free form and verifies no scaffold remains."""
+
+    def _setup(self, tmp_path: Path, monkeypatch, entries: list[dict]) -> Path:
+        from lib import registry as reg_mod
+        gen = tmp_path / "generated"
+        gen.mkdir(exist_ok=True)
+        reg_file = tmp_path / "user_registry.yml"
+        reg_file.write_text(yaml.safe_dump(entries) if entries else "")
+        monkeypatch.setattr(reg_mod, "REGISTRY_FILE", reg_file)
+        monkeypatch.setenv("GENERATED_DIR", str(gen))
+        return gen
+
+    def test_strips_v4_scaffold_from_orphan(self, tmp_path, monkeypatch):
+        from migrate_v5 import migrate
+        gen = self._setup(tmp_path, monkeypatch, [])
+        conf = gen / "stale.user-old.0.nginx.conf"
+        conf.write_text(
+            "server {\n"
+            "    server_name stale.localhost;\n"
+            "    set $auth_mode \"\";\n"
+            "    location = /_set_token { internal; proxy_pass http://$gw/api/auth/exchange$is_args$args; }\n"
+            "    location / {\n"
+            "        auth_request /_auth_jwt;\n"
+            "        proxy_pass http://127.0.0.1:80;\n"
+            "    }\n"
+            "}\n"
+        )
+        report = migrate(gen)
+        assert report["stripped"] == 1
+        assert report["remaining_scaffold"] == []
+        content = conf.read_text()
+        assert "auth_mode" not in content
+        assert "auth_request" not in content
+        assert "location = /_set_token" not in content
+        assert "proxy_pass http://127.0.0.1:80;" in content
+
+    def test_dry_run_writes_nothing(self, tmp_path, monkeypatch):
+        from migrate_v5 import migrate
+        gen = self._setup(tmp_path, monkeypatch, [])
+        conf = gen / "stale.user-old.0.nginx.conf"
+        conf.write_text("set $auth_mode acl;\n")
+        report = migrate(gen, dry_run=True)
+        assert report["dry_run"] is True
+        assert report["stripped"] == 1
+        assert "auth_mode" in conf.read_text()  # unchanged
+
+    def test_clean_confs_left_alone(self, tmp_path, monkeypatch):
+        from migrate_v5 import migrate
+        gen = self._setup(tmp_path, monkeypatch, [])
+        conf = gen / "clean.user-old.0.nginx.conf"
+        conf.write_text("server_name clean.localhost;\n")
+        report = migrate(gen)
+        assert report["skipped"] == 1
+        assert report["remaining_scaffold"] == []
+
+    def test_documented_invocation_runs_from_repo_root(self, tmp_path):
+        """QA GAP-17: the DOCUMENTED `python -m user_provision_tool.migrate_v5`
+        must run from the repo root (`_users_provision/`), not only
+        `python -m migrate_v5` from inside the package dir. Spawns the real CLI
+        in a subprocess with cwd=repo root so module/sys.path resolution is
+        exercised end-to-end."""
+        import subprocess
+        import sys
+
+        repo_root = Path(__file__).resolve().parents[2]  # _users_provision/
+        assert (repo_root / "user_provision_tool" / "migrate_v5.py").is_file()
+        gen = tmp_path / "generated"
+        gen.mkdir(exist_ok=True)
+        (gen / "clean.user-old.0.nginx.conf").write_text("server_name clean.localhost;\n")
+        reg_file = tmp_path / "user_registry.yml"
+        reg_file.write_text("")
+        env = dict(os.environ)
+        env["GENERATED_DIR"] = str(gen)
+        env["REGISTRY_FILE"] = str(reg_file)
+        proc = subprocess.run(
+            [sys.executable, "-m", "user_provision_tool.migrate_v5", "--dry-run"],
+            cwd=str(repo_root),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert proc.returncode == 0, f"stdout={proc.stdout}\nstderr={proc.stderr}"
+        assert "remaining scaffold confs: 0" in proc.stdout
+        assert "VERIFICATION PASSED" in proc.stdout
+
+
+class TestDockerNginxEnvRemoved:
+    """v5 (decision 1/16): POST /docker/nginx/env is removed with a 410 — the
+    internal -nginx is services-only and ENABLE_ACL touches only gateway + edge."""
+
+    def test_env_endpoint_410(self):
+        from fastapi.testclient import TestClient
+        import api
+        client = TestClient(api.app)  # no context manager → no lifespan/docker calls
+        resp = client.post("/docker/nginx/env", params={"container": "subnet-acl-nginx"})
+        assert resp.status_code == 410
+        assert "removed in v5" in resp.json()["detail"]
+
+
+class TestEdgeComposeService:
+    """docker-compose.gateway.yml carries the edge (GAP-1/GAP-14/GAP-15): the
+    NGINX_* client-facing ports, file-level mounts so the placeholder survives,
+    read-only SSL_DIR, non-root, env baked at start."""
+
+    def test_edge_service_block(self):
+        repo = Path(__file__).resolve().parents[3]  # _subnet_acl
+        compose = (repo / "_provision_gateway" / "docker-compose.gateway.yml").read_text()
+        assert "subnet-acl-nginx-acl:" in compose
+        # Client-facing ports reused for the edge (decision 10).
+        assert "${NGINX_HTTP_PORT:-80}:80" in compose
+        assert "${NGINX_HTTPS_PORT:-443}:443" in compose
+        # File-level mounts (not whole-dir) so the image placeholder cert survives.
+        assert "./nginx.acl/edge.conf.template:/etc/nginx/acl/edge.conf.template:ro" in compose
+        assert "./nginx.acl/acl-helpers.conf.template:/etc/nginx/acl/acl-helpers.conf.template:ro" in compose
+        assert "./nginx.acl/entrypoint.sh:/etc/nginx/acl/entrypoint.sh:ro" in compose
+        assert "./nginx.acl:/etc/nginx/acl:ro" not in compose
+        # SSL_DIR read-only at /certs (decision 17).
+        assert "${PROVISION_DIR:-/srv/provision_subnet_acl}/ssl:/certs:ro" in compose
+        # Non-root + baked env + command.
+        assert "user: nginx" in compose
+        assert "ENABLE_ACL=${ENABLE_ACL:-false}" in compose
+        assert "PORTAL_MODE=${PORTAL_MODE:-http}" in compose
+        assert "command: /bin/sh /etc/nginx/acl/entrypoint.sh" in compose
+
+
+class TestEdgeDockerfile:
+    """Edge Dockerfile (decision 11/17): builds the placeholder cert into the
+    image, chowns to nginx, and does not set an ENTRYPOINT (compose drives it)."""
+
+    def test_dockerfile_content(self):
+        content = (EDGE_DIR / "Dockerfile").read_text()
+        assert "FROM nginx:alpine" in content
+        assert "openssl req -x509" in content
+        assert "/etc/nginx/acl/placeholder/" in content
+        assert "chown -R nginx:nginx /etc/nginx" in content
+        assert "USER nginx" in content
+        # No ENTRYPOINT directive — compose drives the command (testability).
+        assert not any(l.strip().startswith("ENTRYPOINT") for l in content.splitlines())

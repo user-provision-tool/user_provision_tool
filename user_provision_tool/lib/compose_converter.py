@@ -40,9 +40,12 @@ Transformations applied
 7. Docker Compose ${ENV_VAR} substitutions are left intact for runtime
    resolution via --env-file.
 
-8. Strip `profiles:` from every service.
-   Profile selection is a deployment-level concern; every rendered user compose
-   must unconditionally start all its services via `docker compose up`.
+8. Ship `profiles:` verbatim on every service (design §Profiles L84-88).
+   Profile activation is a deployment-level choice passed via `docker compose
+   --profile` at up time; services with no `profiles:` key always run, and
+   `[""]` empty-string-profile services run by default (no flag). All services
+   stay in the template so e.g. dify's `["", "postgresql"]` db service is
+   never dropped (previously the provisioned dify had NO database).
 
 9. Passthrough system sockets — `/var/run/docker.sock` and `/run/docker.sock`
    are NEVER converted to per-user volume variables.  They remain as literal
@@ -184,11 +187,14 @@ def _transform_service(
     svc: dict,
     src_to_key: dict[str, str],
     tokens: _TokenRegistry,
+    env_to_key: dict[str, str],
 ) -> dict:
     container_name_val = tokens.tok(f"{{{{ container_prefix }}}}{svc_key}")
 
     # Rebuild dict: container_name right after 'image:' for readability;
     # drop 'ports:' entirely (traffic flows through provision-nginx).
+    # 'profiles:' is KEPT verbatim (design §Profiles) — activation is a
+    # deployment choice via docker compose --profile at up time.
     result: dict = {}
     inserted = False
     for key, value in svc.items():
@@ -196,8 +202,6 @@ def _transform_service(
             continue  # replaced below
         if key == "ports":
             continue  # stripped — use provision-nginx for all ingress
-        if key == "profiles":
-            continue  # stripped — profile selection is a deployment detail, not per-user
         result[key] = value
         if key == "image" and not inserted:
             result["container_name"] = container_name_val
@@ -211,11 +215,40 @@ def _transform_service(
             _transform_volume_entry(v, src_to_key, tokens) for v in result["volumes"]
         ]
 
+    # Replace declared env_file: paths with per-user template tokens
+    # (design §Env story L180-184).  Long-form {path, required} object shape
+    # is preserved — only the path is substituted.
+    if "env_file" in result:
+        result["env_file"] = _transform_env_file_entry(result["env_file"], env_to_key, tokens)
+
     # Replace networks with isolated user network (skip if network_mode is set)
     if "network_mode" not in result:
         result["networks"] = [tokens.tok("{{ network_name }}")]
 
     return result
+
+
+def _transform_env_file_entry(entry: Any, env_to_key: dict[str, str], tokens: _TokenRegistry) -> Any:
+    """Rewrite one service ``env_file:`` value to a per-user template token.
+
+    - str form:  ``env_file: ./config/app.env`` → ``env_file: {{ env_files['key'] }}``
+    - long-form: ``env_file: {path: ./x.env, required: true}`` → path substituted
+      only, all other keys preserved.
+    """
+    if isinstance(entry, str):
+        if entry in env_to_key:
+            return tokens.tok(f"{{{{ env_files['{env_to_key[entry]}'] }}}}")
+        return entry
+    if isinstance(entry, dict):
+        path = entry.get("path")
+        if path in env_to_key:
+            result = dict(entry)
+            result["path"] = tokens.tok(f"{{{{ env_files['{env_to_key[path]}'] }}}}")
+            return result
+        return entry
+    if isinstance(entry, list):
+        return [_transform_env_file_entry(e, env_to_key, tokens) for e in entry]
+    return entry
 
 
 # ─── YAML serialisation ───────────────────────────────────────────────────────
@@ -241,7 +274,42 @@ def _dump_yaml(data: Any) -> str:
 
 # ─── Public API ───────────────────────────────────────────────────────────────
 
-def convert(data: dict) -> tuple[dict, dict[str, str], _TokenRegistry]:
+def _collect_env_files(services: dict) -> list[str]:
+    """Return ordered, de-duplicated declared ``env_file:`` paths across services."""
+    seen: list[str] = []
+    for svc in services.values():
+        if not isinstance(svc, dict):
+            continue
+        for entry in _as_env_file_list(svc.get("env_file")):
+            if entry and entry not in seen:
+                seen.append(entry)
+    return seen
+
+
+def _as_env_file_list(entry: Any) -> list[str]:
+    """Normalise a service ``env_file:`` value into a list of path strings.
+
+    Handles str form, list form, and long-form ``{path, required}`` objects.
+    """
+    if entry is None:
+        return []
+    if isinstance(entry, str):
+        return [entry]
+    if isinstance(entry, dict):
+        path = entry.get("path")
+        return [path] if isinstance(path, str) else []
+    if isinstance(entry, list):
+        result: list[str] = []
+        for e in entry:
+            if isinstance(e, str):
+                result.append(e)
+            elif isinstance(e, dict) and isinstance(e.get("path"), str):
+                result.append(e["path"])
+        return result
+    return []
+
+
+def convert(data: dict) -> tuple[dict, dict[str, str], _TokenRegistry, dict[str, str]]:
     """Pure transform of a parsed compose dict.
 
     Returns
@@ -253,6 +321,8 @@ def convert(data: dict) -> tuple[dict, dict[str, str], _TokenRegistry]:
     tokens : _TokenRegistry
         Token registry; call tokens.detokenize(yaml_text) to get the final
         Jinja2 template body.
+    env_to_key : dict[str, str]
+        Maps declared service ``env_file:`` path → template env-file key.
     """
     tokens = _TokenRegistry()
     result = dict(data)
@@ -270,26 +340,21 @@ def convert(data: dict) -> tuple[dict, dict[str, str], _TokenRegistry]:
         key = _unique_key(Path(src).name or src, used_keys)
         src_to_key[src] = key
 
-    # 3. Transform each service (skip services locked to a named profile)
-    def _is_default_service(svc: dict) -> bool:
-        """Return True if the service runs without explicit profile activation.
+    # 2b. Collect declared service env_file paths and assign keys
+    env_srcs = _collect_env_files(services)
+    env_used: set[str] = set()
+    env_to_key: dict[str, str] = {}
+    for src in env_srcs:
+        key = _unique_key(Path(src).name or src, env_used)
+        env_to_key[src] = key
 
-        Services with no ``profiles`` key are always started.
-        Services with ``profiles: [""]`` use an empty-string profile as a
-        convention to mark them as the default variant — treated the same way.
-        Services with any non-empty profile string are deployment-variant
-        services (e.g. ``profiles: ["falkordb"]``) and should not be included
-        in a provisioned user compose.
-        """
-        profiles = svc.get("profiles")
-        if not profiles:            # no key, or empty list
-            return True
-        return all(p == "" for p in profiles)
-
+    # 3. Transform every service — ALL services ship in the template
+    #    (design §Profiles L84-88: profiles pass through verbatim; only
+    #    default + activated profiles run at up time via --profile).
     result["services"] = {
-        svc_key: _transform_service(svc_key, svc, src_to_key, tokens)
+        svc_key: _transform_service(svc_key, svc, src_to_key, tokens, env_to_key)
         for svc_key, svc in services.items()
-        if isinstance(svc, dict) and _is_default_service(svc)
+        if isinstance(svc, dict)
     }
 
     # 4. Rewrite top-level networks to isolated per-user network
@@ -310,10 +375,14 @@ def convert(data: dict) -> tuple[dict, dict[str, str], _TokenRegistry]:
             new_top[vol_name] = cfg
         result["volumes"] = new_top
 
-    return result, src_to_key, tokens
+    return result, src_to_key, tokens, env_to_key
 
 
-def make_header(src_to_key: dict[str, str], service_name_hint: str) -> str:
+def make_header(
+    src_to_key: dict[str, str],
+    service_name_hint: str,
+    env_to_key: dict[str, str] | None = None,
+) -> str:
     """Return the comment block written at the top of a generated .j2 file."""
     lines = [
         f"# {service_name_hint}.yml.j2 — generated by gen_compose_template.py",
@@ -336,6 +405,14 @@ def make_header(src_to_key: dict[str, str], service_name_hint: str) -> str:
         lines.append(
             "#   " + "  ".join(f"-v {k}=/your/path" for k in src_to_key.values())
         )
+    if env_to_key:
+        lines.append("#   env_files['KEY']  — declared service env_file: paths:")
+        for src, key in env_to_key.items():
+            lines.append(f"#     env_files['{key}']  ← original path: {src}")
+        lines.append(
+            "#     Files that exist in the recipe are copied per-user-per-recipe at"
+        )
+        lines.append("#     render time; missing files stay missing (compose warns).")
     lines += [
         "#",
         "# NOTE: ports: has been stripped — all ingress goes through provision-nginx.",
@@ -393,7 +470,7 @@ def compose_file_to_template(
         r"[^a-zA-Z0-9_]", "_", _Path(input_path).stem
     )
 
-    transformed, src_to_key, tokens = convert(data)
+    transformed, src_to_key, tokens, env_to_key = convert(data)
     raw_yaml = _dump_yaml(transformed)
     template_body = tokens.detokenize(raw_yaml)
 
@@ -422,7 +499,7 @@ def compose_file_to_template(
         template_body,
     )
 
-    header = make_header(src_to_key, hint)
+    header = make_header(src_to_key, hint, env_to_key=env_to_key)
 
     _Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w") as f:

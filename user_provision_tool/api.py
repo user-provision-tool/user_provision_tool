@@ -89,14 +89,23 @@ class RegisterRequest(BaseModel):
     # (equivalent to -pr in the CLI)
     project_root: str | None = None
     # Exactly one of these must be provided:
-    #   compose_template_path — path to an existing Jinja2 .yml.j2 template
-    #   compose_file_path     — path to a plain docker-compose.yml (auto-converted)
+    #   compose_template_path  — path to an existing Jinja2 .yml.j2 template
+    #   compose_file_path      — path to a plain docker-compose.yml (auto-converted)
+    #   compose_file_paths     — ORDERED list of compose files, merged with
+    #                            compose-spec semantics (design §Compose multi-file)
     compose_template_path: str | None = None
     compose_file_path: str | None = None
+    compose_file_paths: list[str] | None = None
     # Optionally one of:
     nginx_conf_template_path: str | None = None
     nginx_conf_file_path: str | None = None
+    # Repeatable interpolation env files (order preserved, later wins).
     env_file_path: str | None = None
+    env_files: list[str] | None = None
+    # Optional repeatable profiles (default = no flag → default + "" services).
+    profiles: list[str] | None = None
+    # Optional per-user override of declared service env files (declared path → host path).
+    service_env_files: dict[str, str] | None = None
     label: str = "0"
     domain: str = "localhost"
     passwd: str = "123456"
@@ -130,10 +139,11 @@ class RegisterRequest(BaseModel):
     def _check_compose_source(self) -> "RegisterRequest":
         has_tpl = bool(self.compose_template_path)
         has_file = bool(self.compose_file_path)
-        if not has_tpl and not has_file:
-            raise ValueError("one of compose_template_path or compose_file_path is required")
-        if has_tpl and has_file:
-            raise ValueError("compose_template_path and compose_file_path are mutually exclusive")
+        has_paths = bool(self.compose_file_paths)
+        if not has_tpl and not has_file and not has_paths:
+            raise ValueError("one of compose_template_path, compose_file_path or compose_file_paths is required")
+        if (has_tpl + has_file + has_paths) > 1:
+            raise ValueError("compose_template_path, compose_file_path and compose_file_paths are mutually exclusive")
         if self.nginx_conf_template_path and self.nginx_conf_file_path:
             raise ValueError("nginx_conf_template_path and nginx_conf_file_path are mutually exclusive")
         if self.https:
@@ -331,6 +341,13 @@ def register_user(
     req: RegisterRequest,
     sync: bool = Query(False, description="If true, block until registration completes"),
 ) -> dict[str, Any]:
+    # --- RACE WINDOW (documented, not mitigated — design §Impl notes L270-272) ---
+    # Generation-save vs deploy is CROSS-PROCESS: the gateway job writes the
+    # per-recipe files (atomic write-then-marker), while this register flow
+    # reads them at render time.  There is no shared lock between the two
+    # processes; a deploy that reads a compose/env file mid-generation simply
+    # sees the pre-write (or pre-marker) snapshot — the narrow acceptable
+    # race window is intentional and documented, NOT mitigated.
     # --- Resolve project_root: bare name → SOURCE_PROJECTS_DIR/{name} ---
     resolved_root: Path | None = None
     if req.project_root:
@@ -351,16 +368,49 @@ def register_user(
         return p
 
     compose_file_path      = _resolve(req.compose_file_path)
+    compose_file_paths     = [_resolve(p) for p in (req.compose_file_paths or [])]
     compose_template_path  = _resolve(req.compose_template_path)
     nginx_conf_file_path   = _resolve(req.nginx_conf_file_path)
     nginx_conf_template_path = _resolve(req.nginx_conf_template_path)
     env_file_path          = _resolve(req.env_file_path)
+    env_files_resolved     = [_resolve(p) for p in (req.env_files or [])]
 
-    # --- Resolve compose template (convert plain file if needed) ---
-    if compose_file_path:
+    # --- Resolve compose template (convert plain file(s) if needed) ---
+    compose_sources: list[str] = []
+    if compose_file_paths:
+        for p in compose_file_paths:
+            if not Path(p).exists():
+                raise HTTPException(404, f"compose_file_paths entry not found: {p}")
+        compose_sources = compose_file_paths
+        if len(compose_file_paths) == 1:
+            # Single file: direct conversion path unchanged (design F15).
+            src = Path(compose_file_paths[0])
+            template_out = str(src.parent / f"{src.stem}.yml.j2")
+            try:
+                compose_file_to_template(str(src), template_out, service_name_hint=req.service_name)
+            except Exception as e:
+                raise HTTPException(422, f"could not convert compose file: {e}")
+            compose_template = template_out
+        else:
+            # ≥2 files: ordered merge → ONE template named <first>.merged.yml.j2
+            # (design §Compose multi-file L68-80, §Impl notes L262-266).
+            from lib.compose_merge import merge_compose_files
+            first = Path(compose_file_paths[0])
+            merged_out = str(first.parent / f"{first.stem}.merged.yml")
+            template_out = str(first.parent / f"{first.stem}.merged.yml.j2")
+            try:
+                merge_compose_files(compose_file_paths, merged_out)
+                compose_file_to_template(merged_out, template_out, service_name_hint=req.service_name)
+            except RuntimeError as e:
+                raise HTTPException(422, f"compose merge failed: {e}")
+            except Exception as e:
+                raise HTTPException(422, f"could not convert merged compose file: {e}")
+            compose_template = template_out
+    elif compose_file_path:
         src = Path(compose_file_path)
         if not src.exists():
             raise HTTPException(404, f"compose_file_path not found: {compose_file_path}")
+        compose_sources = [compose_file_path]
         template_out = str(src.parent / f"{src.stem}.yml.j2")
         try:
             compose_file_to_template(str(src), template_out, service_name_hint=req.service_name)
@@ -377,7 +427,7 @@ def register_user(
     # service name can be rewritten to use {{ container_prefix }}.
     _compose_svc_names: list[str] = []
     try:
-        _compose_src = compose_file_path or compose_template_path
+        _compose_src = compose_sources[0] if compose_sources else compose_template_path
         if _compose_src:
             _compose_svc_names = get_compose_service_names(_compose_src)
     except Exception:
@@ -421,6 +471,10 @@ def register_user(
         nginx_template=nginx_template,
         domain=req.domain,
         env_file=env_file_path,
+        env_files=env_files_resolved or None,
+        profiles=req.profiles or None,
+        service_env_files=req.service_env_files or None,
+        compose_sources=compose_sources or None,
         nginx_container=NGINX_CONTAINER,
         build_args=req.build_args,
         https=req.https,
@@ -900,6 +954,7 @@ class CheckMissingFilesResponse(BaseModel):
     ready: bool
     missing: list[str]
     existing: list[str]
+    needs_env: bool = False
 
 
 @app.get("/services/{service_name}/check-missing-files")
@@ -948,6 +1003,21 @@ def check_missing_files(
         f == ".env" for f in files
     )
 
+    # needs_env signal (design §Env story L156-159): any ${VAR} interpolation
+    # in the recipe's compose files (union scan — the gateway post-processes
+    # this with the actual selection).  Fixes the unconditional .env
+    # missing-flag: .env is only missing when interpolation is actually used.
+    from lib.var_scan import needs_env as _needs_env
+    _needs_env_scan = False
+    for f in files:
+        if f.endswith((".yml", ".yaml", ".yml.j2", ".yaml.j2")):
+            try:
+                if _needs_env((project_dir / f).read_text()):
+                    _needs_env_scan = True
+                    break
+            except OSError:
+                continue
+
     missing: list[str] = []
     existing: list[str] = []
 
@@ -968,7 +1038,7 @@ def check_missing_files(
 
     if has_env:
         existing.append(".env")
-    else:
+    elif _needs_env_scan:
         missing.append(".env")
 
     return CheckMissingFilesResponse(
@@ -977,7 +1047,146 @@ def check_missing_files(
         ready=len(missing) == 0,
         missing=missing,
         existing=existing,
+        needs_env=_needs_env_scan,
     )
+
+
+# ---------------------------------------------------------------------------
+# GET /services/{service_name}/compose/preview — lightweight convert preview
+# (design §Implementation notes L284-286)
+# ---------------------------------------------------------------------------
+
+def _preview_volume_mapping(project_dir: Path, compose_files: list[str]) -> dict[str, Any]:
+    """Run the converter in-call on compose file(s) and return the src→key map.
+
+    Pure preview — NO files are written and no templates are produced.  This
+    is the converter's in-call src→key mapping exposed via a lightweight
+    convert/preview response, so the deploy panel's advanced volume-override
+    rows obtain their keys from the mapping instead of parsing ``.j2`` files
+    in the frontend (design §Implementation notes L284-286).
+
+    - Single file: direct conversion path unchanged (F15) — ``convert()``
+      in memory.
+    - ≥2 files: ordered merge via :func:`lib.compose_merge.merge_compose_data`
+      (same flags as the deploy-time path, no artifact written), then convert.
+    - A ``.j2`` input is first resolved to its plain source sibling (e.g.
+      ``docker-compose.yml.j2`` → ``docker-compose.yml``); when the source is
+      gone the template's ``volumes['key']`` tokens are extracted server-side
+      as a fallback (the *frontend* never parses templates).
+
+    Returns
+    -------
+    dict with ``compose_files`` (resolved list), ``src_to_key``
+    (source path → volume key), ``volume_keys`` (ordered keys, first-appearance).
+    """
+    import re as _re
+    import yaml as _yaml
+    from lib.compose_converter import convert as _convert
+
+    sources: list[str] = []
+    templates: list[str] = []
+    for entry in compose_files:
+        p = Path(entry)
+        if p.is_absolute():
+            raise HTTPException(422, f"compose preview path must be project-relative: {entry}")
+        target = project_dir / p
+        if entry.endswith(".j2"):
+            # Prefer the plain source sibling; only the template itself
+            # (no source left) is kept and handled by the token fallback.
+            source = target.with_name(target.name[: -len(".j2")])
+            if source.exists():
+                target = source
+        if not target.exists():
+            raise HTTPException(404, f"compose file not found: {entry}")
+        rel = str(target.relative_to(project_dir))
+        (sources if not rel.endswith(".j2") else templates).append(rel)
+
+    src_to_key: dict[str, str] = {}
+    used: list[str] = []
+
+    def _add(mapping: dict[str, str]) -> None:
+        for src, key in mapping.items():
+            if key not in used:
+                used.append(key)
+            src_to_key[src] = key
+
+    if templates:
+        if sources:
+            # Mixing source + template inputs is ambiguous — reject.
+            raise HTTPException(
+                422, f"cannot mix source compose files and .j2 templates: {templates}"
+            )
+        # Template-only fallback: extract the keys the converter would assign.
+        content = (project_dir / Path(templates[0])).read_text()
+        seen: list[str] = []
+        for m in _re.finditer(
+            r"\{\{-?\s*volumes\[['\"]([^'\"]+)['\"]\]\s*-?\}\}", content
+        ):
+            if m.group(1) not in seen:
+                seen.append(m.group(1))
+        # Named-volumes block fallback (server-side, mirrors the old behavior).
+        named = _re.search(r"^volumes:\s*\n((?:\s+\w+:\s*\n)+)", content, _re.M)
+        if named:
+            for nv in _re.findall(r"^\s+(\w+):\s*$", named.group(1), _re.M):
+                if nv not in seen:
+                    seen.append(nv)
+        return {
+            "compose_files": templates,
+            "src_to_key": {k: k for k in seen},
+            "volume_keys": seen,
+        }
+
+    if not sources:
+        raise HTTPException(422, "compose_files is required for the preview")
+
+    if len(sources) == 1:
+        with (project_dir / Path(sources[0])).open() as f:
+            data = _yaml.safe_load(f)
+        if not isinstance(data, dict) or "services" not in data:
+            raise HTTPException(
+                422, f"'{sources[0]}' does not look like a docker-compose file "
+                "(missing 'services:' key)"
+            )
+        _transformed, src_to_key, _tokens, _env_to_key = _convert(data)
+    else:
+        from lib.compose_merge import merge_compose_data
+        merged = merge_compose_data([str(project_dir / Path(p)) for p in sources])
+        _transformed, src_to_key, _tokens, _env_to_key = _convert(merged)
+
+    _add(src_to_key)
+    return {"compose_files": sources, "src_to_key": src_to_key, "volume_keys": used}
+
+
+@app.get("/services/{service_name}/compose/preview")
+def compose_preview(
+    service_name: str,
+    compose_files: list[str] = Query(default=[], description="Recipe-relative compose file paths (ordered)"),
+    recipe_path: str = Query("", description="Recipe subdirectory path"),
+) -> dict[str, Any]:
+    """Lightweight convert/preview: converter in-call src→key mapping.
+
+    Runs the converter on the given compose file(s) IN-CALL and returns the
+    bind-mount source→volume-key mapping — no template is written.  The
+    deploy panel's advanced volume-override rows consume ``volume_keys``
+    from this response instead of parsing ``.j2`` files in the frontend
+    (design §Implementation notes L284-286).
+
+    Args:
+        compose_files: Ordered recipe-relative compose paths (the same set
+            that would be passed to register as ``compose_file_paths``).
+        recipe_path: Optional subdirectory for multi-recipe projects.
+    """
+    project_dir = SOURCE_PROJECTS_DIR / service_name
+    if recipe_path:
+        project_dir = project_dir / recipe_path
+    if not project_dir.is_dir():
+        raise HTTPException(
+            404,
+            f"Service '{service_name}' recipe '{recipe_path}' not found"
+            if recipe_path
+            else f"Service '{service_name}' not found",
+        )
+    return _preview_volume_mapping(project_dir, compose_files)
 
 
 # ---------------------------------------------------------------------------
@@ -1031,6 +1240,36 @@ def _validate_nginx_proxy_targets(
             f"Update {nginx_conf.name} so every proxy_pass host matches a "
             f"service key from docker-compose.yml.",
         )
+
+
+# ---------------------------------------------------------------------------
+# POST /nginx/validate  — generated-nginx validation surface (design §Impl
+# notes L259-261, GAP-20).  The gateway calls this after generating/reviewing
+# an nginx conf; the service-name set is the MERGED compose service set
+# (including profile-gated services) — activation awareness is the LLM's job.
+# ---------------------------------------------------------------------------
+
+class NginxValidateRequest(BaseModel):
+    nginx_conf_path: str
+    compose_service_names: list[str] = []
+
+
+class NginxValidateResponse(BaseModel):
+    valid: bool
+    errors: list[str] = []
+
+
+@app.post("/nginx/validate")
+def validate_nginx_conf(req: NginxValidateRequest) -> NginxValidateResponse:
+    conf = Path(req.nginx_conf_path)
+    if not conf.is_file():
+        raise HTTPException(404, f"nginx_conf_path not found: {conf}")
+    errors: list[str] = []
+    try:
+        _validate_nginx_proxy_targets(conf, req.compose_service_names)
+    except HTTPException as e:
+        errors.append(str(e.detail))
+    return NginxValidateResponse(valid=not errors, errors=errors)
 
 
 # ---------------------------------------------------------------------------

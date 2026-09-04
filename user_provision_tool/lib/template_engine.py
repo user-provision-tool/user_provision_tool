@@ -58,6 +58,41 @@ class _PathPlaceholderUndefined(Undefined):
         return iter([])
 
 
+_BIND_COMMENT_RE = re.compile(
+    r"#\s+(volumes|env_files)\['([^']+)'\]\s*←\s*original path:\s*(.+?)\s*$",
+    flags=re.MULTILINE,
+)
+
+
+def extract_template_bind_sources(compose_template_path: str, kind: str) -> dict[str, str]:
+    """Return ``{key: declared_src}`` parsed from the converter header comments.
+
+    The converter writes one comment line per bind mount / env file:
+      ``#     volumes['KEY']  ← original path: ./nginx/conf.d``
+      ``#     env_files['KEY']  ← original path: ./config/app.env``
+
+    These are the declared source paths (relative to the template dir) that
+    ``_auto_volumes`` / ``render_compose`` use for the copy-if-empty bootstrap.
+    """
+    with open(compose_template_path) as f:
+        content = f.read()
+    result: dict[str, str] = {}
+    for m in _BIND_COMMENT_RE.finditer(content):
+        if m.group(1) == kind:
+            result[m.group(2)] = m.group(3).strip()
+    return result
+
+
+def extract_template_volume_sources(compose_template_path: str) -> dict[str, str]:
+    """Return ``{volume_key: declared_src}`` from converter header comments."""
+    return extract_template_bind_sources(compose_template_path, "volumes")
+
+
+def extract_template_env_file_sources(compose_template_path: str) -> dict[str, str]:
+    """Return ``{env_key: declared_src}`` from converter header comments."""
+    return extract_template_bind_sources(compose_template_path, "env_files")
+
+
 def extract_template_volumes(compose_template_path: str) -> list[str]:
     """Return the list of volume keys referenced in a compose template.
 
@@ -114,6 +149,19 @@ def extract_template_volumes(compose_template_path: str) -> list[str]:
     return result
 
 
+def per_user_env_file_name(env_file_path: str, user_name: str, label: str, index: int) -> str:
+    """Per-user-per-recipe copy name for an interpolation env file.
+
+    The first (primary) file keeps the historical convention
+    ``.env.{user}.{label}``; additional files (repeatable --env-file, order
+    preserved) get ``{stem}.{user}.{label}{suffix}``.
+    """
+    if index == 0:
+        return f".env.{user_name}.{label}"
+    p = Path(env_file_path)
+    return f"{p.stem}.{user_name}.{label}{p.suffix}"
+
+
 def render_compose(
     template_path: str,
     output_path: str,
@@ -122,6 +170,8 @@ def render_compose(
     label: str,
     volumes: dict[str, str],
     env_file: str | None = None,
+    env_files: dict[str, str] | None = None,
+    env_files_all: list[str] | None = None,
     subnet: str | None = None,
     gateway: str | None = None,
 ) -> str | None:
@@ -137,9 +187,17 @@ def render_compose(
     IPAM block with ``{% if subnet %}`` for backward compatibility when
     subnet management is disabled.
 
+    Service-level env files (design §Env story L180-184): declared
+    ``env_file:`` paths in the template reference ``{{ env_files['KEY'] }}``
+    tokens.  *env_files* maps KEY → operator-supplied host path override.
+    Each declared file that EXISTS in the recipe dir is copied into the
+    per-user-per-recipe area (next to the rendered compose) and the token
+    resolves to the copy; missing files stay missing (the token resolves to
+    the original declared path, so compose warns / required:true fails up).
+
     Additionally, any ``env_file: .env`` directives in service definitions
-    (both string and list forms) are replaced with the per-user env file name,
-    so containers load environment variables from the correct file.
+    (both string and list forms) from pre-tokenisation templates are replaced
+    with the per-user env file name.
 
     Two distinct placeholder types are handled by different engines:
       - ``{{ var }}``   — Jinja2; resolved here at render time.
@@ -149,6 +207,31 @@ def render_compose(
     """
     env, tpl_name = _make_env(template_path)
     prefix = container_prefix(service_name, user_name, label)
+
+    # --- Resolve declared service env files to per-user copies ---
+    per_user_env_name = f".env.{user_name}.{label}"
+    declared_env = extract_template_env_file_sources(template_path)
+    resolved_env_files: dict[str, str] = {}
+    copied_names: set[str] = set()
+    for key, declared_src in declared_env.items():
+        override = (env_files or {}).get(key)
+        if override:
+            # Operator-supplied host path override — used as-is, never seeded.
+            resolved_env_files[key] = override
+            continue
+        src = Path(template_path).parent / declared_src
+        if src.is_file():
+            dest = Path(output_path).parent / f"{Path(declared_src).name}.{user_name}.{label}"
+            if dest.name not in copied_names:
+                shutil.copy2(src, dest)
+                copied_names.add(dest.name)
+                Path(str(dest) + ".generated").write_text("")
+            resolved_env_files[key] = dest.name
+        else:
+            # Missing file stays missing — compose warns for required:false,
+            # blocks up for required:true.
+            resolved_env_files[key] = declared_src
+
     ctx: dict[str, Any] = {
         "user_name": user_name,
         "service_name": service_name,
@@ -156,22 +239,31 @@ def render_compose(
         "container_prefix": prefix,
         "network_name": user_network_name(service_name, user_name, label),
         "volumes": volumes,
+        "env_files": resolved_env_files,
         "subnet": subnet or "",
         "gateway": gateway or "",
     }
     rendered = env.get_template(tpl_name).render(**ctx)
 
-    # --- Handle env_file: copy with per-user name + rewrite .env refs ---
+    # --- Handle interpolation env files: copy with per-user names + rewrite .env refs ---
+    # Repeatable --env-file (design §Env story L153-155): order is preserved,
+    # later files win at up time (compose semantics).
+    all_env: list[str] = list(env_files_all or [])
+    if env_file and env_file not in all_env:
+        all_env.insert(0, env_file)
     copied_env: str | None = None
-    if env_file and Path(env_file).is_file():
-        # Per-user unique env file name to avoid collisions between users
-        # sharing the same project directory.
-        per_user_env_name = f".env.{user_name}.{label}"
-        dest = Path(output_path).parent / per_user_env_name
-        if Path(env_file).resolve() != dest.resolve():
-            shutil.copy2(env_file, dest)
-        copied_env = str(dest)
+    for idx, ef in enumerate(all_env):
+        if not Path(ef).is_file():
+            continue
+        dest = Path(output_path).parent / per_user_env_file_name(ef, user_name, label, idx)
+        if dest.name not in copied_names and Path(ef).resolve() != dest.resolve():
+            shutil.copy2(ef, dest)
+            copied_names.add(dest.name)
+            Path(str(dest) + ".generated").write_text("")
+        if idx == 0:
+            copied_env = str(dest)
 
+    if all_env:
         # Replace env_file: .env references in the rendered compose so
         # containers load env vars from the correct per-user file.
         # Walk the parsed dict to replace .env before dumping — avoids
@@ -182,8 +274,6 @@ def render_compose(
         f.write(rendered)
     # Mark rendered compose as generated
     Path(str(output_path) + ".generated").write_text("")
-    if copied_env:
-        Path(copied_env + ".generated").write_text("")
 
     return copied_env
 

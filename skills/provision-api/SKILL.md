@@ -55,6 +55,30 @@ curl -X POST http://localhost:8765/users \
 # → 202 {"task_id": "a1b2c3d4e5f6", "status": "pending", "type": "register"}
 ```
 
+Register with multiple compose files (ordered merge), repeatable env files and profiles:
+
+```bash
+curl -X POST http://localhost:8765/users \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "user_name": "alice",
+    "service_name": "dify",
+    "project_root": "dify",
+    "compose_file_paths": ["docker/docker-compose.yaml", "docker/docker-compose.middleware.yaml"],
+    "env_files": ["docker/.env.example", "docker/extra.env"],
+    "profiles": ["postgresql"],
+    "domain": "example.com",
+    "passwd": "secret"
+  }'
+```
+
+- `compose_file_paths` is an ORDERED list; ≥2 files are merged with compose-spec
+  semantics (`docker compose -f a -f b config --no-interpolate --no-path-resolution`,
+  top-level `x-*` blocks stripped) into `<first>.merged.yml.j2`.
+- `env_files` is a repeatable stringArray — order preserved, later files win.
+- `profiles` is a repeatable stringArray — only default + activated services run.
+  Omit it entirely for pure compose default (no `--profile` flag).
+
 ### Register with proxy build args
 
 ```bash
@@ -262,10 +286,14 @@ curl -X POST http://localhost:8765/docker/nginx/reload
 | `service_name` | string | ✓ | `[a-zA-Z0-9_-]+` |
 | `project_root` | string | — | Bare name resolves to `$SOURCE_PROJECTS_DIR/{name}`. Relative/absolute path used as-is. 404 if not found. |
 | `compose_file_path` | string | † | Plain `docker-compose.yml` → auto-converted to `.j2` template |
+| `compose_file_paths` | string[] | † | ORDERED list of plain compose files (≥2 merged via `docker compose config --no-interpolate --no-path-resolution` into `<first>.merged.yml.j2`; top-level `x-*` stripped; single element behaves like `compose_file_path`) |
 | `compose_template_path` | string | † | Pre-made `.j2` compose template filename |
 | `nginx_conf_file_path` | string | — | Plain nginx conf → auto-converted to `.j2` template |
 | `nginx_conf_template_path` | string | — | Pre-made `.j2` nginx conf template filename |
-| `env_file_path` | string | — | `.env` file for Docker Compose `${VAR}` substitution. Copied as `.env.{user}.{label}` next to the generated compose file. Any `env_file: .env` directives in service definitions are automatically replaced with this per-user file name. |
+| `env_file_path` | string | — | Single `.env` for Docker Compose `${VAR}` substitution (legacy alias; prefer `env_files`). Copied as `.env.{user}.{label}` next to the generated compose file. |
+| `env_files` | string[] | — | Repeatable `.env`-class files for `${VAR}` substitution — order preserved, later wins. An ALWAYS-pass invariant holds: an explicit per-user `--env-file` is passed on every up/rebuild even when the list is empty (an empty per-user file fully overrides compose's `<project-dir>/.env` auto-read). Recorded in the registry so rebuild re-applies the same order. |
+| `profiles` | string[] | — | Repeatable compose profiles to activate (e.g. `["postgresql"]`). Default (absent) = no `--profile` flag → only default + `""` services run. Recorded in the registry; rebuild/up/down/reconciliation re-apply them. |
+| `service_env_files` | object | — | Optional override for declared per-service `env_file:` paths `{ "service_key": "/host/path", ... }`; default = every declared path that exists. Missing files stay missing (compose default semantics). |
 | `label` | string | — | Digits only; default `"0"` |
 | `domain` | string | — | Domain for `server_name`; default `"localhost"` |
 | `passwd` | string | — | Default `"123456"`. Pass `""` to disable HTTP basic auth entirely. |
@@ -276,7 +304,7 @@ curl -X POST http://localhost:8765/docker/nginx/reload
 | `privkey` | string | — | Path or bare filename to the private key file. Same resolution rules as `fullchain`. |
 | `no_cache` | bool | — | **(rebuild only)** Pass `--no-cache` to `docker compose build` |
 
-> † Exactly one of `compose_file_path` or `compose_template_path` is required.
+> † Exactly one of `compose_file_path`, `compose_file_paths`, or `compose_template_path` is required.
 
 ## Response Codes
 

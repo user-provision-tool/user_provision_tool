@@ -22,6 +22,45 @@
 > browser 5/0, migrate_v5 --dry-run VERIFICATION PASSED (0 scaffold, no auth_request in generated
 > confs). No feature row in this doc changed status.
 > Prior: doc-accuracy pass (T10/T11 edge features de-tracked to the gateway repo; scope and counts corrected).
+> **Updated**: 2026-09-01 — cycle 20260901T102115Z file-selection-and-generation design FINAL
+> verification (supervisor PASSED, openGapCount=0, iteration 3): the iter-3 gap list was EMPTY
+> (analyzer PASSED gaps:[], gap-reviewer r1 PASSED failures:[], coder filesChanged:[] — no
+> code/config/test changes). GAP-23/GAP-24 (implemented iter-2) remain live, re-verified this
+> iteration: race-window documentation at all 4 sites incl. user_provision_tool/api.py:350
+> register_user comment; compose-preview chain end-to-end (provision-api GET
+> /services/{name}/compose/preview, pure in-call, returns {compose_files, src_to_key, volume_keys};
+> live curl 200 with 54 src_to_key + 54 volume_keys). Final test evidence (QA iter-3 r1 +
+> supervisor): provision-api pytest 438/0 + gateway pytest 348/0 (pythonPassed 786), shell 124/0
+> (53+10+10+24+27), browser 4/0, registry 24/24 RESOLVED 0 OPEN. No feature row in this doc changed
+> status.
+> **Updated**: 2026-09-01 — cycle 20260901T164901Z file-selection-and-generation design FINAL
+> verification (supervisor PASSED, openGapCount=0, iteration 3): GAP-1..GAP-6 re-verified live —
+> iter-1 traversal hardening at every join site (per-user-file GET/PUT + save-generated reject
+> recipe_path escape → 400; llm_service validation drafts reject invalid recipe_path, service_manager
+> `_scan_recipe_dir` skips traversal-invalid paths), derive endpoint + in-panel profiles recompute
+> in both panels (23-profile union, nothing persisted); iter-2 GAP-5 `server_names_hash_bucket_size
+> 128` in nginx.provision.conf — subnet-acl-nginx Up RestartCount 0, 8766 401/444 signature;
+> GAP-6 test_gateway_api 53/0. Iter-3 GAP-7 (flaky test_merge_real_docker_golden — shells to real
+> `docker compose config` via lib/compose_merge.py, failed 1/7 full-suite runs) FIXED in the
+> test-script layer: `_retry_transient` helper (3 attempts, 1s→2s backoff) wraps the real merge in
+> tests/test_selection_generation.py, last error re-raised after exhaustion (genuine breakage still
+> fails); +2 unit tests; golden semantics unchanged. Suite deterministic: 441 passed / 0 failed in
+> 3 consecutive coder runs + 6 consecutive QA full-suite runs (was 439 with a 1/7 flake). Final
+> test evidence (QA iter-3 r2 + supervisor): user_provision_tool pytest 441/0 + gateway pytest
+> 363/0 (pythonPassed 804), shell 245/0, browser 6/0 (iter-3 r1 full matrix; r2 0/0 — webui
+> unchanged), registry 7/7 RESOLVED 0 OPEN. All F1-F62 IMPLEMENTED — no feature row in this doc
+> changed status.
+> **Updated**: 2026-09-03 — cycle 20260903T154936Z file-selection-and-generation design FINAL
+> verification (supervisor PASSED, openGapCount=0, iteration 3): the iter-1/iter-2/iter-3 gap
+> lists were ALL EMPTY (analyzer PASSED gaps:[] each iteration, gap-reviewer r1 PASSED
+> failures:[], coder filesChanged:[] — no code/config/test changes in this whole cycle; drift
+> clean: no source file newer than 2026-09-01T19:31:40Z). All F1-F62 remain IMPLEMENTED;
+> prior-cycle GAP-1..GAP-7 (cycle 20260901T164901Z) remain RESOLVED 7/7, re-verified in source
+> this cycle — incl. GAP-5 `server_names_hash_bucket_size 128` at nginx.provision.conf:27 and
+> GAP-7 `_retry_transient` (tests/test_selection_generation.py:17/169, golden merge
+> deterministic). Final test evidence (QA iter-3 r1 + supervisor): user_provision_tool pytest
+> 441/0 + gateway pytest 363/0 (pythonPassed 804), shell 245/0 (27+10+10+24+53+121), browser
+> 1/0, registry 0 OPEN. No feature row in this doc changed status.
 
 ---
 

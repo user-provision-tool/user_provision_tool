@@ -130,26 +130,62 @@ def _run(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.CompletedProcess(args, proc.returncode, stdout=stdout, stderr=stderr)
 
 
-def _compose_base(compose_file: str, env_file: str | None, project_name: str | None) -> list[str]:
+def _compose_base(
+    compose_file: str,
+    env_files: str | list[str] | None = None,
+    project_name: str | None = None,
+    profiles: str | list[str] | None = None,
+) -> list[str]:
+    """Build the global-flag prefix for a docker compose command.
+
+    ``--env-file`` is repeatable (design §Env story L153-155): order is
+    preserved and later files win for duplicate keys (compose semantics).
+    ``--profile`` is repeatable (design §Profiles L89-91); default (no flag)
+    activates no profile plus the implicit ``""`` services.
+    """
     cmd = ["docker", "compose", "-f", compose_file]
     if project_name:
         cmd += ["--project-name", project_name]
-    if env_file:
-        cmd += ["--env-file", env_file]
+    if env_files:
+        if isinstance(env_files, str):
+            env_files = [env_files]
+        for ef in env_files:
+            cmd += ["--env-file", ef]
+    if profiles:
+        if isinstance(profiles, str):
+            profiles = [profiles]
+        for p in profiles:
+            if p:
+                cmd += ["--profile", p]
     return cmd
 
 
-def compose_up(compose_file: str, env_file: str | None = None, project_name: str | None = None) -> None:
-    _run(_compose_base(compose_file, env_file, project_name) + ["up", "-d"])
+def compose_up(
+    compose_file: str,
+    env_file: str | list[str] | None = None,
+    project_name: str | None = None,
+    profiles: str | list[str] | None = None,
+) -> None:
+    _run(_compose_base(compose_file, env_file, project_name, profiles) + ["up", "-d"])
 
 
-def compose_down(compose_file: str, env_file: str | None = None, project_name: str | None = None) -> None:
-    _run(_compose_base(compose_file, env_file, project_name) + ["down"])
+def compose_down(
+    compose_file: str,
+    env_file: str | list[str] | None = None,
+    project_name: str | None = None,
+    profiles: str | list[str] | None = None,
+) -> None:
+    _run(_compose_base(compose_file, env_file, project_name, profiles) + ["down"])
 
 
-def compose_stop(compose_file: str, env_file: str | None = None, project_name: str | None = None) -> None:
+def compose_stop(
+    compose_file: str,
+    env_file: str | list[str] | None = None,
+    project_name: str | None = None,
+    profiles: str | list[str] | None = None,
+) -> None:
     """Stop containers without removing them (docker compose stop)."""
-    _run(_compose_base(compose_file, env_file, project_name) + ["stop"])
+    _run(_compose_base(compose_file, env_file, project_name, profiles) + ["stop"])
 
 
 def compose_down_by_project(project_name: str) -> None:
@@ -161,8 +197,8 @@ def compose_down_by_project(project_name: str) -> None:
     _run(["docker", "compose", "-p", project_name, "down", "--remove-orphans"])
 
 
-def compose_build(compose_file: str, no_cache: bool = False, env_file: str | None = None, project_name: str | None = None, build_args: dict[str, str] | None = None) -> None:
-    cmd = _compose_base(compose_file, env_file, project_name) + ["build"]
+def compose_build(compose_file: str, no_cache: bool = False, env_file: str | list[str] | None = None, project_name: str | None = None, build_args: dict[str, str] | None = None, profiles: str | list[str] | None = None) -> None:
+    cmd = _compose_base(compose_file, env_file, project_name, profiles) + ["build"]
     if no_cache:
         cmd.append("--no-cache")
     if build_args:

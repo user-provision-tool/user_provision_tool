@@ -227,9 +227,13 @@ def recover_on_startup(
             # Zombie entry: registry says deployed, but no container exists.
             if compose_file and Path(compose_file).exists():
                 env_file = entry.get("env_file_path") or None
+                env_files = list(entry.get("env_files") or [])
+                profiles = list(entry.get("profiles") or [])
+                if not env_files and env_file:
+                    env_files = [env_file]
                 print(f"[recovery] Zombie entry {user_name}/{service_name}/{label} — starting containers via compose_up", flush=True)
                 try:
-                    docker_ops.compose_up(compose_file, env_file=env_file, project_name=network_name)
+                    docker_ops.compose_up(compose_file, env_file=env_files or None, project_name=network_name, profiles=profiles)
                     zombies_restarted += 1
                     print(f"[recovery] Zombie entry {user_name}/{service_name}/{label} — started successfully", flush=True)
                 except Exception as exc:

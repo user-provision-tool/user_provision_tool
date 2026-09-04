@@ -3,8 +3,8 @@
 Usage:
     python cli/register.py -u USER_NAME -sn SERVICE_NAME
         -pr PROJECT_ROOT
-        { -tc COMPOSE_TEMPLATE | -fc COMPOSE_FILE }
-        [-v KEY=VALUE ...] [-e ENV_FILE]
+        { -tc COMPOSE_TEMPLATE | -fc COMPOSE_FILE [-fc COMPOSE_FILE ...] }
+        [-v KEY=VALUE ...] [-e ENV_FILE ...] [--profile NAME ...]
         [-tn NGINX_TEMPLATE | -fn NGINX_FILE]
         [-l LABEL] [-d DOMAIN]
 
@@ -99,7 +99,15 @@ def parse_args() -> argparse.Namespace:
     )
     src_group.add_argument(
         "-fc", "--compose-file",
-        help="Filename of a plain docker-compose.yml inside project root. Converted to .yml.j2 before registration.",
+        action="append",
+        default=[],
+        metavar="FILE",
+        help=(
+            "Filename of a plain docker-compose.yml inside project root. Converted "
+            "to .yml.j2 before registration. Repeatable: two or more files are "
+            "merged with compose-spec semantics (docker compose -f a -f b config "
+            "--no-interpolate --no-path-resolution) into <first>.merged.yml.j2."
+        ),
     )
 
     p.add_argument("-v", "--volume", action="append", default=[],
@@ -109,7 +117,20 @@ def parse_args() -> argparse.Namespace:
             "When omitted, paths are auto-generated under USER_DATA_DIR."
         ),
     )
-    p.add_argument("-e", "--env-file", default=None, help="Path to .env file for docker compose variable substitution")
+    p.add_argument("-e", "--env-file", action="append", default=[],
+        metavar="FILE",
+        help=(
+            "Path to an env file for docker compose variable substitution "
+            "(repeatable; order preserved, later files win)."
+        ),
+    )
+    p.add_argument("--profile", action="append", default=[],
+        metavar="NAME",
+        help=(
+            "Compose profile to activate (repeatable). Default (no flag) runs "
+            "only default services plus the implicit \"\" profile."
+        ),
+    )
 
     nginx_group = p.add_mutually_exclusive_group()
     nginx_group.add_argument(
@@ -199,6 +220,7 @@ def main() -> None:
         sys.exit(1)
 
     # --- Resolve compose template (-tc used directly; -fc triggers conversion) ---
+    compose_sources: list[str] = []
     if args.compose_template:
         compose_src = project_root / args.compose_template
         if not compose_src.exists():
@@ -206,15 +228,31 @@ def main() -> None:
             sys.exit(1)
         compose_template = str(compose_src)
     else:
-        compose_src = project_root / args.compose_file
-        if not compose_src.exists():
-            print(f"ERROR: compose file not found: {compose_src}", file=sys.stderr)
-            sys.exit(1)
-        src = compose_src
-        template_out = str(src.parent / f"{src.stem}.yml.j2")
+        compose_files = [project_root / f for f in args.compose_file]
+        for cf in compose_files:
+            if not cf.exists():
+                print(f"ERROR: compose file not found: {cf}", file=sys.stderr)
+                sys.exit(1)
+        compose_sources = [str(cf) for cf in compose_files]
+        if len(compose_files) == 1:
+            src = compose_files[0]
+            template_out = str(src.parent / f"{src.stem}.yml.j2")
+        else:
+            # ≥2 files: ordered merge → ONE template named <first>.merged.yml.j2
+            from lib.compose_merge import merge_compose_files
+            first = compose_files[0]
+            merged_out = str(first.parent / f"{first.stem}.merged.yml")
+            template_out = str(first.parent / f"{first.stem}.merged.yml.j2")
+            try:
+                merge_compose_files(compose_sources, merged_out)
+            except RuntimeError as exc:
+                print(f"ERROR: compose merge failed: {exc}", file=sys.stderr)
+                sys.exit(1)
+            src = Path(merged_out)
+            print(f"[0/4] Merged {len(compose_files)} compose files: {merged_out}")
         try:
             src_to_key = compose_file_to_template(
-                str(compose_src), template_out, service_name_hint=args.service_name
+                str(src), template_out, service_name_hint=args.service_name
             )
         except ValueError as exc:
             print(f"ERROR: could not convert compose file: {exc}", file=sys.stderr)
@@ -227,12 +265,13 @@ def main() -> None:
                 print(f"       volume key '{k}'  ←  {s}")
             print("       Pass these with -v KEY=HOST_PATH (or omit to be warned).")
 
-    env_file: str | None = None
-    if args.env_file:
-        env_file = str(Path(args.env_file).resolve())
-        if not Path(env_file).exists():
-            print(f"ERROR: env file not found: {env_file}", file=sys.stderr)
+    env_files: list[str] = []
+    for ef in args.env_file:
+        resolved = str(Path(ef).resolve())
+        if not Path(resolved).exists():
+            print(f"ERROR: env file not found: {resolved}", file=sys.stderr)
             sys.exit(1)
+        env_files.append(resolved)
 
     # --- Resolve nginx template (-tn used directly; -fn triggers conversion) ---
     # Extract compose service names so proxy_pass targets matching a compose
@@ -320,7 +359,9 @@ def main() -> None:
             passwd=passwd,
             nginx_template=nginx_template,
             domain=args.domain,
-            env_file=env_file,
+            env_files=env_files or None,
+            profiles=args.profile or None,
+            compose_sources=compose_sources or None,
             build_args=build_args,
             https=args.https,
             fullchain=args.fullchain,

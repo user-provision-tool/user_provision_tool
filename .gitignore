@@ -6,8 +6,8 @@ dist/
 wheels/
 *.egg-info
 
-# Virtual environments
-.venv/
+# Virtual environments (dirs + the repo-root .venv symlink used by uv)
+.venv
 
 # Test caches
 .pytest_cache/
@@ -32,5 +32,7 @@ _ref/
 .github/
 example/
 */tests/fixtures/docker-compose.user-*
+*/tests/fixtures/.env.*.0
+*/tests/fixtures/.env.*.0.generated
 _ignore/
 task_registry.json

@@ -1367,43 +1367,49 @@ class TestComposeConverter:
     def _convert_to_text(self, data: dict) -> tuple[str, dict]:
         """Run convert() and return (detokenized_yaml_text, src_to_key)."""
         from lib.compose_converter import convert
-        transformed, src_to_key, tokens = convert(data)
+        transformed, src_to_key, tokens, _ = convert(data)
         raw = yaml.dump(transformed, default_flow_style=False, sort_keys=False)
         return tokens.detokenize(raw), src_to_key
 
     def test_convert_strips_name(self):
         from lib.compose_converter import convert
-        transformed, _, _ = convert(self._sample_data())
+        transformed, _, _, _ = convert(self._sample_data())
         assert "name" not in transformed
 
     def test_convert_strips_ports(self):
         from lib.compose_converter import convert
-        transformed, _, _ = convert(self._sample_data())
+        transformed, _, _, _ = convert(self._sample_data())
         assert "ports" not in transformed["services"]["web"]
 
-    def test_convert_strips_profiles(self):
-        """A service whose only profile is \"\" is kept with profiles key removed."""
-        from lib.compose_converter import convert
-        data = self._sample_data()
-        data["services"]["db"]["profiles"] = [""]
-        transformed, _, _ = convert(data)
-        assert "db" in transformed["services"]
-        assert "profiles" not in transformed["services"]["db"]
+    def test_convert_keeps_profiles_verbatim(self):
+        """design §Profiles: converter ships profiles: as-is (GAP-4 fix).
 
-    def test_convert_excludes_named_profile_services(self):
+        A service with a named profile stays in the template WITH its
+        profiles key — activation happens at up time via --profile.
+        """
         from lib.compose_converter import convert
         data = self._sample_data()
         data["services"]["web"]["profiles"] = ["falkordb"]
-        transformed, _, _ = convert(data)
-        assert "web" not in transformed["services"]
+        transformed, _, _, _ = convert(data)
+        assert "web" in transformed["services"]
+        assert transformed["services"]["web"]["profiles"] == ["falkordb"]
 
     def test_convert_keeps_empty_string_profile_services(self):
         from lib.compose_converter import convert
         data = self._sample_data()
         data["services"]["web"]["profiles"] = [""]
-        transformed, _, _ = convert(data)
+        transformed, _, _, _ = convert(data)
         assert "web" in transformed["services"]
-        assert "profiles" not in transformed["services"]["web"]
+        assert transformed["services"]["web"]["profiles"] == [""]
+
+    def test_convert_keeps_mixed_empty_and_named_profile_lists(self):
+        """dify db_postgres case: [\"\", \"postgresql\"] must NOT be dropped."""
+        from lib.compose_converter import convert
+        data = self._sample_data()
+        data["services"]["db"]["profiles"] = ["", "postgresql"]
+        transformed, _, _, _ = convert(data)
+        assert "db" in transformed["services"]
+        assert transformed["services"]["db"]["profiles"] == ["", "postgresql"]
 
     def test_convert_sets_container_name_template(self):
         text, _ = self._convert_to_text(self._sample_data())
@@ -1418,13 +1424,13 @@ class TestComposeConverter:
 
     def test_convert_src_to_key_bind_mounts(self):
         from lib.compose_converter import convert
-        _, src_to_key, _ = convert(self._sample_data())
+        _, src_to_key, _, _ = convert(self._sample_data())
         assert "/data/myapp/html" in src_to_key
         assert "/var/lib/myapp/db" in src_to_key
 
     def test_convert_named_volumes_excluded_from_src_to_key(self):
         from lib.compose_converter import convert
-        _, src_to_key, _ = convert(self._sample_data())
+        _, src_to_key, _, _ = convert(self._sample_data())
         assert "db_socket" not in src_to_key
 
     def test_convert_replaces_networks(self):
@@ -1445,7 +1451,7 @@ class TestComposeConverter:
         data = self._sample_data()
         data["volumes"]["shared_vol"] = {"external": True}
         from lib.compose_converter import convert
-        transformed, _, tokens = convert(data)
+        transformed, _, tokens, _ = convert(data)
         raw = yaml.dump(transformed, default_flow_style=False, sort_keys=False)
         text = tokens.detokenize(raw)
         # External volumes must NOT get a container_prefix name override
@@ -1563,7 +1569,7 @@ class TestComposeConverter:
                 "b": {"image": "x", "volumes": ["/beta/data:/b"]},
             }
         }
-        _, src_to_key, _ = convert(data)
+        _, src_to_key, _, _ = convert(data)
         keys = list(src_to_key.values())
         assert len(keys) == len(set(keys)), "Duplicate volume keys generated"
 
@@ -1711,7 +1717,7 @@ class TestComposeConverter:
                 },
             },
         }
-        _, src_to_key, _ = convert(data)
+        _, src_to_key, _, _ = convert(data)
         assert "/var/run/docker.sock" not in src_to_key, (
             "docker.sock must not appear in src_to_key — it is a passthrough path"
         )
@@ -1756,7 +1762,7 @@ services:
                 },
             },
         }
-        _, src_to_key, _ = convert(data)
+        _, src_to_key, _, _ = convert(data)
         assert "/run/docker.sock" not in src_to_key
 
     def test_passthrough_paths_surrounded_by_normal_bind_mounts(self):
@@ -1774,7 +1780,7 @@ services:
                 },
             },
         }
-        _, src_to_key, _ = convert(data)
+        _, src_to_key, _, _ = convert(data)
         # Normal bind mount IS converted
         assert "/data/html" in src_to_key
         # docker.sock is NOT converted
@@ -2234,8 +2240,10 @@ class TestProvisionerEnvFile:
         assert Path(stored).exists(), f"Per-user env file not found: {stored}"
         assert Path(stored).read_text() == "FOO=bar\n"
 
-    def test_register_without_env_file_has_null_env_file_path(self):
-        """Without env_file, registry env_file_path should be None."""
+    def test_register_without_env_file_uses_empty_per_user_env(self):
+        """Always-pass --env-file invariant (design G17): with no env selected
+        an EMPTY per-user env file is created and recorded, so compose never
+        auto-reads the recipe-level .env."""
         provisioner.register_user(
             user_name="noenv",
             service_name="myapp",
@@ -2247,7 +2255,15 @@ class TestProvisionerEnvFile:
         entry = registry.get_user_service("noenv", "myapp", "0")
         assert entry is not None
         stored = entry.get("env_file_path") or None
-        assert stored is None, f"Expected None, got: {stored}"
+        assert stored is not None, "per-user env file must always exist"
+        assert stored.endswith(".env.noenv.0")
+        assert Path(stored).exists()
+        assert Path(stored).read_text() == ""
+        assert entry.get("env_files") == [stored]
+        # compose_up must receive the explicit per-user --env-file
+        up_calls = [c for c in self.calls if "up" in c]
+        assert up_calls, "compose_up should have been called"
+        assert any("--env-file" in c and stored in c for c in up_calls)
 
     def test_register_compose_up_uses_per_user_env_file(self):
         """The --env-file flag to compose_up points to the per-user copy."""
@@ -3169,6 +3185,7 @@ class TestCheckMissingFiles:
         assert "ready" in fields
         assert "missing" in fields
         assert "existing" in fields
+        assert "needs_env" in fields
 
     def test_check_missing_files_endpoint_registered(self, monkeypatch):
         """The endpoint should be registered on the FastAPI app."""
@@ -3227,7 +3244,10 @@ class TestCheckMissingFiles:
 
         svc_dir = tmp_path / "myapp_j2"
         svc_dir.mkdir()
-        (svc_dir / "docker-compose.yml.j2").write_text("services:\n  web: {{ container_prefix }}")
+        # compose references ${TAG} → needs_env true → .env genuinely missing
+        (svc_dir / "docker-compose.yml.j2").write_text(
+            "services:\n  web:\n    image: nginx:${TAG}"
+        )
         (svc_dir / "nginx.conf.j2").write_text("server { server_name {{ hostname }}; }")
         (svc_dir / "Dockerfile").write_text("FROM python:3.13")
 
@@ -3240,10 +3260,36 @@ class TestCheckMissingFiles:
             assert response.status_code == 200
             data = response.json()
             assert data["ready"] is False  # .env is missing
+            assert data["needs_env"] is True
             assert ".env" in data["missing"]
             assert "docker-compose" in data["existing"]
             assert "nginx.conf" in data["existing"]
             assert "Dockerfile" in data["existing"]
+        finally:
+            api.SOURCE_PROJECTS_DIR = original
+
+    def test_check_missing_files_no_env_vars_no_env_required(self, tmp_path, monkeypatch):
+        """GAP-10: without ${VAR} interpolation, .env is NOT in the missing list."""
+        import api
+        from pathlib import Path
+
+        svc_dir = tmp_path / "novars"
+        svc_dir.mkdir()
+        (svc_dir / "docker-compose.yml").write_text("services:\n  web:\n    image: nginx:alpine")
+        (svc_dir / "nginx.conf").write_text("server { listen 80; }")
+        (svc_dir / "Dockerfile").write_text("FROM python:3.13")
+
+        original = api.SOURCE_PROJECTS_DIR
+        try:
+            api.SOURCE_PROJECTS_DIR = tmp_path
+            from fastapi.testclient import TestClient
+            client = TestClient(api.app)
+            response = client.get("/services/novars/check-missing-files")
+            assert response.status_code == 200
+            data = response.json()
+            assert data["needs_env"] is False
+            assert ".env" not in data["missing"]
+            assert data["ready"] is True
         finally:
             api.SOURCE_PROJECTS_DIR = original
 
@@ -3317,7 +3363,10 @@ class TestCheckMissingFiles:
             data = response.json()
             assert data["ready"] is False
             assert len(data["existing"]) == 0  # root files are outside the recipe
-            assert len(data["missing"]) == 4
+            # No compose in the recipe → no interpolation → .env not required
+            assert data["needs_env"] is False
+            assert ".env" not in data["missing"]
+            assert len(data["missing"]) == 3
         finally:
             api.SOURCE_PROJECTS_DIR = original
 
@@ -3549,6 +3598,17 @@ class TestV5PortalDDeprecated:
         assert "include /etc/nginx/env.d" not in conf
         assert "listen 80 default_server;" in conf
         assert "return 444;" in conf
+
+    def test_internal_nginx_provision_conf_server_names_hash_bucket_size(self):
+        """nginx.provision.conf raises server_names_hash_bucket_size above the
+        64-byte default — generated services.d server_names (up to ~51 chars +
+        ngx_hash_elt_t overhead) otherwise fail nginx -t with the
+        'could not build server_names_hash' [emerg] (regression 2026-09-01,
+        subnet-acl-nginx crash-loop)."""
+        repo = Path(__file__).resolve().parents[2]  # _users_provision
+        conf = (repo / "nginx.provision.conf").read_text()
+        # Must be set inside the http block (after 'http {'), before any include.
+        assert "server_names_hash_bucket_size 128;" in conf
 
     def test_render_nginx_conf_no_portal_constants(self, tmp_path):
         """Rendered confs never reference the v4 portal constants ($portal_scheme

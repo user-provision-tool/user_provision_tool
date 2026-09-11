@@ -12,6 +12,10 @@ import sys
 import threading
 from pathlib import Path
 
+# Bound every docker subprocess so a hung daemon op cannot wedge the API forever.
+DOCKER_TIMEOUT = 30.0
+
+
 
 _LOG_FILE = os.environ.get("DOCKER_OPS_LOG", "")
 
@@ -95,16 +99,26 @@ def _run(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
                 pass
 
     def _read_stdout(pipe) -> None:
-        for line in iter(pipe.readline, ""):
-            print(line, end="", flush=True)
-            _write_line(line)
-            stdout_lines.append(line)
+        # The pipe can be closed under us when the child exits (the `with
+        # Popen` block closes it) — readline then raises ValueError/OSError and
+        # the thread died noisily ("Exception in thread … I/O operation on
+        # closed file"). End the loop quietly instead.
+        try:
+            for line in iter(pipe.readline, ""):
+                print(line, end="", flush=True)
+                _write_line(line)
+                stdout_lines.append(line)
+        except (ValueError, OSError):
+            pass
 
     def _read_stderr(pipe) -> None:
-        for line in iter(pipe.readline, ""):
-            print(line, end="", file=sys.stderr, flush=True)
-            _write_line(line)
-            stderr_lines.append(line)
+        try:
+            for line in iter(pipe.readline, ""):
+                print(line, end="", file=sys.stderr, flush=True)
+                _write_line(line)
+                stderr_lines.append(line)
+        except (ValueError, OSError):
+            pass
 
     with subprocess.Popen(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env) as proc:
         t_out = threading.Thread(target=_read_stdout, args=(proc.stdout,), daemon=True)
@@ -237,7 +251,7 @@ def docker_info() -> dict[str, Any]:
     """Return docker system info including container counts."""
     result = subprocess.run(
         ["docker", "info", "--format", "{{json .}}"],
-        text=True, capture_output=True,
+        text=True, capture_output=True, timeout=DOCKER_TIMEOUT,
     )
     import json
     try:
@@ -267,7 +281,7 @@ def _docker_ps_raw(all_containers: bool) -> list[dict[str, str]]:
     args = ["docker", "ps", "--format", "{{.Names}}\t{{.Status}}\t{{.Image}}"]
     if flag:
         args.insert(2, flag)  # docker ps -a --format ...
-    result = subprocess.run(args, text=True, capture_output=True)
+    result = subprocess.run(args, text=True, capture_output=True, timeout=DOCKER_TIMEOUT)
     containers = []
     for line in result.stdout.splitlines():
         parts = line.split("\t")
@@ -288,7 +302,7 @@ def docker_stats_snapshot() -> list[dict[str, str]]:
             "--format", "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}",
         ],
         text=True,
-        capture_output=True,
+        capture_output=True, timeout=DOCKER_TIMEOUT,
     )
     stats = []
     for line in result.stdout.splitlines():
@@ -306,7 +320,7 @@ def network_list() -> list[str]:
     """Return list of Docker network names."""
     result = subprocess.run(
         ["docker", "network", "ls", "--format", "{{.Name}}"],
-        text=True, capture_output=True,
+        text=True, capture_output=True, timeout=DOCKER_TIMEOUT,
     )
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
@@ -316,7 +330,7 @@ def network_inspect(network: str) -> dict | None:
     import json
     result = subprocess.run(
         ["docker", "network", "inspect", network],
-        text=True, capture_output=True,
+        text=True, capture_output=True, timeout=DOCKER_TIMEOUT,
     )
     if result.returncode != 0:
         return None
@@ -337,7 +351,7 @@ def container_inspect(container: str) -> dict | None:
     import json
     result = subprocess.run(
         ["docker", "container", "inspect", container],
-        text=True, capture_output=True,
+        text=True, capture_output=True, timeout=DOCKER_TIMEOUT,
     )
     if result.returncode != 0:
         return None
@@ -352,7 +366,7 @@ def container_exists(container: str) -> bool:
     """Check if a container exists (running or stopped)."""
     result = subprocess.run(
         ["docker", "container", "inspect", container],
-        text=True, capture_output=True,
+        text=True, capture_output=True, timeout=DOCKER_TIMEOUT,
     )
     return result.returncode == 0
 
@@ -381,7 +395,7 @@ def container_logs(container: str, tail: int = 100) -> str:
     """Get the last *tail* lines of a container's logs."""
     result = subprocess.run(
         ["docker", "logs", "--tail", str(tail), container],
-        text=True, capture_output=True,
+        text=True, capture_output=True, timeout=DOCKER_TIMEOUT,
     )
     return result.stdout
 
@@ -402,7 +416,7 @@ def orphan_network_cleanup(network: str, nginx_container: str = "subnet-acl-ngin
         network_disconnect(nginx_container, network)
         result = subprocess.run(
             ["docker", "network", "rm", network],
-            text=True, capture_output=True,
+            text=True, capture_output=True, timeout=DOCKER_TIMEOUT,
         )
         return result.returncode == 0
     return False

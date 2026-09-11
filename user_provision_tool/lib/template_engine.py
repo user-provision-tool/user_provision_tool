@@ -46,6 +46,16 @@ def user_network_name(service_name: str, user_name: str, label: str) -> str:
     return f"{service_name}-user_{user_name}-{label}"
 
 
+def service_hostname(service_name: str, user_name: str, label: str, domain: str) -> str:
+    """The nginx ``server_name`` / externally-served hostname for one instance.
+
+    Single source of truth for the service URL host — used both at deploy time
+    (nginx conf) and by the pre-deploy url-base endpoint, so the pre-deploy and
+    deploy URLs are consistent by construction (design: serving-URL contract).
+    """
+    return f"{service_name}-{user_name}-{label}.{domain}"
+
+
 class _PathPlaceholderUndefined(Undefined):
     """Renders as a valid absolute path placeholder so YAML stays parseable."""
     def __str__(self) -> str:
@@ -149,17 +159,16 @@ def extract_template_volumes(compose_template_path: str) -> list[str]:
     return result
 
 
-def per_user_env_file_name(env_file_path: str, user_name: str, label: str, index: int) -> str:
-    """Per-user-per-recipe copy name for an interpolation env file.
+def canonical_env_file_name(index: int, user_name: str, label: str) -> str:
+    """Positional canonical name for an interpolation env file (design §3).
 
-    The first (primary) file keeps the historical convention
-    ``.env.{user}.{label}``; additional files (repeatable --env-file, order
-    preserved) get ``{stem}.{user}.{label}{suffix}``.
+    The INCOMING name is ignored entirely; the index is the position in the
+    `env_files` list (0-based → 1-based canonical suffix). This replaces the
+    old source-derived convention (which produced pathological duplicates
+    like ``.env.specialsync2.specialsync2.0.0`` from already-per-user-named
+    inputs).
     """
-    if index == 0:
-        return f".env.{user_name}.{label}"
-    p = Path(env_file_path)
-    return f"{p.stem}.{user_name}.{label}{p.suffix}"
+    return f".env.{index + 1}.{user_name}.{label}"
 
 
 def render_compose(
@@ -209,7 +218,16 @@ def render_compose(
     prefix = container_prefix(service_name, user_name, label)
 
     # --- Resolve declared service env files to per-user copies ---
-    per_user_env_name = f".env.{user_name}.{label}"
+    # The PROJECT interpolation env (declared as ``.env`` / ``./.env`` in a
+    # service's env_file) is NOT a service file to copy from the recipe — it
+    # must resolve to the canonical per-user interpolation env (design §3), the
+    # copy of the FIRST passed interpolation env file (or the empty fallback).
+    primary_env_name = canonical_env_file_name(0, user_name, label)
+    all_env: list[str] = list(env_files_all or [])
+    if env_file and env_file not in all_env:
+        all_env.insert(0, env_file)
+    has_interp_env = any(Path(ef).is_file() for ef in all_env)
+
     declared_env = extract_template_env_file_sources(template_path)
     resolved_env_files: dict[str, str] = {}
     copied_names: set[str] = set()
@@ -218,6 +236,10 @@ def render_compose(
         if override:
             # Operator-supplied host path override — used as-is, never seeded.
             resolved_env_files[key] = override
+            continue
+        # Project interpolation .env → point at the canonical per-user env.
+        if Path(declared_src).name in (".env", ".env.example"):
+            resolved_env_files[key] = primary_env_name if has_interp_env else declared_src
             continue
         src = Path(template_path).parent / declared_src
         if src.is_file():
@@ -247,15 +269,16 @@ def render_compose(
 
     # --- Handle interpolation env files: copy with per-user names + rewrite .env refs ---
     # Repeatable --env-file (design §Env story L153-155): order is preserved,
-    # later files win at up time (compose semantics).
-    all_env: list[str] = list(env_files_all or [])
-    if env_file and env_file not in all_env:
-        all_env.insert(0, env_file)
+    # later files win at up time (compose semantics). The PRIMARY is the copy of
+    # the FIRST interpolation env file → canonical .env.1.{user}.{label} (or the
+    # empty fallback when none is passed); services' env_file refs to the
+    # project ``.env``/``./.env`` are rewritten to this primary.
     copied_env: str | None = None
     for idx, ef in enumerate(all_env):
         if not Path(ef).is_file():
             continue
-        dest = Path(output_path).parent / per_user_env_file_name(ef, user_name, label, idx)
+        # Positional canonicalization (design §3): incoming names ignored.
+        dest = Path(output_path).parent / canonical_env_file_name(idx, user_name, label)
         if dest.name not in copied_names and Path(ef).resolve() != dest.resolve():
             shutil.copy2(ef, dest)
             copied_names.add(dest.name)
@@ -263,12 +286,36 @@ def render_compose(
         if idx == 0:
             copied_env = str(dest)
 
-    if all_env:
-        # Replace env_file: .env references in the rendered compose so
-        # containers load env vars from the correct per-user file.
-        # Walk the parsed dict to replace .env before dumping — avoids
-        # indentation-dependent regex matching on flattened YAML text.
-        rendered = _rewrite_env_file_in_dict(rendered, per_user_env_name)
+    if not copied_env:
+        # Empty-pass invariant (design G17): create the empty canonical primary
+        # so `--env-file` blocks compose's auto-read of the recipe .env, and the
+        # .env refs point at it (uniform naming — no legacy `.env.{u}.{l}`).
+        empty_primary = Path(output_path).parent / primary_env_name
+        if not empty_primary.exists():
+            empty_primary.write_text("")
+            Path(str(empty_primary) + ".generated").write_text("")
+        copied_env = str(empty_primary)
+
+    # Runtime view of the interpolation env = the ORDERED canonical copies of
+    # every passed interpolation file (decision 3: expand, later-wins == the
+    # merge `--env-file` gives interpolation). N==1 collapses to the single
+    # `.env.1…`.
+    env_ref_targets = [
+        canonical_env_file_name(idx, user_name, label)
+        for idx, ef in enumerate(all_env)
+        if Path(ef).is_file()
+    ]
+    if not env_ref_targets:
+        env_ref_targets = [primary_env_name]
+
+    if has_interp_env or not all_env:
+        # Rewrite env_file refs that RESOLVE to the project `.env` (path
+        # identity — `.env`, `./.env`, `././.env`, `sub/../.env` all match) to
+        # the canonical list above, so containers load the same per-user env
+        # compose interpolates from.
+        rendered = _rewrite_env_file_in_dict(
+            rendered, env_ref_targets, Path(template_path).parent
+        )
 
     with open(output_path, "w") as f:
         f.write(rendered)
@@ -278,22 +325,39 @@ def render_compose(
     return copied_env
 
 
-def _rewrite_env_file_in_dict(yaml_text: str, per_user_env_name: str) -> str:
-    """Replace ``.env`` references in ``env_file:`` directives with *per_user_env_name*.
+def _rewrite_env_file_in_dict(
+    yaml_text: str,
+    env_ref_targets: list[str],
+    base_dir: Path,
+) -> str:
+    """Rewrite env_file refs that RESOLVE to the project interpolation ``.env``.
 
-    Parses the YAML text into a dict, walks the service definitions to find
-    and replace ``env_file`` values pointing to ``.env``, then re-serialises.
-    This is immune to indentation variations that break regex-based approaches.
+    Matching is by PATH IDENTITY against ``base_dir/.env`` (any spelling —
+    ``.env``, ``./.env``, ``././.env``, ``sub/../.env`` — resolves to the same
+    file and matches). A matched ref is replaced by ``env_ref_targets``, the
+    ordered canonical interpolation files (decision 3: expansion; N==1 collapses
+    to the single name).
 
-    Handles both forms:
-      - String:  ``env_file: .env``
-      - List:    ``env_file:\\n  - .env``
+    Handles string form, list items, and ``{path, required}`` object entries.
     """
+    project_env = (base_dir / ".env").resolve()
+
+    def _is_project_env(v: Any) -> bool:
+        if not isinstance(v, str) or not v:
+            return False
+        try:
+            return (base_dir / v).resolve() == project_env
+        except Exception:
+            return False
+
+    def _targets() -> list[str]:
+        return env_ref_targets if len(env_ref_targets) > 1 else env_ref_targets
+
     try:
         data = yaml.safe_load(yaml_text)
     except yaml.YAMLError:
         # Fall back to the legacy regex approach if YAML is unparseable
-        return _rewrite_env_file_refs_legacy(yaml_text, per_user_env_name)
+        return _rewrite_env_file_refs_legacy(yaml_text, env_ref_targets, base_dir)
 
     if not isinstance(data, dict):
         return yaml_text
@@ -304,12 +368,23 @@ def _rewrite_env_file_in_dict(yaml_text: str, per_user_env_name: str) -> str:
             if not isinstance(svc, dict):
                 continue
             env_val = svc.get("env_file")
-            if env_val == ".env":
-                svc["env_file"] = per_user_env_name
+            if isinstance(env_val, str):
+                if _is_project_env(env_val):
+                    svc["env_file"] = _targets()
             elif isinstance(env_val, list):
-                svc["env_file"] = [
-                    per_user_env_name if v == ".env" else v for v in env_val
-                ]
+                new_items: list[Any] = []
+                for v in env_val:
+                    if isinstance(v, dict):
+                        # {path, required: …} object entry
+                        if _is_project_env(v.get("path")):
+                            new_items.extend(_targets())
+                        else:
+                            new_items.append(v)
+                    elif _is_project_env(v):
+                        new_items.extend(_targets())
+                    else:
+                        new_items.append(v)
+                svc["env_file"] = new_items
 
     return yaml.dump(
         data,
@@ -321,13 +396,23 @@ def _rewrite_env_file_in_dict(yaml_text: str, per_user_env_name: str) -> str:
     )
 
 
-def _rewrite_env_file_refs_legacy(yaml_text: str, per_user_env_name: str) -> str:
+def _rewrite_env_file_refs_legacy(
+    yaml_text: str, env_ref_targets: list[str], base_dir: Path
+) -> str:
     """Legacy regex-based fallback for unparseable YAML.
 
-    Handles both forms:
-      - String:  ``env_file: .env``
-      - List:    ``env_file:\\n  - .env``
+    Best-effort path-identity match (resolution against ``base_dir/.env``);
+    a matched ref is replaced by the canonical targets (decision 3).
     """
+    targets = env_ref_targets if len(env_ref_targets) > 1 else env_ref_targets
+    project_env = (base_dir / ".env").resolve()
+
+    def _proj(v: str) -> bool:
+        try:
+            return bool(v) and (base_dir / v).resolve() == project_env
+        except Exception:
+            return False
+
     lines = yaml_text.split("\n")
     result: list[str] = []
     in_env_file = False
@@ -346,19 +431,19 @@ def _rewrite_env_file_refs_legacy(yaml_text: str, per_user_env_name: str) -> str
             # List item under env_file:
             m2 = re.match(r"^(\s+)-\s+(.*)$", line)
             if m2 and len(m2.group(1)) >= env_file_indent:
-                if m2.group(2) == ".env":
-                    line = f"{m2.group(1)}- {per_user_env_name}"
-                result.append(line)
+                if _proj(m2.group(2)):
+                    for t in targets:
+                        result.append(f"{m2.group(1)}- {t}")
+                else:
+                    result.append(line)
                 continue
             else:
                 in_env_file = False
 
-        # Handle string form: env_file: .env  (on a single line)
-        line = re.sub(
-            r"^(\s*env_file:\s+)\.env(\s*)$",
-            rf"\1{per_user_env_name}\2",
-            line,
-        )
+        # Handle string form: env_file: .env (single line)
+        m3 = re.match(r"^(\s*env_file:\s+)(.*?)(\s*)$", line)
+        if m3 and _proj(m3.group(2)):
+            line = m3.group(1) + (targets[0] if len(targets) == 1 else ", ".join(targets)) + m3.group(3)
         result.append(line)
 
     return "\n".join(result)
@@ -479,7 +564,9 @@ def render_nginx_conf(
         "domain_name": domain_name,
         "container_prefix": prefix,
         "network_name": user_network_name(service_name, user_name, label),
-        "hostname": f"{service_name}-{user_name}-{label}.{domain_name}",
+        # Single source of truth for the served hostname (feature 3): the same
+        # builder the pre-deploy /service-url-base endpoint and the registry use.
+        "hostname": service_hostname(service_name, user_name, label, domain_name),
         "htpasswd_path": htpasswd_path,
         "https": https,
         "ssl_certificate_path": ssl_certificate_path,
@@ -536,154 +623,3 @@ def render_nginx_conf(
     Path(str(output_path) + ".generated").write_text("")
 
 
-def write_env_d(
-    generated_dir: str,
-    enable_acl: bool,
-    portal_scheme: str = "http",
-    dashboard_host: str = "localhost:8775",
-) -> Path:
-    """DEPRECATED (v5, decision 1/6) — ``env.d`` disappears from the internal side.
-
-    v5 moves the ACL gate entirely to the edge ``-nginx-acl`` and the internal
-    per-service confs are the simple ACL-free form (§5). ``ENABLE_ACL`` touches
-    only the gateway and the edge. This writer is retained only so existing
-    callers (older ``-api`` versions) fail gracefully; the current ``-api`` no
-    longer calls it. Do not use in new code.
-
-    Returns the path of the written ``mode.env`` (v4 behaviour, unchanged).
-    """
-    env_dir = Path(generated_dir) / "env.d"
-    env_dir.mkdir(parents=True, exist_ok=True)
-    mode = "acl" if enable_acl else "basic"
-    mode_file = env_dir / "mode.env"
-    mode_file.write_text(
-        f"set $auth_mode {mode};\n"
-        f"set $portal_scheme {portal_scheme};\n"
-        f"set $dashboard_host {dashboard_host};\n"
-    )
-    return mode_file
-
-
-_PORTAL_SERVER_HEADER = """\
-    # Deferred DNS (B12): the gateway/dashboard may not be up when nginx
-    # starts (minimal, gateway-less deployment). Variables + resolver defer
-    # hostname resolution to request time so nginx always starts cleanly.
-    resolver 127.0.0.11 valid=30s ipv6=off;
-    set $portal_api subnet-acl-gateway:8770;
-    set $portal_dash subnet-acl-dashboard:80;
-"""
-
-
-def _portal_locations() -> str:
-    """DEPRECATED (v5, decision 5/15) — the portal moves to the edge ``-nginx-acl``."""
-    return (
-        "    # Internal-only endpoints must not be reachable via the portal (GAP-31).\n"
-        "    location = /api/auth/verify { return 404; }\n"
-        "    location = /api/auth/exchange { return 404; }\n"
-        "\n"
-        "    # API routes → provision-gateway\n"
-        "    location /api/ {\n"
-        "        proxy_pass http://$portal_api;\n"
-        "        proxy_set_header Host $host;\n"
-        "        proxy_set_header X-Real-IP $remote_addr;\n"
-        "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
-        "        proxy_set_header X-Forwarded-Proto $scheme;\n"
-        "    }\n"
-        "\n"
-        "    # Service redirect (GET /go/{hostname}) → provision-gateway /api/auth/go/{hostname}\n"
-        "    location /go/ {\n"
-        "        rewrite ^/go/(.*) /api/auth/go/$1 break;\n"
-        "        proxy_pass http://$portal_api;\n"
-        "        proxy_set_header Host $host;\n"
-        "        proxy_set_header X-Real-IP $remote_addr;\n"
-        "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
-        "        proxy_set_header X-Forwarded-Proto $scheme;\n"
-        "    }\n"
-        "\n"
-        "    # Login page / POST → provision-gateway\n"
-        "    location /login {\n"
-        "        proxy_pass http://$portal_api;\n"
-        "        proxy_set_header Host $host;\n"
-        "        proxy_set_header X-Real-IP $remote_addr;\n"
-        "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
-        "        proxy_set_header X-Forwarded-Proto $scheme;\n"
-        "    }\n"
-        "\n"
-        "    # Alert pages (token_expired, acl_denied) → provision-dashboard SPA\n"
-        "    location /alert {\n"
-        "        proxy_pass http://$portal_dash;\n"
-        "        proxy_set_header Host $host;\n"
-        "        proxy_set_header X-Real-IP $remote_addr;\n"
-        "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
-        "        proxy_set_header X-Forwarded-Proto $scheme;\n"
-        "    }\n"
-        "\n"
-        "    # Dashboard SPA root → provision-dashboard (lowest priority catch-all)\n"
-        "    location / {\n"
-        "        proxy_pass http://$portal_dash;\n"
-        "        proxy_set_header Host $host;\n"
-        "        proxy_set_header X-Real-IP $remote_addr;\n"
-        "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
-        "        proxy_set_header X-Forwarded-Proto $scheme;\n"
-        "    }\n"
-    )
-
-
-_PORTAL_HTTP = (
-    "# Portal management block (PORTAL_MODE=http) — v4 §5.2, §10.3 F6.\n"
-    "server {\n"
-    "    listen 80;\n"
-    "    server_name subnet-acl-gateway.*;\n"
-    + _PORTAL_SERVER_HEADER
-    + _portal_locations()
-    + "}\n"
-)
-
-
-def write_portal_d(
-    generated_dir: str,
-    portal_mode: str = "http",
-    portal_tls_dir: str = "/etc/letsencrypt/live",
-    portal_cert_name: str = "subnet-acl-gateway",
-) -> Path:
-    """DEPRECATED on the internal (v5, decision 5/15) — the portal moves to the edge.
-
-    v5 serves the portal host from the edge ``-nginx-acl`` (§4.3 portal blocks);
-    the internal ``-nginx`` is services-only (§5) and no longer includes
-    ``portal.d``. This writer is retained for backward compatibility; the
-    current ``-api`` no longer calls it. Do not use in new code.
-
-    - ``http``  → single :80 management block (v4 behavior).
-    - ``https`` → :443 ssl portal-cert block + a :80 ``301`` HTTPS redirect.
-
-    Returns the path of the written ``portal.conf``.
-    """
-    portal_dir = Path(generated_dir) / "portal.d"
-    portal_dir.mkdir(parents=True, exist_ok=True)
-    portal_file = portal_dir / "portal.conf"
-    if portal_mode.lower() != "https":
-        portal_file.write_text(_PORTAL_HTTP)
-        return portal_file
-
-    cert_name = portal_cert_name or "subnet-acl-gateway"
-    fullchain = f"{portal_tls_dir}/{cert_name}/fullchain.pem"
-    privkey = f"{portal_tls_dir}/{cert_name}/privkey.pem"
-    https = (
-        "# Portal management block (PORTAL_MODE=https) — v4 §5.2, §10.3 F6.\n"
-        "server {\n"
-        "    listen 80;\n"
-        "    server_name subnet-acl-gateway.*;\n"
-        "    return 301 https://$host$request_uri;\n"
-        "}\n"
-        "\n"
-        "server {\n"
-        "    listen 443 ssl;\n"
-        "    server_name subnet-acl-gateway.*;\n"
-        f"    ssl_certificate {fullchain};\n"
-        f"    ssl_certificate_key {privkey};\n"
-        + _PORTAL_SERVER_HEADER
-        + _portal_locations()
-        + "}\n"
-    )
-    portal_file.write_text(https)
-    return portal_file

@@ -8,26 +8,26 @@ duplicating it.
 from __future__ import annotations
 
 import shutil
-import threading
 from pathlib import Path
 from typing import Any
 
 from . import auth, docker_ops, registry, subnet_manager, template_engine
 from .compose_converter import ensure_subnet_ipam_block, get_compose_service_names
 
-# Registry writes must be atomic across threads (relevant when the API handles
-# concurrent requests).
-_registry_lock = threading.Lock()
+# Registry writes are serialised by lib.registry.transaction() — Tier 1
+# (in-process RLock) + Tier 2 (cross-process flock on the registry sidecar
+# lock file) — around every read-modify-write.
 
 
 def _update_registry_status(user_name: str, service_name: str, label: str, status: str) -> None:
     """Update the status field of a registry entry (building → running).
 
     Used so the API can report accurate service state during long builds.
-    Thread-safe: acquires _registry_lock.
+    Thread-safe and process-safe: runs under registry.transaction().
     """
-    with _registry_lock:
+    with registry.transaction():
         users = registry._load()
+        matched = False
         for u in users:
             if (
                 u.get("user_name") == user_name
@@ -35,8 +35,12 @@ def _update_registry_status(user_name: str, service_name: str, label: str, statu
                 and str(u.get("label", "")) == str(label)
             ):
                 u["status"] = status
+                matched = True
                 break
-        registry._save(users)
+        # Save ONLY on a real match: writing back an unchanged (possibly empty)
+        # list is how an empty registry could be persisted over real data.
+        if matched:
+            registry._save(users)
 
 
 def _copy_bind_source_if_empty(
@@ -57,6 +61,12 @@ def _copy_bind_source_if_empty(
         return
     if src.is_file():
         # File→file bind: the per-user target must be a FILE, not a dir.
+        if vol_dir.exists() and vol_dir.is_dir():
+            # An empty dir (e.g. mkdir'd by an earlier deploy) would shadow
+            # the file mount — replace it ONLY when it is empty.
+            if any(vol_dir.iterdir()):
+                return
+            vol_dir.rmdir()
         if not vol_dir.exists():
             vol_dir.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, vol_dir)
@@ -73,6 +83,171 @@ def _copy_bind_source_if_empty(
             shutil.copytree(item, dst, dirs_exist_ok=True)
         else:
             shutil.copy2(item, dst)
+
+
+def _bootstrap_volumes_from_template(
+    volumes: dict[str, str], compose_template: str
+) -> None:
+    """Copy-if-empty bootstrap for an EXPLICIT volume mapping.
+
+    Each key's declared source (parsed from the converter header comments in
+    the template) is copied into the per-user target when absent or empty —
+    file→file sources land as FILES (never directories), so container
+    entrypoints that ``cp`` their mount target keep working.  Keys without a
+    declared source (runtime data dirs) are mkdir'd as before.
+    """
+    sources = template_engine.extract_template_volume_sources(compose_template)
+    template_dir = Path(compose_template).parent
+    for key, host_path in list(volumes.items()):
+        vol_dir = Path(host_path)
+        declared_src = sources.get(key)
+        if declared_src:
+            _copy_bind_source_if_empty(vol_dir, declared_src, template_dir)
+        if not vol_dir.exists():
+            vol_dir.mkdir(parents=True, exist_ok=True)
+
+
+def _materialize_env_examples(recipe_dir: Path) -> None:
+    """Copy `*.env.example` → the declared `*.env` when the latter is missing.
+
+    Repo-shipped examples become the service env files compose loads (marked
+    ``.generated``); an existing declared file (e.g. an LLM-generated ``.env``)
+    is never overwritten.
+    """
+    if not recipe_dir.is_dir():
+        return
+    for example in recipe_dir.rglob("*.env.example"):
+        declared = example.with_suffix("")
+        if declared.exists():
+            continue
+        try:
+            shutil.copy2(example, declared)
+            Path(str(declared) + ".generated").write_text("")
+        except OSError:
+            continue
+
+
+def _register_render_and_start(
+    *,
+    user_name: str,
+    service_name: str,
+    label: str,
+    entry: dict[str, Any],
+    compose_template: str,
+    compose_out: str,
+    volumes: dict[str, str],
+    env_file: str | None,
+    env_files: list[str] | None,
+    service_env_files: dict[str, str] | None,
+    nginx_template: str | None,
+    nginx_out: str | None,
+    htpasswd_out: str | None,
+    passwd_hash: str,
+    domain: str,
+    https: bool,
+    ssl_certificate_path: str,
+    ssl_certificate_key_path: str,
+    build_args: dict[str, str] | None,
+    profiles: list[str] | None,
+    _subnet: str,
+    _gateway: str,
+) -> str | None:
+    """Render the per-user compose/nginx files and start the containers.
+
+    Part of ``register_user`` — separated so the caller can roll the registry
+    entry back when ANY step here fails (a render error must never leave a
+    stale registration behind). Returns the primary per-user env copy path
+    (``copied_env``) or None.
+    """
+    # --- Render compose file ---
+    # Effective interpolation env files: repeatable --env-file order preserved
+    # (env_files list first, legacy env_file as the primary).
+    _all_env: list[str] = list(env_files or [])
+    if env_file and env_file not in _all_env:
+        _all_env.insert(0, env_file)
+    copied_env = template_engine.render_compose(
+        compose_template, compose_out,
+        user_name, service_name, label, volumes,
+        env_file=_all_env[0] if _all_env else None,
+        env_files_all=_all_env or None,
+        env_files=service_env_files or None,
+        subnet=_subnet,
+        gateway=_gateway,
+    )
+
+    # --- Always-pass explicit per-user --env-file invariant (design G17) ---
+    # Compose auto-reads <project-dir>/.env when no --env-file is given; an
+    # EMPTY per-user env file fully overrides that auto-read. When nothing is
+    # selected we still create and pass the empty per-user file.
+    _env_files_used: list[str] = []
+    if copied_env:
+        _env_files_used.append(copied_env)
+    for _idx, _ef in enumerate(_all_env[1:], start=1):
+        _dest = (
+            Path(compose_out).parent
+            / template_engine.canonical_env_file_name(_idx, user_name, label)
+        )
+        if _dest.exists():
+            _env_files_used.append(str(_dest))
+    if not _env_files_used:
+        _empty_env = Path(compose_out).parent / template_engine.canonical_env_file_name(0, user_name, label)
+        if not _empty_env.exists():
+            _empty_env.write_text("")
+            Path(str(_empty_env) + ".generated").write_text("")
+        _env_files_used = [str(_empty_env)]
+        copied_env = str(_empty_env)
+
+    # --- Record container names from the rendered compose ---
+    prefix = template_engine.container_prefix(service_name, user_name, label)
+    compose_svc_names = get_compose_service_names(compose_out)
+    container_names = [f"{prefix}{svc}" for svc in compose_svc_names]
+    entry["container_names"] = container_names
+    entry["env_files"] = _env_files_used
+
+    # Update registry with per-user copied env path + container names
+    # so rebuild/remove/reconciliation always have the correct references.
+    if copied_env:
+        entry["env_file_path"] = copied_env
+    with registry.transaction():
+        users = registry._load()
+        for u in users:
+            if (
+                u.get("user_name") == user_name
+                and u.get("service_name") == service_name
+                and str(u.get("label", "")) == str(label)
+            ):
+                if copied_env:
+                    u["env_file_path"] = copied_env
+                u["env_files"] = _env_files_used
+                u["container_names"] = container_names
+                break
+        registry._save(users)
+
+    # --- Render nginx conf + htpasswd ---
+    if nginx_template and nginx_out:
+        if htpasswd_out:
+            auth.write_htpasswd_file(htpasswd_out, user_name, passwd_hash)
+            # Mark htpasswd as generated
+            Path(htpasswd_out + ".generated").write_text("")
+        template_engine.render_nginx_conf(
+            nginx_template, nginx_out,
+            user_name, service_name, label,
+            domain, htpasswd_out or "",
+            https=https,
+            ssl_certificate_path=ssl_certificate_path,
+            ssl_certificate_key_path=ssl_certificate_key_path,
+        )
+
+    # --- Mark as building (container not yet started) ---
+    _update_registry_status(user_name, service_name, label, "building")
+
+    # --- Start containers ---
+    # Profiles: explicit per-user --profile flags; default (none) activates
+    # no profile plus the implicit "" services.
+    if build_args:
+        docker_ops.compose_build(compose_out, env_file=_env_files_used, project_name=entry["network_name"], build_args=build_args, profiles=profiles)
+    docker_ops.compose_up(compose_out, env_file=_env_files_used, project_name=entry["network_name"], profiles=profiles)
+    return copied_env
 
 
 def _auto_volumes(
@@ -209,9 +384,34 @@ def register_user(
             )
         else:
             volumes = {}
+    else:
+        # Explicit volumes (e.g. the deploy panel's pre-filled mapping) still
+        # need the copy-if-empty bootstrap: repo-shipped FILE→FILE binds
+        # (dify's docker-entrypoint.sh / squid templates / nginx templates /
+        # sandbox conf) must land as FILES at the per-user target — without
+        # the bootstrap the target is an empty DIRECTORY and container
+        # entrypoints crash ("cp: omitting directory").
+        _bootstrap_volumes_from_template(volumes, compose_template)
+
+    # --- Complete the volume mapping (render-safety) ---
+    # The template references EVERY declared bind key; a panel mapping that
+    # misses keys (e.g. built from a compose preview that merged different
+    # files) crashes the Jinja render with UndefinedError. Auto-fill missing
+    # keys with the standard per-user path + copy-if-empty bootstrap so the
+    # render and the mounts always have a value.
+    expected_vols = template_engine.extract_template_volumes(compose_template)
+    if user_data_dir and any(k not in volumes for k in expected_vols):
+        auto = _auto_volumes(
+            compose_template, user_name, service_name, label,
+            Path(user_data_dir),
+        )
+        for k in expected_vols:
+            if k not in volumes:
+                volumes[k] = auto.get(k) or str(
+                    Path(user_data_dir) / user_name / service_name / label / k
+                )
 
     # --- Volume cross-check (informational; callers decide how to surface) ---
-    expected_vols = template_engine.extract_template_volumes(compose_template)
     missing_vols = [k for k in expected_vols if k not in volumes]
     extra_vols = [k for k in volumes if k not in expected_vols]
 
@@ -329,7 +529,7 @@ def register_user(
         "https": https,
         "ssl_certificate_path": ssl_certificate_path,
         "ssl_certificate_key_path": ssl_certificate_key_path,
-        "hostname": f"{service_name}-{user_name}-{label}.{domain}",
+        "hostname": template_engine.service_hostname(service_name, user_name, label, domain),
         "passwd_plain": passwd,
         "subnet": _subnet,
         "gateway": _gateway,
@@ -342,7 +542,7 @@ def register_user(
             entry["service_env_files"].append(_declared)
 
     # Duplicate check + add are atomic to prevent concurrent registrations
-    with _registry_lock:
+    with registry.transaction():
         if registry.get_user_service(user_name, service_name, label):
             raise ValueError(
                 f"User '{user_name}' with service '{service_name}' "
@@ -350,95 +550,32 @@ def register_user(
             )
         registry.add_user(entry)
 
-    # --- Render compose file ---
-    # Effective interpolation env files: repeatable --env-file order preserved
-    # (env_files list first, legacy env_file as the primary).
-    _all_env: list[str] = list(env_files or [])
-    if env_file and env_file not in _all_env:
-        _all_env.insert(0, env_file)
-    copied_env = template_engine.render_compose(
-        compose_template, compose_out,
-        user_name, service_name, label, volumes,
-        env_file=_all_env[0] if _all_env else None,
-        env_files_all=_all_env or None,
-        env_files=service_env_files or None,
-        subnet=_subnet,
-        gateway=_gateway,
-    )
+    # --- Materialize declared service env files from .example siblings ---
+    # Projects like dify ship envs/*/x.env.example ONLY — the declared
+    # env_file entries (required: false) are silently SKIPPED by compose when
+    # missing, which drops the DB/Redis config (DB_HOST etc.) and breaks the
+    # app (postgres connection refused on localhost:5432).
+    _materialize_env_examples(Path(compose_template).parent)
 
-    # --- Always-pass explicit per-user --env-file invariant (design G17) ---
-    # Compose auto-reads <project-dir>/.env when no --env-file is given; an
-    # EMPTY per-user env file fully overrides that auto-read. When nothing is
-    # selected we still create and pass the empty per-user file.
-    _env_files_used: list[str] = []
-    if copied_env:
-        _env_files_used.append(copied_env)
-    for _idx, _ef in enumerate(_all_env[1:], start=1):
-        _dest = (
-            Path(compose_out).parent
-            / template_engine.per_user_env_file_name(_ef, user_name, label, _idx)
-        )
-        if _dest.exists():
-            _env_files_used.append(str(_dest))
-    if not _env_files_used:
-        _empty_env = Path(compose_out).parent / f".env.{user_name}.{label}"
-        if not _empty_env.exists():
-            _empty_env.write_text("")
-            Path(str(_empty_env) + ".generated").write_text("")
-        _env_files_used = [str(_empty_env)]
-        copied_env = str(_empty_env)
-
-    # --- Record container names from the rendered compose ---
-    prefix = template_engine.container_prefix(service_name, user_name, label)
-    compose_svc_names = get_compose_service_names(compose_out)
-    container_names = [f"{prefix}{svc}" for svc in compose_svc_names]
-    entry["container_names"] = container_names
-    entry["env_files"] = _env_files_used
-
-    # Update registry with per-user copied env path + container names
-    # so rebuild/remove/reconciliation always have the correct references.
-    if copied_env:
-        entry["env_file_path"] = copied_env
-    with _registry_lock:
-        users = registry._load()
-        for u in users:
-            if (
-                u.get("user_name") == user_name
-                and u.get("service_name") == service_name
-                and str(u.get("label", "")) == str(label)
-            ):
-                if copied_env:
-                    u["env_file_path"] = copied_env
-                u["env_files"] = _env_files_used
-                u["container_names"] = container_names
-                break
-        registry._save(users)
-
-    # --- Render nginx conf + htpasswd ---
-    if nginx_template and nginx_out:
-        if htpasswd_out:
-            auth.write_htpasswd_file(htpasswd_out, user_name, passwd_hash)
-            # Mark htpasswd as generated
-            Path(htpasswd_out + ".generated").write_text("")
-        template_engine.render_nginx_conf(
-            nginx_template, nginx_out,
-            user_name, service_name, label,
-            domain, htpasswd_out or "",
-            https=https,
+    # --- Render compose file → start containers (rollback on ANY failure) ---
+    # Any exception after the registry entry is added must remove the entry —
+    # a stale entry (e.g. from a Jinja render error caused by an incomplete
+    # volume mapping) blocks every retry with "already registered".
+    try:
+        copied_env = _register_render_and_start(
+            user_name=user_name, service_name=service_name, label=label,
+            entry=entry, compose_template=compose_template,
+            compose_out=compose_out, volumes=volumes,
+            env_file=env_file, env_files=env_files,
+            service_env_files=service_env_files,
+            nginx_template=nginx_template, nginx_out=nginx_out,
+            htpasswd_out=htpasswd_out, passwd_hash=passwd_hash,
+            domain=domain, https=https,
             ssl_certificate_path=ssl_certificate_path,
             ssl_certificate_key_path=ssl_certificate_key_path,
+            build_args=build_args, profiles=profiles,
+            _subnet=_subnet, _gateway=_gateway,
         )
-
-    # --- Mark as building (container not yet started) ---
-    _update_registry_status(user_name, service_name, label, "building")
-
-    # --- Start containers ---
-    # Profiles: explicit per-user --profile flags; default (none) activates
-    # no profile plus the implicit "" services.
-    try:
-        if build_args:
-            docker_ops.compose_build(compose_out, env_file=_env_files_used, project_name=entry["network_name"], build_args=build_args, profiles=profiles)
-        docker_ops.compose_up(compose_out, env_file=_env_files_used, project_name=entry["network_name"], profiles=profiles)
     except RuntimeError:
         # Rollback: tear down any partially-created Docker resources
         # (containers, networks) so a retry doesn't hit "already exists" errors,
@@ -450,7 +587,11 @@ def register_user(
                 docker_ops.compose_down(compose_out, project_name=entry["network_name"])
         except Exception as down_err:
             _log.warning("Failed to clean up Docker resources after failed deploy: %s", down_err)
-        with _registry_lock:
+        with registry.transaction():
+            registry.remove_user_service(user_name, service_name, label)
+        raise
+    except Exception:
+        with registry.transaction():
             registry.remove_user_service(user_name, service_name, label)
         raise
 
@@ -467,6 +608,52 @@ def register_user(
         "volume_warnings": {"missing": missing_vols, "extra": extra_vols},
         "copied_env": copied_env,
     }
+
+
+def _purge_user_artifacts(
+    user_name: str, service_name: str, label: str, entry: dict
+) -> None:
+    """Delete every artifact belonging to one (user, service, label) deploy:
+    per-user env copies / rendered compose / markers in the recipe dir, and the
+    user_data volume tree. Original recipe files are untouched (matched by the
+    ``.{user}.{label}`` / ``.user-{user}.{label}`` suffixes)."""
+    import shutil as _sh
+
+    # 1) per-user files in the recipe (compose) directory.
+    compose_dir = None
+    for k in ("compose_file_path", "compose_template_path"):
+        p = entry.get(k)
+        if p:
+            d = Path(p).parent
+            if d.is_dir():
+                compose_dir = d
+                break
+    if compose_dir:
+        m1 = f".{user_name}.{label}"       # .env.raw.specialsync.0, .env.1.specialsync.0, redis.env.specialsync.0, …
+        m2 = f".user-{user_name}.{label}"  # docker-compose.user-specialsync.0.yml
+        for f in list(compose_dir.iterdir()):
+            name = f.name
+            if (m1 in name or m2 in name) and f.is_file():
+                try:
+                    f.unlink(missing_ok=True)
+                    Path(str(f) + ".generated").unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    # 2) user_data volume tree for this instance (bind targets share the
+    #    {user_data}/{user}/{service}/{label} root).
+    vols = [Path(v) for v in (entry.get("volumes") or {}).values() if v]
+    tree = None
+    if vols:
+        try:
+            import os as _os
+            tree = Path(_os.path.commonpath([str(v) for v in vols]))
+        except ValueError:
+            tree = None
+    while tree is not None and tree != tree.parent and tree.name != label:
+        tree = tree.parent
+    if tree is not None and tree.exists() and tree.name == label:
+        _sh.rmtree(tree, ignore_errors=True)
 
 
 def remove_user(
@@ -543,8 +730,13 @@ def remove_user(
         if fpath:
             try:
                 Path(fpath).unlink(missing_ok=True)
+                Path(str(fpath) + ".generated").unlink(missing_ok=True)
             except OSError:
                 pass
+
+    # Full purge (decision #2): a deleted service leaves NOTHING behind —
+    # per-user artifacts in the recipe dir + the user_data volume tree.
+    _purge_user_artifacts(user_name, service_name, label, entry)
 
     # P1: Orphan network cleanup — if network still exists after compose_down, clean it up
     if net:
@@ -555,10 +747,35 @@ def remove_user(
 
     docker_ops.nginx_reload(nginx_container)
 
-    with _registry_lock:
+    with registry.transaction():
         registry.remove_user_service(user_name, service_name, label)
 
     return {"user_name": user_name, "service_name": service_name, "label": label}
+
+
+def remove_user_marked(**kwargs) -> dict[str, str]:
+    """``remove_user`` with a persisted ``deleting`` registry status.
+
+    The status is written BEFORE the teardown starts so the dashboard keeps
+    showing "Deleting…" across page refreshes (mirrors the ``building`` status
+    written on register/rebuild). ``remove_user`` drops the registry entry on
+    success; on failure the status is reset so a card cannot stay stuck.
+    """
+    user_name = kwargs.get("user_name", "")
+    service_name = kwargs.get("service_name", "")
+    label = str(kwargs.get("label", ""))
+    try:
+        _update_registry_status(user_name, service_name, label, "deleting")
+    except Exception:
+        pass
+    try:
+        return remove_user(**kwargs)
+    except Exception:
+        try:
+            _update_registry_status(user_name, service_name, label, "running")
+        except Exception:
+            pass
+        raise
 
 
 def rebuild_user(
@@ -594,6 +811,14 @@ def rebuild_user(
     compose_file = entry.get("compose_file_path", "")
     if not compose_file or not Path(compose_file).exists():
         raise FileNotFoundError(f"Compose file not found: {compose_file}")
+
+    # Copy-if-empty bootstrap (self-heal): FILE→FILE bind targets must exist
+    # as FILES before `up` — empty dir targets (e.g. left by an older deploy
+    # that skipped the bootstrap) crash container entrypoints.
+    template_path = entry.get("compose_template_path") or ""
+    volumes = dict(entry.get("volumes") or {})
+    if template_path and volumes and Path(template_path).exists():
+        _bootstrap_volumes_from_template(volumes, template_path)
 
     # Re-apply the exact recorded settings (design G8/G17 — otherwise a
     # rebuild silently drops the user's profile-gated database).
@@ -756,7 +981,7 @@ def change_password(
     auth.write_htpasswd_file(htpasswd_path, user_name, passwd_hash)
 
     # Update registry
-    with _registry_lock:
+    with registry.transaction():
         users = registry._load()
         for u in users:
             if (

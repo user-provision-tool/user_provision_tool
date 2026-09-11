@@ -214,6 +214,24 @@ class TaskManager:
         self._persist_to_disk()
         return True
 
+    def finish(self, task_id: str, status: str, error: str = "") -> bool:
+        """Move a task to a terminal state from an external owner (custom tasks).
+
+        ``status`` must be ``completed`` or ``failed``. Returns False when the
+        task is missing or already terminal (idempotent — no-op on repeat).
+        """
+        if status not in ("completed", "failed"):
+            return False
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None or task.status in ("completed", "failed", "cancelled", "unknown"):
+                return False
+            task.status = status
+            task.error = str(error) if (status == "failed" and error) else None
+            task.updated_at = time.time()
+        self._persist_to_disk()
+        return True
+
     def list_all(self) -> list[dict[str, Any]]:
         """Return status dicts for all tasks in the pool, newest first."""
         self._cleanup_stale()

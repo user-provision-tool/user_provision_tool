@@ -509,7 +509,7 @@ class TestRegistryRecordsSelection:
         entry = registry.get_user_service("alice", "myapp", "0")
         assert entry["profiles"] == ["a"]
         assert entry["env_files"], "per-user env file must be recorded"
-        assert entry["env_files"][0].endswith(".env.alice.0")
+        assert entry["env_files"][0].endswith(".env.1.alice.0")  # positional canonical name
         assert entry["compose_sources"] == ["docker-compose.yml"]
         # service_env_files records declared paths that exist in the recipe
         assert entry["service_env_files"] == ["./svc.env"]

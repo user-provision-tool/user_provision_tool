@@ -57,7 +57,12 @@ services:
       - ./nginx.provision.conf:/etc/nginx/nginx.provision.conf:ro
       - ${PROVISION_DIR:-/srv/provision_subnet_acl}/generated:/etc/nginx/services.d:ro
     networks:
-      - subnet_acl_shared
+      # Static IP pin (mirrors the gateway's pin in docker-compose.gateway.yml):
+      # the edge (subnet-acl-nginx-acl) resolves 'subnet-acl-nginx' ONCE at
+      # startup and caches the peer — a recreate that moves this container to
+      # a new IP silently 502s every ACL relay until the edge restarts.
+      subnet_acl_shared:
+        ipv4_address: 172.17.0.6
     environment:
       - GENERATED_DIR=${PROVISION_DIR:-/srv/provision_subnet_acl}/generated
     # envsubst substitutes only $GENERATED_DIR; all nginx $variables are left intact.

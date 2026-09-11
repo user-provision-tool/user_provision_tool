@@ -26,10 +26,18 @@ def tmp_generated(tmp_path: Path) -> Path:
 
 @pytest.fixture()
 def registry_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Patch registry.REGISTRY_FILE to point at a temp file for each test."""
+    """Patch registry.REGISTRY_FILE to point at a temp file for each test.
+
+    ALSO resets the module cache: ``_load()`` returns ``_state["data"]`` unless
+    the mtime is None, so patching only the path let a previous test's (or the
+    live registry's) cached list leak into this test — the cause of the
+    order-dependent "environment" failures.
+    """
     from lib import registry as reg_mod
     reg_path = tmp_path / "user_registry.yml"
     monkeypatch.setattr(reg_mod, "REGISTRY_FILE", reg_path)
+    reg_mod._state["data"] = []
+    reg_mod._state["mtime"] = None
     return reg_path
 
 

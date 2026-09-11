@@ -681,7 +681,7 @@ networks:
         )
 
         assert copied is not None
-        assert copied.endswith(".env.alice.0")
+        assert copied.endswith(".env.1.alice.0")  # positional canonical name
         assert Path(copied).exists()
         assert Path(copied).read_text() == "FOO=bar\n"
 
@@ -711,10 +711,11 @@ networks:
         )
 
         content = Path(out).read_text()
-        assert "env_file: .env.bob.1" in content
+        # canonical per-user env is passed as an --env-file LIST (G17)
+        assert "- .env.1.bob.1" in content
         assert "env_file: .env\n" not in content  # original replaced
-        # .env.bob.1 file exists
-        assert (tmp_path / ".env.bob.1").exists()
+        # canonical per-user file exists
+        assert (tmp_path / ".env.1.bob.1").exists()
 
     def test_render_compose_env_file_list_form_replaced(self, tmp_path):
         """env_file: list form - .env is replaced with per-user env file name."""
@@ -743,9 +744,9 @@ networks:
         )
 
         content = Path(out).read_text()
-        assert "- .env.eve.2" in content
+        assert "- .env.1.eve.2" in content
         assert "- .env\n" not in content  # original replaced
-        assert (tmp_path / ".env.eve.2").exists()
+        assert (tmp_path / ".env.1.eve.2").exists()
 
     def test_render_compose_env_file_list_with_multiple_items(self, tmp_path):
         """Only .env entries in env_file list are replaced; other entries untouched."""
@@ -775,7 +776,7 @@ networks:
         )
 
         content = Path(out).read_text()
-        assert "- .env.alice.0" in content
+        assert "- .env.1.alice.0" in content
         assert "- shared.env" in content   # untouched
         assert "- .env\n" not in content   # original .env replaced
 
@@ -802,8 +803,9 @@ networks:
         )
 
         content = Path(out).read_text()
-        # .env remains as-is when no env_file is supplied
-        assert "env_file: .env" in content
+        # No env_file supplied ⇒ the canonical per-user env is still passed
+        # explicitly (G17: never let compose auto-read the recipe .env)
+        assert "- .env.1.alice.0" in content
         assert ".env.alice.0" not in content
 
     def test_render_compose_two_users_env_files_isolated(self, tmp_path):
@@ -846,8 +848,8 @@ networks:
         assert Path(copied_b).read_text() == "USER=b\n"
 
         # Each rendered compose references its own env file
-        assert "env_file: .env.alice.0" in Path(out_a).read_text()
-        assert "env_file: .env.bob.0" in Path(out_b).read_text()
+        assert "- .env.1.alice.0" in Path(out_a).read_text()
+        assert "- .env.1.bob.0" in Path(out_b).read_text()
 
 
 # ---------------------------------------------------------------------------
@@ -2176,6 +2178,109 @@ class TestProvisioner:
         _auto_volumes(COMPOSE_TEMPLATE, "alice", "myapp", "0", user_data)
         _auto_volumes(COMPOSE_TEMPLATE, "alice", "myapp", "0", user_data)  # must not raise
 
+    def test_recipe_path_for_entry_root_and_subdir(self, tmp_path, monkeypatch):
+        """The per-instance recipe subdir exposed to the dashboard:
+        '' for a project-root recipe, the dir name for a sub-recipe (dify →
+        'docker'). Derived from the recorded per-user file paths."""
+        import api as api_mod
+
+        root = tmp_path / "source_projects"
+        (root / "myapp").mkdir(parents=True)
+        (root / "dify" / "docker").mkdir(parents=True)
+        monkeypatch.setattr(api_mod, "SOURCE_PROJECTS_DIR", root)
+
+        root_entry = {
+            "service_name": "myapp",
+            "compose_file_path": str(root / "myapp" / "docker-compose.user-alice.0.yml"),
+        }
+        assert api_mod._recipe_path_for_entry(root_entry) == ""
+
+        sub_entry = {
+            "service_name": "dify",
+            "compose_file_path": str(root / "dify" / "docker" / "docker-compose.user-alice.0.yml"),
+        }
+        assert api_mod._recipe_path_for_entry(sub_entry) == "docker"
+
+        # A template-only entry resolves too (compose_template_path fallback).
+        tpl_entry = {
+            "service_name": "dify",
+            "compose_template_path": str(root / "dify" / "docker" / "docker-compose.yml.j2"),
+        }
+        assert api_mod._recipe_path_for_entry(tpl_entry) == "docker"
+
+        # Unknown/foreign paths never escape the project dir.
+        assert api_mod._recipe_path_for_entry(
+            {"service_name": "myapp", "compose_file_path": "/etc/passwd"}
+        ) == ""
+
+    def test_service_payload_exposes_recipe_path_and_env_file(self, tmp_path, monkeypatch):
+        """GET /users service entries carry recipe_path + env_file_path so the
+        dashboard resolves Deployment-Files links inside the recipe dir."""
+        import api as api_mod
+        from lib import registry as reg_mod
+
+        root = tmp_path / "source_projects"
+        (root / "dify" / "docker").mkdir(parents=True)
+        monkeypatch.setattr(api_mod, "SOURCE_PROJECTS_DIR", root)
+
+        entry = {
+            "user_name": "alice",
+            "service_name": "dify",
+            "label": "0",
+            "compose_file_path": str(root / "dify" / "docker" / "docker-compose.user-alice.0.yml"),
+            "env_file_path": str(root / "dify" / "docker" / ".env.1.alice.0"),
+            "container_names": [],
+            "volumes": {},
+        }
+        monkeypatch.setattr(reg_mod, "get_user", lambda u: [entry])
+        monkeypatch.setattr(api_mod.registry, "get_user", lambda u: [entry])
+
+        status = api_mod._status_for_user("alice", {})
+        bucket = (
+            status["healthy_services"] or status["unhealthy_services"] or status["missing_services"]
+        )
+        assert bucket, "entry must appear in one of the status buckets"
+        svc = bucket[0]
+        assert svc["recipe_path"] == "docker"
+        assert svc["env_file_path"].endswith("/dify/docker/.env.1.alice.0")
+
+    def test_purge_user_artifacts_removes_recipe_files_and_user_data(self, tmp_path):
+        """Delete semantics (decision #2): `remove_user` -> `_purge_user_artifacts`
+        leaves NOTHING behind — the per-user recipe files AND the
+        {user_data}/{user}/{service}/{label} volume tree are removed, while the
+        original recipe files are untouched."""
+        from lib.provisioner import _purge_user_artifacts
+
+        recipe = tmp_path / "recipe"
+        recipe.mkdir()
+        # Per-user artifacts for THIS instance (must be purged).
+        for name in (".env.raw.alice.0", ".env.1.alice.0", "docker-compose.user-alice.0.yml"):
+            (recipe / name).write_text("x")
+        (recipe / ".env.raw.alice.0.generated").write_text("")
+        # Original recipe file + another instance's artifact (must survive).
+        (recipe / "docker-compose.yml").write_text("services: {}")
+        (recipe / ".env.raw.bob.1").write_text("keep me")
+
+        tree = tmp_path / "user_data" / "alice" / "myapp" / "0"
+        (tree / "app_data").mkdir(parents=True)
+        (tree / "app_data" / "db.sqlite").write_text("payload")
+
+        entry = {
+            "compose_file_path": str(recipe / "docker-compose.user-alice.0.yml"),
+            "volumes": {"app_data": str(tree / "app_data")},
+        }
+        _purge_user_artifacts("alice", "myapp", "0", entry)
+
+        # user_data volume tree is GONE (the whole instance tree, not just the vol dir).
+        assert not tree.exists()
+        # Per-user recipe artifacts are gone...
+        for name in (".env.raw.alice.0", ".env.1.alice.0", "docker-compose.user-alice.0.yml"):
+            assert not (recipe / name).exists(), name
+        assert not (recipe / ".env.raw.alice.0.generated").exists()
+        # ...but the original recipe and other instances are untouched.
+        assert (recipe / "docker-compose.yml").exists()
+        assert (recipe / ".env.raw.bob.1").exists()
+
 
 # ---------------------------------------------------------------------------
 # provisioner — env_file_path registry storage + rebuild
@@ -2231,8 +2336,8 @@ class TestProvisionerEnvFile:
         assert entry is not None
 
         stored = entry.get("env_file_path") or ""
-        assert ".env.envuser.0" in stored, (
-            f"Registry should store per-user copy .env.envuser.0, got: {stored}"
+        assert ".env.1.envuser.0" in stored, (
+            f"Registry should store per-user copy .env.1.envuser.0, got: {stored}"
         )
         assert "custom.env" not in stored, (
             f"Registry should NOT store original custom.env, got: {stored}"
@@ -2256,7 +2361,7 @@ class TestProvisionerEnvFile:
         assert entry is not None
         stored = entry.get("env_file_path") or None
         assert stored is not None, "per-user env file must always exist"
-        assert stored.endswith(".env.noenv.0")
+        assert stored.endswith(".env.1.noenv.0")
         assert Path(stored).exists()
         assert Path(stored).read_text() == ""
         assert entry.get("env_files") == [stored]
@@ -2287,7 +2392,7 @@ class TestProvisionerEnvFile:
         for i, arg in enumerate(up_cmd):
             if arg == "--env-file" and i + 1 < len(up_cmd):
                 env_path = up_cmd[i + 1]
-                assert ".env.copyuser.1" in env_path, (
+                assert ".env.1.copyuser.1" in env_path, (
                     f"--env-file should point to per-user copy, got: {env_path}"
                 )
                 assert "app.env" not in env_path, (
@@ -2329,7 +2434,7 @@ class TestProvisionerEnvFile:
             for i, arg in enumerate(cmd):
                 if arg == "--env-file" and i + 1 < len(cmd):
                     env_path = cmd[i + 1]
-                    assert ".env.rebuildenv.0" in env_path, (
+                    assert ".env.1.rebuildenv.0" in env_path, (
                         f"Rebuild --env-file should use per-user copy, got: {env_path}"
                     )
                     assert "prod.env" not in env_path, (
@@ -2729,6 +2834,224 @@ class TestAPIProjectRoot:
 # ---------------------------------------------------------------------------
 # api — FastAPI TestClient tests for new endpoints (P1-P6)
 # ---------------------------------------------------------------------------
+
+
+class TestDockerOpsLogReaders:
+    """The stdout/stderr reader threads must end quietly when the pipe closes."""
+
+    def test_readers_survive_a_closed_pipe(self):
+        import io
+        import threading
+        from lib import docker_ops
+
+        # A stream whose readline raises ValueError (closed file) after one line.
+        class Exploding:
+            def __init__(self):
+                self.n = 0
+            def readline(self):
+                self.n += 1
+                if self.n == 1:
+                    return "hello\n"
+                raise ValueError("I/O operation on closed file")
+
+        # The reader is a closure inside _run; exercise the same guard shape by
+        # driving the real thread body through a Popen-free call.
+        thread_exc = []
+
+        def _read_stdout(pipe):
+            try:
+                for line in iter(pipe.readline, ""):
+                    pass
+            except (ValueError, OSError):
+                pass
+
+        t = threading.Thread(target=_read_stdout, args=(Exploding(),))
+        t.start(); t.join(timeout=5)
+        assert not t.is_alive()
+        # And the production source carries the guard (source-level check: the
+        # closure is not importable in isolation).
+        import inspect
+        src = inspect.getsource(docker_ops)
+        assert src.count("except (ValueError, OSError):") >= 2, (
+            "docker_ops stdout/stderr readers must swallow closed-pipe errors"
+        )
+
+
+class TestRegistryLocking:
+    """Tier 2 (cross-process flock): exclusion, no stale locks, lost-update
+    protection, reentrancy, and lock-free readers."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, tmp_path, monkeypatch):
+        from lib import registry
+        monkeypatch.setattr(registry, "REGISTRY_FILE", tmp_path / "user_registry.yml")
+        registry._state.update({"data": [], "mtime": None, "path": None})
+        self.registry = registry
+        self.path = registry.REGISTRY_FILE
+        self.root = str(Path(__file__).parent.parent)
+        yield
+
+    def _spawn(self, code: str, *args: str):
+        import os
+        import subprocess
+        import sys
+        env = dict(os.environ)
+        env["REGISTRY_FILE"] = str(self.path)
+        env["PYTHONPATH"] = self.root
+        return subprocess.Popen(
+            [sys.executable, "-c", code, *args], env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+
+    _HOLD = (
+        "import time, sys\n"
+        "from lib import registry\n"
+        "if __name__ == '__main__':\n"
+        "    with registry.transaction():\n"
+        "        print('locked', flush=True)\n"
+        "        time.sleep(float(sys.argv[1]) if len(sys.argv) > 1 else 1.5)\n"
+    )
+
+    def test_transaction_is_reentrant(self):
+        """A nested transaction must reuse the outer flock (a second flock on a
+        new fd would deadlock against itself)."""
+        with self.registry.transaction():
+            with self.registry.transaction():
+                self.registry.add_user({"user_name": "nested", "service_name": "s", "label": "0"})
+        assert len(self.registry._load()) == 1
+
+    def test_second_process_is_excluded_then_succeeds(self):
+        child = self._spawn(self._HOLD, "1.2")
+        assert child.stdout.readline().strip() == "locked"      # child holds flock
+        try:
+            with pytest.raises(self.registry.RegistryLockTimeout):
+                with self.registry.transaction(timeout=0.3):
+                    pass
+        finally:
+            child.wait(timeout=10)
+        # after the holder exits the lock is free again
+        with self.registry.transaction(timeout=2.0):
+            pass
+
+    def test_lock_is_released_when_the_holder_dies(self):
+        """No stale lock: kill -9 the holder, the lock is gone immediately."""
+        import signal
+        child = self._spawn(self._HOLD, "30")
+        assert child.stdout.readline().strip() == "locked"
+        child.send_signal(signal.SIGKILL)
+        child.wait(timeout=10)
+        import time as _t
+        t0 = _t.monotonic()
+        with self.registry.transaction(timeout=2.0):
+            pass
+        assert _t.monotonic() - t0 < 1.0, "lock survived the holder's death (stale lock)"
+
+    def test_concurrent_processes_do_not_lose_updates(self):
+        """THE lost-update regression: N processes each add entries; every entry
+        must survive (without the flock, load-modify-save interleaving drops
+        them)."""
+        n_proc, per_proc = 5, 10
+        code = (
+            "from lib import registry\n"
+            "import sys\n"
+            f"p = int(sys.argv[1]) if len(sys.argv) > 1 else 0\n"
+            f"for i in range({per_proc}):\n"
+            "    registry.add_user({'user_name': f'p{p}-u{i}', 'service_name': 's', 'label': '0'})\n"
+        )
+        procs = [self._spawn(code, str(p)) for p in range(n_proc)]
+        for pr in procs:
+            out, err = pr.communicate(timeout=120)
+            assert pr.returncode == 0, err
+        # Assert on the FILE (authoritative), not this process's cache — the
+        # cache is only refreshed by the 1s monitor tick.
+        users = [u["user_name"] for u in (yaml.safe_load(self.path.read_text()) or [])]
+        assert len(users) == n_proc * per_proc, f"lost updates: {len(users)}"
+        assert len(set(users)) == n_proc * per_proc
+
+    def test_readers_are_not_blocked_by_a_holder(self):
+        """Atomic publishing means reads never wait on the write lock."""
+        import time as _t
+        self.registry._save([{"user_name": "keep", "service_name": "s", "label": "0"}])
+        child = self._spawn(self._HOLD, "1.2")
+        assert child.stdout.readline().strip() == "locked"
+        try:
+            t0 = _t.monotonic()
+            users = self.registry._load()
+            elapsed = _t.monotonic() - t0
+            assert elapsed < 0.2, f"reader blocked for {elapsed:.3f}s"
+            assert [u["user_name"] for u in users] == ["keep"]
+        finally:
+            child.wait(timeout=10)
+
+
+class TestRegistryDurability:
+    """Regression coverage for the registry WIPE: a truncate-then-write save let
+    a concurrent reader cache [] and the next save persist it (all instances
+    lost). These tests pin the three fixes."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, tmp_path, monkeypatch):
+        from lib import registry
+        monkeypatch.setattr(registry, "REGISTRY_FILE", tmp_path / "user_registry.yml")
+        registry._state["data"] = []
+        registry._state["mtime"] = None
+        self.registry = registry
+        self.path = registry.REGISTRY_FILE
+        yield
+
+    def _entries(self, n=3):
+        return [{"user_name": f"u{i}", "service_name": "svc", "label": "0"} for i in range(n)]
+
+    def test_save_is_atomic_and_leaves_no_temp(self):
+        self.registry._save(self._entries(3))
+        assert self.path.exists()
+        assert not (self.path.parent / (self.path.name + ".tmp")).exists()
+        assert len(self.registry._load()) == 3
+
+    def test_empty_file_does_not_wipe_cached_state(self):
+        """A partially-written (empty) file must keep the last good state."""
+        self.registry._save(self._entries(3))
+        assert len(self.registry._load()) == 3
+        self.path.write_text("")          # simulate a truncated/partial write
+        self.registry._reload()
+        assert len(self.registry._load()) == 3, "empty file must not wipe the cache"
+
+    def test_concurrent_reader_never_sees_an_empty_registry(self):
+        """Hammer save() while another thread reads: readers must never observe
+        an empty registry (the original wipe mechanism)."""
+        import threading
+        self.registry._save(self._entries(3))
+        stop = threading.Event()
+        seen_empty = []
+
+        def reader():
+            while not stop.is_set():
+                if len(self.registry._load()) == 0:
+                    seen_empty.append(1)
+
+        t = threading.Thread(target=reader, daemon=True)
+        t.start()
+        for _ in range(200):
+            self.registry._save(self._entries(3))
+        stop.set()
+        t.join(timeout=2)
+        assert not seen_empty, "a concurrent reader observed an EMPTY registry"
+
+    def test_status_update_saves_only_on_match(self, monkeypatch):
+        from lib import provisioner
+        self.registry._save(self._entries(2))
+        calls = []
+        monkeypatch.setattr(self.registry, "_save", lambda users: calls.append(len(users)))
+        provisioner._update_registry_status("nobody", "svc", "0", "deleting")
+        assert calls == [], "no match ⇒ must not save (this persisted an empty list)"
+        provisioner._update_registry_status("u0", "svc", "0", "deleting")
+        assert calls == [2], "a real match still saves"
+
+    def test_backup_written_before_overwrite(self):
+        self.registry._save(self._entries(2))
+        self.registry._save(self._entries(3))
+        bak = self.path.with_name(self.path.name + ".bak")
+        assert bak.exists(), "previous good copy kept for recovery"
 
 
 class TestAPINewEndpoints:
@@ -3142,6 +3465,46 @@ class TestAPINewEndpoints:
         assert response.status_code == 200
         assert "text/event-stream" in response.headers["content-type"]
 
+    def test_custom_task_lifecycle_endpoint(self, tmp_path, monkeypatch):
+        """Feature 5: POST /tasks/custom → append log → finish surfaces a
+        generate-missing-files task in GET /tasks with its log file readable
+        via SSE (regression: create_custom_task previously called the
+        nonexistent ``task_manager.Task`` attribute → 500)."""
+        from pathlib import Path
+        from lib.task_manager import TaskManager
+
+        # Isolate the task store so nothing touches the shared singleton dir.
+        tm = TaskManager(max_workers=1, log_dir=str(tmp_path / "task_logs"))
+        monkeypatch.setattr(self.api, "task_manager", tm)
+
+        r = self.client.post("/tasks/custom", json={
+            "type": "generate-missing-files",
+            "target": "dify @ docker / specialsync",
+            "detail": {"service_name": "dify"},
+        })
+        assert r.status_code == 200, r.text
+        tid = r.json()["task_id"]
+        assert r.json()["log_file"]
+
+        # Task appears in the list with its type.
+        types = [t["type"] for t in self.client.get("/tasks").json()["tasks"]]
+        assert "generate-missing-files" in types
+
+        # Append a session-log line (single JSON line) then finish.
+        logline = '{"stage": "env.turn2", "reasoning": "resolved urls"}'
+        assert self.client.post(f"/tasks/{tid}/log", json={"line": logline}).status_code == 200
+        assert self.client.post(f"/tasks/{tid}/finish", json={"status": "completed"}).status_code == 200
+
+        # The line is persisted to the task's log file and served by SSE.
+        logfiles = list((tmp_path / "task_logs").glob("task-*.log"))
+        assert len(logfiles) == 1
+        assert "env.turn2" in logfiles[0].read_text()
+
+        sse = self.client.get(f"/tasks/{tid}/log?tail=10&follow=false")
+        assert sse.status_code == 200
+        assert "env.turn2" in sse.text
+        assert "event: done" in sse.text
+
     # ── Helper: register a user for dependent tests ──
 
     def _register_user(self, user_name: str, monkeypatch):
@@ -3259,9 +3622,9 @@ class TestCheckMissingFiles:
             response = client.get("/services/myapp_j2/check-missing-files")
             assert response.status_code == 200
             data = response.json()
-            assert data["ready"] is False  # .env is missing
+            assert data["ready"] is True  # .env is never in the missing list anymore
             assert data["needs_env"] is True
-            assert ".env" in data["missing"]
+            assert ".env" not in data["missing"]
             assert "docker-compose" in data["existing"]
             assert "nginx.conf" in data["existing"]
             assert "Dockerfile" in data["existing"]
@@ -3539,16 +3902,7 @@ class TestProvisionerRegistryFields:
 
 class TestV5EnvDDeprecated:
     """v5 (decision 1/6): env.d disappears from the internal side — -api never
-    writes it, the internal confs never include it, and the retained writer is
-    deprecated (kept only so older -api versions fail gracefully)."""
-
-    def test_write_env_d_is_deprecated(self, tmp_path):
-        """The retained writer is marked DEPRECATED (v5 §11.1)."""
-        from lib.template_engine import write_env_d
-        assert write_env_d.__doc__ and write_env_d.__doc__.lstrip().startswith("DEPRECATED")
-        # Still functional for older callers (no crash).
-        f = write_env_d(str(tmp_path), enable_acl=True)
-        assert "set $auth_mode acl;" in f.read_text()
+    writes it, the internal confs never include it, and the v4 writers are removed from the codebase."""
 
     def test_render_nginx_conf_never_includes_env_d(self, tmp_path):
         """The rendered simple conf must never carry an env.d include."""
@@ -3577,17 +3931,8 @@ class TestV5EnvDDeprecated:
 
 class TestV5PortalDDeprecated:
     """v5 (decision 5/15): the portal moves to the edge — the internal
-    nginx.provision.conf is services-only (no portal.d include), the retained
-    internal writer is deprecated, and rendered confs never reference the v4
-    portal constants."""
-
-    def test_write_portal_d_is_deprecated(self, tmp_path):
-        """The retained internal writer is marked DEPRECATED (v5 §11.1)."""
-        from lib.template_engine import write_portal_d
-        assert write_portal_d.__doc__ and write_portal_d.__doc__.lstrip().startswith("DEPRECATED")
-        # Still functional for older callers.
-        f = write_portal_d(str(tmp_path), portal_mode="http")
-        assert f.parent.name == "portal.d"
+    nginx.provision.conf is services-only (no portal.d include), the v4 internal writer is removed, and rendered confs never reference
+    the v4 portal constants."""
 
     def test_internal_nginx_provision_conf_services_only(self):
         """nginx.provision.conf has NO portal.d include and keeps services.d + 444."""
@@ -3734,8 +4079,13 @@ class TestRegenerateNginxConfs:
         gen = tmp_path / "generated"
         gen.mkdir(exist_ok=True)
         reg_file = tmp_path / "user_registry.yml"
-        reg_file.write_text(yaml.safe_dump(entries) if entries else "")
+        # Write a VALID empty list (not "") — an empty FILE is indistinguishable
+        # from a partially-written one and is deliberately ignored by _reload.
+        reg_file.write_text(yaml.safe_dump(entries or []))
         monkeypatch.setattr(reg_mod, "REGISTRY_FILE", reg_file)
+        reg_mod._state["data"] = []
+        reg_mod._state["mtime"] = None
+        reg_mod._state["path"] = None
         monkeypatch.setenv("GENERATED_DIR", str(gen))
         return gen
 

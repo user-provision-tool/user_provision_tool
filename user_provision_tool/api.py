@@ -22,6 +22,8 @@ Environment variables:
 
 from __future__ import annotations
 
+import threading
+import time
 import os
 import sys
 from pathlib import Path
@@ -37,7 +39,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from lib import docker_ops, provisioner, reconciliation, registry, subnet_manager, template_engine, validation
 from lib.compose_converter import compose_file_to_template, get_compose_service_names
 from lib.nginx_converter import nginx_file_to_template
-from lib.task_manager import task_manager
+from lib.task_manager import Task, task_manager
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -526,14 +528,17 @@ def remove_user(
 
     if sync:
         try:
-            provisioner.remove_user(**prov_kwargs)
+            provisioner.remove_user_marked(**prov_kwargs)
         except KeyError as e:
             raise HTTPException(404, str(e))
         except RuntimeError as e:
             raise HTTPException(500, f"docker compose down failed: {e}")
         return {"status": "removed", "user_name": user_name, "service_name": service_name, "label": label}
 
-    task_id = task_manager.submit("remove", provisioner.remove_user, **prov_kwargs)
+    # remove_user_marked persists a 'deleting' status first, so the dashboard
+    # keeps showing "Deleting…" (including across page refreshes) until the
+    # registry entry disappears when the teardown completes.
+    task_id = task_manager.submit("remove", provisioner.remove_user_marked, **prov_kwargs)
     return {
         "task_id": task_id,
         "status": "pending",
@@ -875,6 +880,58 @@ def cancel_task(task_id: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Custom-task endpoints — external processes (gateway generation sessions)
+# create a Tasks-page record and append session log lines (design §2).
+# ---------------------------------------------------------------------------
+
+@app.post("/tasks/custom")
+def create_custom_task(req: dict[str, Any]) -> dict[str, Any]:
+    """Create a task record owned by an external process (e.g. the gateway's
+    missing-files generation session). The caller gets a task_id + log path;
+    it appends lines via POST /tasks/{id}/log and finishes via
+    POST /tasks/{id}/finish."""
+    import uuid as _uuid
+
+    task_id = _uuid.uuid4().hex[:12]
+    log_file = str(task_manager._log_dir / f"task-{task_id}.log")
+    task = Task(task_id, req.get("type", "custom"), None, log_file=log_file)
+    task.status = "running"
+    task.result = {"target": req.get("target", ""), "detail": req.get("detail", {})}
+    with task_manager._lock:
+        task_manager._tasks[task_id] = task
+        task_manager._cleanup_excess()
+        task_manager._persist_to_disk()
+    return {"task_id": task_id, "log_file": log_file}
+
+
+@app.post("/tasks/{task_id}/log")
+def append_custom_task_log(task_id: str, req: dict[str, Any]) -> dict[str, Any]:
+    """Append a line to a custom task's log file."""
+    task = task_manager.get(task_id)
+    if task is None:
+        raise HTTPException(404, f"Task not found: {task_id}")
+    log_file = task_manager.get_log_file(task_id)
+    if not log_file:
+        raise HTTPException(404, f"Task log not found: {task_id}")
+    line = str((req or {}).get("line", ""))
+    with open(log_file, "a", encoding="utf-8") as f:
+        f.write(line if line.endswith("\n") else line + "\n")
+    return {"appended": True}
+
+
+@app.post("/tasks/{task_id}/finish")
+def finish_custom_task(task_id: str, req: dict[str, Any]) -> dict[str, Any]:
+    """Mark a custom task completed or failed (with an error string)."""
+    status = (req or {}).get("status", "completed")
+    if status not in ("completed", "failed"):
+        raise HTTPException(400, "status must be completed or failed")
+    if task_manager.get(task_id) is None:
+        raise HTTPException(404, f"Task not found: {task_id}")
+    task_manager.finish(task_id, status, str((req or {}).get("error", "")))
+    return {"task_id": task_id, "status": status}
+
+
+# ---------------------------------------------------------------------------
 # P2: GET /tasks/{task_id}/log  — SSE build log streaming
 # ---------------------------------------------------------------------------
 
@@ -1031,15 +1088,19 @@ def check_missing_files(
     else:
         missing.append("nginx.conf")
 
+    # Dockerfile is required ONLY when compose is missing (it is the build
+    # context for compose generation — design §8.1); when compose exists it is
+    # NOT flagged as missing.
     if has_dockerfile:
         existing.append("Dockerfile")
-    else:
+    elif not has_compose:
         missing.append("Dockerfile")
 
+    # The recipe-level .env is no longer a generation target — per-user env is
+    # generated at deploy time (design §2/§4). It is never listed as missing;
+    # needs_env remains reported for the gateway's own use.
     if has_env:
         existing.append(".env")
-    elif _needs_env_scan:
-        missing.append(".env")
 
     return CheckMissingFilesResponse(
         service_name=service_name,
@@ -1049,6 +1110,29 @@ def check_missing_files(
         existing=existing,
         needs_env=_needs_env_scan,
     )
+
+
+# ---------------------------------------------------------------------------
+# GET /service-url-base — pre-deploy service URL host (serving-URL contract)
+# ---------------------------------------------------------------------------
+
+@app.get("/service-url-base")
+def service_url_base(
+    service_name: str = Query(...),
+    user_name: str = Query(...),
+    label: str = Query("0"),
+    domain: str = Query("localhost"),
+    scheme: str = Query("http"),
+) -> dict[str, str]:
+    """Return the hostname (and scheme echo) a deployed instance will be served on.
+
+    This is the SAME hostname the deploy path writes into the per-user nginx
+    ``server_name`` (via :func:`template_engine.service_hostname`), so a caller
+    can assemble a URL BEFORE the service exists that matches what the deploy
+    will produce — consistency by shared code, not by replaying a saved string.
+    """
+    host = template_engine.service_hostname(service_name, user_name, label, domain)
+    return {"hostname": host, "scheme": scheme, "domain": domain}
 
 
 # ---------------------------------------------------------------------------
@@ -1277,7 +1361,10 @@ def validate_nginx_conf(req: NginxValidateRequest) -> NginxValidateResponse:
 # ---------------------------------------------------------------------------
 
 def _compute_status(filter_user: str | None) -> dict[str, Any]:
-    running = {c["name"]: c["status"] for c in docker_ops.docker_ps()}
+    # docker_ps_all: include exited-0 one-shots (e.g. dify init_permissions) so
+    # they are not miscounted as "down"/unhealthy (design §9). _status_for_user
+    # treats "Exited (0)" as healthy and any other stopped state as unhealthy.
+    running = {c["name"]: c["status"] for c in docker_ops.docker_ps_all()}
     all_users = registry.get_all_users()
 
     if filter_user:
@@ -1288,27 +1375,127 @@ def _compute_status(filter_user: str | None) -> dict[str, Any]:
     return {"user_status": [_status_for_user(name, running) for name in sorted(user_names)]}
 
 
+_compose_parse_cache: dict[str, tuple[int, dict | None]] = {}
+_compose_cache_lock = threading.Lock()
+_compose_monitor_started = False
+
+
+def _parse_compose(path: str) -> tuple[int, dict | None]:
+    try:
+        m = Path(path).stat().st_mtime_ns
+    except OSError:
+        return 0, None
+    try:
+        import yaml
+        with open(path) as f:
+            data = yaml.safe_load(f)
+    except Exception:
+        data = None
+    return m, data
+
+
+def _compose_monitor_loop() -> None:
+    """Watch known rendered-compose files; reload only when they change."""
+    while True:
+        time.sleep(1.0)
+        with _compose_cache_lock:
+            paths = list(_compose_parse_cache)
+        for p in paths:
+            try:
+                m = Path(p).stat().st_mtime_ns
+            except OSError:
+                continue
+            with _compose_cache_lock:
+                hit = _compose_parse_cache.get(p)
+                if hit is None or hit[0] == m:
+                    continue
+                _compose_parse_cache[p] = _parse_compose(p)
+
+
+def _compose_services(path: str) -> dict | None:
+    """Return a cached parse of a rendered compose. Files are monitored and
+    reloaded ONLY when they change — reads never re-yaml-parse (per-poll
+    re-parsing saturated the -api CPU)."""
+    global _compose_monitor_started
+    with _compose_cache_lock:
+        hit = _compose_parse_cache.get(path)
+        if hit is not None:
+            return hit[1]
+        _compose_parse_cache[path] = _parse_compose(path)
+    if not _compose_monitor_started:
+        _compose_monitor_started = True
+        threading.Thread(target=_compose_monitor_loop, daemon=True, name="compose-watch").start()
+    return _compose_parse_cache[path][1]
+
+
 def _expected_container_names(entry: dict) -> list[str]:
-    """Return the full container names for a service — from registry or compose file."""
+    """Return the full container names for a service — from registry or compose file.
+
+    Profile-filtered (design §9): services whose compose ``profiles:`` list does
+    not intersect the entry's recorded (activated) ``profiles`` are NOT
+    expected — with no profile activated, only unprofiled services are
+    expected to run.
+    """
+    compose_file = entry.get("compose_file_path", "")
+    active_profiles = set(entry.get("profiles") or [])
+    active_svcs: set[str] | None = None
+    if compose_file and Path(compose_file).exists():
+        data = _compose_services(compose_file) or {}
+        services = data.get("services", {}) or {}
+        active_svcs = {
+            name
+            for name, svc in services.items()
+            if not isinstance(svc, dict)
+            or not svc.get("profiles")
+            or any(p in active_profiles for p in (svc.get("profiles") or []))
+        }
+
     stored = entry.get("container_names")
     if stored:
-        return stored
+        if active_svcs is None:
+            return stored
+        prefix = template_engine.container_prefix(
+            entry["service_name"], entry["user_name"], entry["label"]
+        )
+        return [c for c in stored if c[len(prefix):] in active_svcs]
 
     # Fallback: derive from compose file (backward compat with pre-container_names entries)
-    compose_file = entry.get("compose_file_path", "")
-    if compose_file and Path(compose_file).exists():
-        import yaml
-        try:
-            with open(compose_file) as f:
-                data = yaml.safe_load(f) or {}
-            prefix = template_engine.container_prefix(
-                entry["service_name"], entry["user_name"], entry["label"]
-            )
-            svc_keys = list(data.get("services", {}).keys())
-            return [f"{prefix}{k}" for k in svc_keys]
-        except Exception:
-            pass
+    if active_svcs is not None:
+        prefix = template_engine.container_prefix(
+            entry["service_name"], entry["user_name"], entry["label"]
+        )
+        return [f"{prefix}{k}" for k in sorted(active_svcs)]
     return []
+
+
+def _recipe_path_for_entry(entry: dict[str, Any]) -> str:
+    """Recipe subdirectory of one instance, relative to its project dir.
+
+    ``''`` = the project-root recipe; otherwise the recipe dir (e.g. ``docker``
+    for dify). Derived from the recorded per-user file paths so the dashboard's
+    Deployment-Files links resolve to the SAME directory the deploy wrote into
+    (single source of truth = the registry entry).
+    """
+    service_name = entry.get("service_name") or ""
+    try:
+        project_dir = (SOURCE_PROJECTS_DIR / service_name).resolve()
+    except OSError:
+        return ""
+    candidates: list[str] = []
+    for key in ("compose_file_path", "compose_template_path", "nginx_conf_path", "env_file_path"):
+        v = entry.get(key)
+        if isinstance(v, str) and v:
+            candidates.append(v)
+    for v in (entry.get("compose_file_paths") or []):
+        if isinstance(v, str) and v:
+            candidates.append(v)
+    for c in candidates:
+        try:
+            rel = Path(c).resolve().parent.relative_to(project_dir)
+        except (ValueError, OSError):
+            continue
+        return "" if str(rel) == "." else rel.as_posix()
+    return ""
 
 
 def _status_for_user(user_name: str, running: dict[str, str]) -> dict[str, Any]:
@@ -1328,7 +1515,11 @@ def _status_for_user(user_name: str, running: dict[str, str]) -> dict[str, Any]:
                 status = running[cname]
                 if "unhealthy" in status.lower():
                     unhealthy[cname] = status
-                elif "up" in status.lower() or "healthy" in status.lower():
+                elif (
+                    "up" in status.lower()
+                    or "healthy" in status.lower()
+                    or "exited (0)" in status.lower()  # one-shot completed successfully
+                ):
                     healthy[cname] = status
                 else:
                     unhealthy[cname] = status
@@ -1340,6 +1531,11 @@ def _status_for_user(user_name: str, running: dict[str, str]) -> dict[str, Any]:
             "label": entry["label"],
             "compose_template_path": entry.get("compose_template_path", ""),
             "compose_file_path": compose_file,
+            # Recipe subdir of THIS instance ('' = project root) + the effective
+            # per-user env file — the dashboard's Deployment-Files links must
+            # resolve inside the recipe dir, not the project root.
+            "recipe_path": _recipe_path_for_entry(entry),
+            "env_file_path": entry.get("env_file_path", ""),
             "container_names": expected_names,
             "healthy_containers": healthy,
             "unhealthy_containers": unhealthy,
@@ -1421,6 +1617,7 @@ def _compute_container_stats() -> dict[str, Any]:
     healthy_running = 0
     unhealthy_running = 0
     restarting = 0
+    completed = 0
     down = 0
     missing = 0
 
@@ -1433,6 +1630,10 @@ def _compute_container_stats() -> dict[str, Any]:
         status_lower = status.lower()
         if "restarting" in status_lower:
             restarting += 1
+        elif "exited (0)" in status_lower:
+            # One-shot init container completed successfully — NOT "down"
+            # (feature 10; mirrors _status_for_user's exited-(0)-healthy rule).
+            completed += 1
         elif "up" in status_lower:
             if "(unhealthy)" in status_lower:
                 unhealthy_running += 1
@@ -1448,6 +1649,7 @@ def _compute_container_stats() -> dict[str, Any]:
             "healthy_running": healthy_running,
             "unhealthy_running": unhealthy_running,
             "restarting": restarting,
+            "completed": completed,
             "down": down,
             "missing": missing,
             "total_expected": len(expected),
@@ -1499,10 +1701,13 @@ def _compute_service_stats() -> dict[str, Any]:
             if "restarting" in status_lower:
                 all_ok = False
                 break
-            if "up" not in status_lower:
+            if "(unhealthy)" in status_lower:
                 all_ok = False
                 break
-            if "(unhealthy)" in status_lower:
+            # A completed one-shot init (Exited (0)) counts as healthy — only
+            # genuinely stopped/errored states make the service unhealthy
+            # (feature 10; mirrors _status_for_user).
+            if ("up" not in status_lower) and ("exited (0)" not in status_lower):
                 all_ok = False
                 break
 

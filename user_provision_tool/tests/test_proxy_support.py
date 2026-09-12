@@ -473,14 +473,14 @@ class TestMockProxy:
 
     def test_context_manager(self):
         from tests.mock_proxy import MockProxy
-        with MockProxy() as proxy:
+        with MockProxy(offline=True) as proxy:
             assert proxy.port > 0
         # After __exit__ the server is stopped
 
     def test_http_get_relay(self):
         from tests.mock_proxy import MockProxy
         import urllib.request
-        with MockProxy() as proxy:
+        with MockProxy(offline=True) as proxy:
             proxy_url = proxy.url
             proxy_handler = urllib.request.ProxyHandler({
                 "http": proxy_url,
@@ -495,7 +495,7 @@ class TestMockProxy:
     def test_clear_history(self):
         from tests.mock_proxy import MockProxy
         import urllib.request
-        with MockProxy() as proxy:
+        with MockProxy(offline=True) as proxy:
             proxy_handler = urllib.request.ProxyHandler({"http": proxy.url})
             opener = urllib.request.build_opener(proxy_handler)
             opener.open("http://example.com", timeout=10)
@@ -507,7 +507,7 @@ class TestMockProxy:
     def test_history_structure(self):
         from tests.mock_proxy import MockProxy
         import urllib.request
-        with MockProxy() as proxy:
+        with MockProxy(offline=True) as proxy:
             proxy_handler = urllib.request.ProxyHandler({"http": proxy.url})
             opener = urllib.request.build_opener(proxy_handler)
             req = urllib.request.Request(

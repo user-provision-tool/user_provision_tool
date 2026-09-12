@@ -711,13 +711,13 @@ def remove_user(
     # never block teardown.
     compose_exists = compose_file and Path(compose_file).exists()
     if compose_exists:
-        docker_ops.compose_down(compose_file, project_name=project_name)
+        docker_ops.compose_down(compose_file, project_name=project_name, remove_volumes=True)
     elif project_name:
         _log.warning(
             "Compose file %s not found for %s/%s/%s — attempting down by project name %s",
             compose_file, user_name, service_name, label, project_name,
         )
-        docker_ops.compose_down_by_project(project_name)
+        docker_ops.compose_down_by_project(project_name, remove_volumes=True)
     else:
         _log.warning(
             "No compose file or project name for %s/%s/%s — skipping container teardown",
@@ -737,6 +737,20 @@ def remove_user(
     # Full purge (decision #2): a deleted service leaves NOTHING behind —
     # per-user artifacts in the recipe dir + the user_data volume tree.
     _purge_user_artifacts(user_name, service_name, label, entry)
+
+    # Named volumes live in Docker's volume store, not in the user_data tree the
+    # purge walks, so the bind-mount cleanup above cannot reach them. Without
+    # this, a compose declaring named volumes keeps its database/keys and the
+    # next deploy of the same (user, service, label) silently inherits them —
+    # not a clean deploy. The compose_file_path is unlinked further up, so the
+    # sweep is by compose-project label rather than by the file's declarations.
+    if project_name:
+        removed = docker_ops.remove_project_volumes(project_name)
+        if removed:
+            _log.info(
+                "removed %d named volume(s) for %s/%s/%s: %s",
+                len(removed), user_name, service_name, label, ", ".join(removed),
+            )
 
     # P1: Orphan network cleanup — if network still exists after compose_down, clean it up
     if net:

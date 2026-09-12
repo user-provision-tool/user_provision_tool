@@ -1014,6 +1014,25 @@ class CheckMissingFilesResponse(BaseModel):
     needs_env: bool = False
 
 
+def _is_compose_name(name: str) -> bool:
+    """True when ``name`` is a compose file by the platform's naming convention.
+
+    The convention — not "any YAML" — is what identifies a compose. Counting
+    unrelated YAML (a CI config, a linter config, a codecov config) as a compose
+    is not harmless: this presence scan then reports compose as PRESENT and the
+    deploy skips compose generation, while the gateway's candidate scan
+    (correctly) offers no compose to select — leaving nothing to deploy.
+    Mirrors ``file_sets._is_compose_name`` in the gateway; the two MUST agree.
+    A ``.j2`` template counts, since a recipe shipping a compose template does
+    have a compose for presence purposes.
+    """
+    if name.endswith(".j2"):
+        name = name[:-3]
+    return (name.startswith("docker-compose") or name.startswith("compose")) and (
+        name.endswith(".yml") or name.endswith(".yaml")
+    )
+
+
 @app.get("/services/{service_name}/check-missing-files")
 def check_missing_files(
     service_name: str,
@@ -1041,12 +1060,7 @@ def check_missing_files(
 
     files = [f.name for f in project_dir.iterdir() if f.is_file()]
 
-    has_compose = any(
-        f.endswith(".yml.j2") or f.endswith(".yaml.j2") or
-        (f.endswith(".yml") and not f.endswith(".j2")) or
-        (f.endswith(".yaml") and not f.endswith(".j2"))
-        for f in files
-    )
+    has_compose = any(_is_compose_name(f) for f in files)
     has_nginx = any(
         f.endswith(".conf.j2") or
         (f.endswith(".conf") and not f.endswith(".j2"))

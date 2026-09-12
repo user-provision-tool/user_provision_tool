@@ -4700,3 +4700,101 @@ class TestEdgeDockerfile:
         assert "USER nginx" in content
         # No ENTRYPOINT directive — compose drives the command (testability).
         assert not any(l.strip().startswith("ENTRYPOINT") for l in content.splitlines())
+
+
+class TestComposePresenceScan:
+    """check_missing_files must agree with the gateway's candidate scan.
+
+    Regression: any *.yml/*.yaml counted as a compose, so a recipe whose root
+    ships codecov.yml / cubic.yaml / lefthook.yml and no compose (n8n) reported
+    compose as present — the deploy skipped compose generation with nothing to
+    deploy. Mirrors the gateway's `_is_compose_name`.
+    """
+
+    def test_only_compose_named_yaml_counts(self):
+        from api import _is_compose_name
+        for ok in ("docker-compose.yml", "docker-compose.yaml", "compose.yml",
+                   "compose.yaml", "docker-compose.yml.j2"):
+            assert _is_compose_name(ok), ok
+        for no in ("codecov.yml", "cubic.yaml", "lefthook.yml",
+                   ".tbls.sqlite.yml", "pnpm-workspace.yaml", "values.yaml"):
+            assert not _is_compose_name(no), no
+
+    def test_check_missing_files_ignores_unrelated_yaml(self, tmp_path, monkeypatch):
+        import api
+        monkeypatch.setattr(api, "SOURCE_PROJECTS_DIR", tmp_path)
+        p = tmp_path / "n8n"
+        p.mkdir()
+        for f in ("codecov.yml", "cubic.yaml", "lefthook.yml", "pnpm-workspace.yaml"):
+            (p / f).write_text("x: 1\n")
+        resp = api.check_missing_files("n8n", "")
+        assert "docker-compose" in resp.missing, resp.missing
+        assert "nginx.conf" in resp.missing, resp.missing
+
+    def test_check_missing_files_accepts_a_real_recipe(self, tmp_path, monkeypatch):
+        import api
+        monkeypatch.setattr(api, "SOURCE_PROJECTS_DIR", tmp_path)
+        p = tmp_path / "svc"
+        p.mkdir()
+        (p / "docker-compose.yml").write_text("services: {}\n")
+        (p / "nginx.conf").write_text("server {}\n")
+        (p / "codecov.yml").write_text("coverage: {}\n")
+        resp = api.check_missing_files("svc", "")
+        assert "docker-compose" not in resp.missing
+        assert "nginx.conf" not in resp.missing
+
+
+class TestVolumePurgeOnDelete:
+    """Deletion must remove NAMED volumes too (decision #2 — nothing is kept).
+
+    Regression: `remove_user` ran `docker compose down` without `--volumes`, and
+    the artifact purge only walks the user_data bind-mount tree. A compose that
+    declares named volumes (n8n's `n8n_data:/home/node/.n8n`) therefore kept its
+    SQLite database and encryption key across a delete, so the next "clean"
+    deploy silently inherited the previous instance's data and accounts.
+    """
+
+    def _record(self, monkeypatch, stdout=""):
+        calls = []
+        import subprocess
+        def fake_run(args, check=True):
+            calls.append(list(args))
+            return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
+        from lib import docker_ops
+        monkeypatch.setattr(docker_ops, "_run", fake_run)
+        return docker_ops, calls
+
+    def test_compose_down_only_removes_volumes_when_asked(self, monkeypatch):
+        docker_ops, calls = self._record(monkeypatch)
+        docker_ops.compose_down("/x/docker-compose.yml", project_name="p")
+        assert "--volumes" not in calls[-1], "a plain down must not delete volumes"
+        docker_ops.compose_down("/x/docker-compose.yml", project_name="p", remove_volumes=True)
+        assert "--volumes" in calls[-1]
+
+    def test_down_by_project_can_remove_volumes(self, monkeypatch):
+        docker_ops, calls = self._record(monkeypatch)
+        docker_ops.compose_down_by_project("p", remove_volumes=True)
+        assert calls[-1][-1] == "--volumes"
+
+    def test_volume_sweep_removes_everything_labelled_with_the_project(self, monkeypatch):
+        docker_ops, calls = self._record(monkeypatch, stdout="p_a\np_b\n\n")
+        removed = docker_ops.remove_project_volumes("p")
+        assert removed == ["p_a", "p_b"]
+        rm = [c for c in calls if c[:3] == ["docker", "volume", "rm"]]
+        assert [c[-1] for c in rm] == ["p_a", "p_b"]
+        # the listing is filtered by the compose project label, not by name guessing
+        ls = [c for c in calls if c[:3] == ["docker", "volume", "ls"]]
+        assert any("label=com.docker.compose.project=p" in a for a in ls[0])
+
+    def test_volume_sweep_never_raises_when_nothing_matches(self, monkeypatch):
+        docker_ops, calls = self._record(monkeypatch, stdout="")
+        assert docker_ops.remove_project_volumes("p") == []
+        assert not [c for c in calls if c[:3] == ["docker", "volume", "rm"]]
+
+    def test_delete_path_asks_for_volume_removal(self, monkeypatch):
+        """remove_user must request it — this is the wiring that was missing."""
+        import inspect
+        from lib import provisioner
+        src = inspect.getsource(provisioner.remove_user)
+        assert "remove_volumes=True" in src
+        assert "remove_project_volumes" in src

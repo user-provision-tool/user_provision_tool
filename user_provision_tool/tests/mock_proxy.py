@@ -51,6 +51,13 @@ class _ForwardHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
     # Increase timeouts to avoid hangs during slow builds
     timeout = 120
 
+    # Answer every request locally instead of forwarding upstream. The tests that
+    # use this proxy exercise its plumbing (that a request traverses it, is
+    # recorded, and is relayed back) — not example.com. Forwarding made them
+    # depend on outbound internet: a slow upstream exceeded the client's 10s
+    # timeout and the suite went intermittently red.
+    offline: bool = False
+
     def _forward_request(self) -> None:
         """Read the incoming request, forward it, and write the response."""
         content_len = int(self.headers.get("Content-Length", 0))
@@ -64,6 +71,16 @@ class _ForwardHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             "body_len": len(body),
             "timestamp": time.time(),
         })
+
+        if self.offline:
+            payload = b"mock-proxy: offline\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(payload)
+            return
 
         # Build the target URL
         url = self.path
@@ -168,9 +185,10 @@ class MockProxy:
             ...
     """
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 0):
+    def __init__(self, host: str = "127.0.0.1", port: int = 0, offline: bool = False):
         self.host = host
         self._port: int = port
+        self._offline = offline
         self._server: _ThreadedTCPServer | None = None
         self._thread: threading.Thread | None = None
         self.history: list[dict[str, Any]] = []
@@ -190,6 +208,7 @@ class MockProxy:
         handler.proxy_host = self.host
         handler.proxy_port = self._port
         handler.history = self.history
+        handler.offline = self._offline
 
         self._server = _ThreadedTCPServer((self.host, self._port), handler)
         self._port = self._server.server_address[1]

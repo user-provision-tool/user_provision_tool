@@ -188,8 +188,21 @@ def compose_down(
     env_file: str | list[str] | None = None,
     project_name: str | None = None,
     profiles: str | list[str] | None = None,
+    remove_volumes: bool = False,
 ) -> None:
-    _run(_compose_base(compose_file, env_file, project_name, profiles) + ["down"])
+    """``docker compose down``. ``remove_volumes`` adds ``--volumes``.
+
+    Deletion (decision #2 — a deleted service leaves NOTHING behind) must pass
+    ``remove_volumes=True``: a compose that declares NAMED volumes keeps its data
+    otherwise, because named volumes live in Docker's volume store, not in the
+    user_data bind-mount tree the purge walks. Leaving them behind means the next
+    deploy of the same (user, service, label) silently inherits the previous
+    instance's database, accounts and encryption key — it is not a clean deploy.
+    """
+    cmd = _compose_base(compose_file, env_file, project_name, profiles) + ["down"]
+    if remove_volumes:
+        cmd.append("--volumes")
+    _run(cmd)
 
 
 def compose_stop(
@@ -202,13 +215,40 @@ def compose_stop(
     _run(_compose_base(compose_file, env_file, project_name, profiles) + ["stop"])
 
 
-def compose_down_by_project(project_name: str) -> None:
+def compose_down_by_project(project_name: str, remove_volumes: bool = False) -> None:
     """Tear down a Compose project by project name alone (no compose file needed).
 
     Useful as a fallback when the per-user compose file has been lost but the
-    containers and networks still exist under *project_name*.
+    containers and networks still exist under *project_name*. ``remove_volumes``
+    also removes the project's named volumes (see ``compose_down``).
     """
-    _run(["docker", "compose", "-p", project_name, "down", "--remove-orphans"])
+    cmd = ["docker", "compose", "-p", project_name, "down", "--remove-orphans"]
+    if remove_volumes:
+        cmd.append("--volumes")
+    _run(cmd)
+
+
+def remove_project_volumes(project_name: str) -> list[str]:
+    """Remove every volume belonging to a Compose project, by label.
+
+    Backstop for deletion: ``compose down --volumes`` only removes volumes the
+    CURRENT compose file declares, so a volume left by an earlier revision of the
+    file (or one the file no longer lists) would survive a "leaves nothing"
+    delete. Compose labels every volume it creates with the project name, so a
+    label sweep catches whatever the compose file has forgotten.
+
+    Returns the volume names it removed. Never raises: deletion must not fail
+    because a volume was already gone.
+    """
+    res = _run(
+        ["docker", "volume", "ls", "-q",
+         "--filter", f"label=com.docker.compose.project={project_name}"],
+        check=False,
+    )
+    names = [n.strip() for n in (res.stdout or "").splitlines() if n.strip()]
+    for name in names:
+        _run(["docker", "volume", "rm", "-f", name], check=False)
+    return names
 
 
 def compose_build(compose_file: str, no_cache: bool = False, env_file: str | list[str] | None = None, project_name: str | None = None, build_args: dict[str, str] | None = None, profiles: str | list[str] | None = None) -> None:

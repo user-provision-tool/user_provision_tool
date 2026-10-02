@@ -22,7 +22,9 @@ class TestTaskManager:
             return a + b
 
         task_id = tm.submit("test", slow_add, 1, 2)
-        assert len(task_id) == 12  # short UUID
+        # Namespaced since GRILLING G28: `api-` + 12 hex chars. The prefix is what
+        # makes an id self-describing in a list that also holds the gateway's `gt-` ids.
+        assert task_id.startswith("api-") and len(task_id) == 16
 
         # Poll until completed
         import time
@@ -57,20 +59,68 @@ class TestTaskManager:
         assert task["result"] is None
 
     def test_cancel_pending_task(self):
-        from lib.task_manager import TaskManager
+        """A task is cancellable in the pending window before a worker picks it up."""
+        import threading
+        import time
+        from lib.task_manager import Task, TaskManager
         tm = TaskManager(max_workers=1)
+        tm._tasks["pending01"] = Task("pending01", "test")
+        assert tm.cancel("pending01") is True
+        assert tm.get("pending01")["status"] == "cancelled"
+
+    def test_submit_refuses_at_capacity(self):
+        """A saturated pool must NOT accept-and-queue forever (doc §4d)."""
+        import time
+        from lib.task_manager import TaskCapacityError, TaskManager
+        tm = TaskManager(max_workers=1)
+        started = __import__("threading").Event()
 
         def blocker():
-            import time
+            started.set()
             time.sleep(10)
 
-        # Use the only worker so the second task stays pending
         tm.submit("block", blocker)
-        task_id = tm.submit("test", lambda: 42)
+        started.wait(2)
+        # The single worker is busy → the next submit is refused, not queued.
+        try:
+            tm.submit("test", lambda: 42)
+            assert False, "expected TaskCapacityError"
+        except TaskCapacityError as exc:
+            assert exc.running == 1 and exc.capacity == 1
+            assert "at capacity" in str(exc)
+            assert "cancel a task" in str(exc)
 
-        assert tm.cancel(task_id) is True
-        task = tm.get(task_id)
-        assert task["status"] == "cancelled"
+    def test_capacity_refusal_is_not_counted_as_a_task(self):
+        """A refused submit must leave no task behind."""
+        import time
+        from lib.task_manager import TaskCapacityError, TaskManager
+        tm = TaskManager(max_workers=1)
+        started = __import__("threading").Event()
+
+        def blocker():
+            started.set()
+            time.sleep(10)
+
+        tm.submit("block", blocker)
+        started.wait(2)
+        before = len(tm.list_all())
+        try:
+            tm.submit("test", lambda: 42)
+        except TaskCapacityError:
+            pass
+        assert len(tm.list_all()) == before
+
+    def test_task_carries_its_target(self):
+        """The card's Cancel finds the task via (user, service, label) — §4b."""
+        from lib.task_manager import TaskManager
+        tm = TaskManager(max_workers=2)
+        tid = tm.submit(
+            "register", lambda **kw: None,
+            user_name="alice", service_name="n8n", label="0",
+        )
+        assert tm.get(tid)["target"] == {
+            "user_name": "alice", "service_name": "n8n", "label": "0",
+        }
 
     def test_get_nonexistent_returns_none(self):
         from lib.task_manager import TaskManager
@@ -95,7 +145,10 @@ class TestTaskManager:
 
     def test_task_id_uniqueness(self):
         from lib.task_manager import TaskManager
-        tm = TaskManager(max_workers=4)
+        # Enough workers for every submission: submit() now REFUSES past
+        # capacity instead of queueing (doc §4d), so a 4-worker pool would make
+        # this a test of pool saturation rather than of id uniqueness.
+        tm = TaskManager(max_workers=32)
         ids = {tm.submit("test", lambda: None) for _ in range(20)}
         assert len(ids) == 20
 
@@ -176,7 +229,12 @@ class TestTaskManager:
         assert not Path(log_path).exists()  # log deleted
 
     def test_task_log_file_cleaned_on_max(self, tmp_path):
-        """When max_tasks is exceeded, oldest task + log are evicted."""
+        """Beyond max_tasks, the oldest FINISHED task + log are evicted.
+
+        The sweep is triggered from `submit`, i.e. while the newest tasks are
+        still live — so the eviction is expected once they have FINISHED, which
+        is why it is driven explicitly here (G30: only finished records are
+        eligible; `test_cap_never_evicts_a_live_task` covers the live case)."""
         from lib.task_manager import TaskManager
         from pathlib import Path
         log_dir = tmp_path / "task_logs"
@@ -197,6 +255,9 @@ class TestTaskManager:
                     break
                 time.sleep(0.01)
 
+        # All five are finished now ⇒ the cap applies on the next sweep.
+        tm._cleanup_excess()
+
         # Oldest 2 tasks should be evicted
         assert tm.get(task_ids[0]) is None
         assert tm.get(task_ids[1]) is None
@@ -207,6 +268,60 @@ class TestTaskManager:
         assert tm.get(task_ids[2]) is not None
         assert tm.get(task_ids[3]) is not None
         assert tm.get(task_ids[4]) is not None
+
+    def test_the_cleanup_defaults_are_the_contract(self):
+        """G30: "one TTL number, one default, configured the same way".
+
+        Pinned on this side too, against the gateway's
+        (`test_unit.py::TestTheCleanupContract::test_the_ttl_and_cap_defaults_are_the_apis`).
+        The env names differ because the engines do; the DEFAULTS must not, or
+        the two stores age their records for different lengths of time and nobody
+        sees it.
+        """
+        import os
+        from lib.task_manager import TaskManager
+
+        assert int(os.environ.get("TASK_TTL_SECONDS", "604800")) == 604800
+        assert int(os.environ.get("TASK_MAX_COUNT", "1000")) == 1000
+        # …and the singleton is built from them, not from a literal.
+        tm = TaskManager()
+        assert tm._ttl == 604800 and tm._max_tasks == 1000
+
+    def test_cap_never_evicts_a_live_task(self, tmp_path):
+        """G30: only FINISHED records are eligible for eviction.
+
+        The sweep used to sort every task by age and delete the overflow
+        whatever its status, so a RUNNING task could lose its registry entry —
+        and its log, which the `LLM based fix` handoff needs — while its build
+        carried on. The oldest task here is the live one, so eviction by age
+        alone would take it."""
+        from lib.task_manager import Task, TaskManager
+        from pathlib import Path
+        log_dir = tmp_path / "task_logs"
+        tm = TaskManager(max_workers=4, max_tasks=2, log_dir=str(log_dir))
+
+        # The OLDEST task is still running; two finished ones follow.
+        running = Task("api-running", "register")
+        running.status = "running"
+        running.created_at = 1.0
+        tm._tasks[running.task_id] = running
+
+        finished = []
+        for i, age in enumerate((2.0, 3.0, 4.0)):
+            t = Task(f"api-done{i}", "register")
+            t.status = "completed"
+            t.created_at = age
+            tm._tasks[t.task_id] = t
+            finished.append(t.task_id)
+
+        tm._cleanup_excess()
+
+        assert tm.get("api-running") is not None, "a live task keeps its record"
+        assert tm.get("api-running").get("status") == "running"
+        # cap 2 against three finished ⇒ exactly the oldest finished one goes
+        assert tm.get(finished[0]) is None
+        assert tm.get(finished[1]) is not None
+        assert tm.get(finished[2]) is not None
 
     def test_get_log_file_nonexistent(self, tmp_path):
         """get_log_file returns None for nonexistent task."""
@@ -266,7 +381,10 @@ class TestTaskManager:
             time.sleep(0.01)
 
         assert set(task.keys()) == {
-            "task_id", "type", "status", "created_at", "updated_at", "result", "error"
+            "task_id", "type", "status", "created_at", "updated_at", "result", "error",
+            # Added for §4b: a service card finds the task behind a `building`
+            # entry by its (user, service, label) target.
+            "target",
         }
         assert task["task_id"] == tid
         assert task["type"] == "register"

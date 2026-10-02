@@ -37,7 +37,33 @@ def _retry_transient(fn, attempts=3, delay=1.0, backoff=2.0):
                 time.sleep(wait)
                 wait *= backoff
     assert last_exc is not None
+    # Distinguish "the ENVIRONMENT was unavailable" from "the merge is wrong".
+    # Only the former is not a verdict on the tree — and retrying cannot fix it,
+    # so reporting it as a FAILURE makes the suite red on a green tree (observed
+    # again 2026-09-20: this test failed one full run and passed the next, on
+    # identical code, under heavy parallel container load). Skipping is the
+    # honest signal: the precondition `shutil.which("docker")` was checked at
+    # import time, but the DAEMON can become unreachable mid-run.
+    if _is_env_unavailable(last_exc):
+        pytest.skip(f"docker environment unavailable: {last_exc}")
     raise last_exc
+
+
+# Signatures of "the tool/daemon is not reachable", as opposed to "the merge
+# produced a wrong result". Kept narrow on purpose: a genuine merge error must
+# still fail the suite.
+_ENV_UNAVAILABLE = (
+    "cannot connect to the docker daemon",
+    "error during connect",
+    "is the docker daemon running",
+    "docker: not found",
+    "connection refused",
+)
+
+
+def _is_env_unavailable(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(sig in text for sig in _ENV_UNAVAILABLE)
 
 
 # ---------------------------------------------------------------------------
@@ -166,11 +192,24 @@ class TestComposeMerge:
         a.write_text(DIFY_BASE)
         b.write_text(DIFY_MIDDLEWARE)
         out = tmp_path / "docker-compose.merged.yml"
-        _retry_transient(
-            lambda: merge_compose_files([str(a), str(b)], str(out)),
-            attempts=3,
-        )
-        data = yaml.safe_load(out.read_text())
+        # The READ + structural check belong INSIDE the retry. They used to sit
+        # outside it, so a run whose `docker compose config` exited 0 but
+        # produced a truncated config (`name: dify` and no `services`) was never
+        # retried — it failed the suite with `KeyError: 'services'`. Captured
+        # live 2026-09-20; this is NOT an environment-unavailable signature,
+        # which is why the skip-classification for that case did not cover it.
+        def _merge_and_parse():
+            merge_compose_files([str(a), str(b)], str(out))
+            parsed = yaml.safe_load(out.read_text())
+            # A merged dify config ALWAYS has services; its absence means the
+            # output was truncated/empty, which is transient — not a verdict.
+            if not isinstance(parsed, dict) or not parsed.get("services"):
+                raise RuntimeError(
+                    "merged config carries no services (truncated output)"
+                )
+            return parsed
+
+        data = _retry_transient(_merge_and_parse, attempts=3)
         names = sorted(data["services"].keys())
         assert "db_postgres" in names  # profile-gated service SURVIVES the merge
         assert data["services"]["db_postgres"]["profiles"] == ["", "postgresql"]
@@ -733,3 +772,98 @@ class TestComposePreview:
         )
         assert resp.status_code == 200
         assert resp.json()["volume_keys"] == ["app_data", "db_data"]
+
+
+class TestTransientRetryClassification:
+    """The retry must SKIP on an unavailable environment and FAIL on a bad merge.
+
+    Round-6 fix: retrying 3x could not help a daemon that was unreachable for
+    longer than the budget, and reporting that as a FAILURE made the suite red
+    on a green tree (observed: this file's golden test failed one full run and
+    passed the next on identical code). Skipping is a precondition signal, not a
+    verdict on the tree — but a genuine merge error must still fail.
+    """
+
+    def test_environment_errors_are_recognised(self):
+        from tests.test_selection_generation import _is_env_unavailable
+        assert _is_env_unavailable(RuntimeError(
+            "docker compose config failed: Cannot connect to the Docker daemon at ..."))
+        assert _is_env_unavailable(RuntimeError(
+            "error during connect: Post http://...: connection refused"))
+        assert not _is_env_unavailable(RuntimeError("config failed: invalid compose"))
+
+    def test_a_permanent_environment_error_skips(self):
+        # The raise is caught HERE, not by pytest.raises: pytest intercepts a
+        # Skipped raised inside a test and marks the test skipped — so the
+        # obvious formulation reported "skipped" and proved nothing (it was
+        # first written that way, and silently verified nothing).
+        from tests.test_selection_generation import _retry_transient
+        try:
+            _retry_transient(
+                lambda: (_ for _ in ()).throw(
+                    RuntimeError("Cannot connect to the Docker daemon")),
+                attempts=2, delay=0,
+            )
+        except BaseException as e:  # noqa: BLE001 - Skipped is a BaseException
+            raised = type(e).__name__
+        else:
+            raised = "none"
+        assert raised == "Skipped", f"expected Skipped, got {raised}"
+
+    def test_a_real_merge_error_still_fails(self):
+        from tests.test_selection_generation import _retry_transient
+        with pytest.raises(RuntimeError, match="config failed"):
+            _retry_transient(
+                lambda: (_ for _ in ()).throw(RuntimeError("config failed: bad yaml")),
+                attempts=2, delay=0,
+            )
+
+
+class TestTruncatedMergeOutputIsRetried:
+    """A services-less merge output is TRANSIENT, not a verdict.
+
+    Captured live (2026-09-20): `docker compose config` exited 0 but emitted only
+    `name: dify`, so the test died with `KeyError: 'services'`. The read and the
+    structural check sat OUTSIDE `_retry_transient`, so that outcome was never
+    retried — and it is not an environment-unavailable error either, which is why
+    the skip-classification for that case did not cover it.
+    """
+
+    def test_a_transient_truncated_output_is_retried(self, tmp_path):
+        from lib import compose_merge
+        calls = {"n": 0}
+
+        def fake_merge(paths, out):
+            calls["n"] += 1
+            p = Path(out)
+            if calls["n"] == 1:
+                p.write_text("name: dify\n")            # truncated
+            else:
+                p.write_text("services:\n  db_postgres:\n    profiles: ['', 'postgresql']\n")
+
+        orig = compose_merge.merge_compose_files
+        try:
+            compose_merge.merge_compose_files = fake_merge
+            out = tmp_path / "m.yml"
+            def run():
+                fake_merge([], str(out))
+                data = yaml.safe_load(out.read_text())
+                if not isinstance(data, dict) or not data.get("services"):
+                    raise RuntimeError("merged config carries no services (truncated output)")
+                return data
+            data = _retry_transient(run, attempts=3, delay=0)
+            assert "db_postgres" in data["services"]
+            assert calls["n"] == 2, "the truncated attempt must have been retried"
+        finally:
+            compose_merge.merge_compose_files = orig
+
+    def test_a_persistently_bad_output_still_fails(self, tmp_path):
+        out = tmp_path / "m.yml"
+        def run():
+            out.write_text("name: dify\n")
+            data = yaml.safe_load(out.read_text())
+            if not isinstance(data, dict) or not data.get("services"):
+                raise RuntimeError("merged config carries no services (truncated output)")
+            return data
+        with pytest.raises(RuntimeError, match="no services"):
+            _retry_transient(run, attempts=2, delay=0)

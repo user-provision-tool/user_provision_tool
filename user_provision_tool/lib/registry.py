@@ -208,6 +208,30 @@ def get_user_service(user_name: str, service_name: str, label: str) -> dict[str,
     return None
 
 
+def next_free_label(user_name: str, service_name: str) -> str:
+    """The next label to allocate for a user+service pair — ``max(existing) + 1``, or ``"0"``.
+
+    Label allocation belongs to the registry owner (GRILLING G3): the label is part of the
+    entry's identity and its uniqueness is enforced here, so the value must be derived from
+    the same store that enforces it. ``max + 1`` deliberately never reuses a freed label —
+    a reused label can collide with surviving Docker objects (a network still attached to
+    another stack's container), which is exactly how a redeploy used to be blocked.
+
+    Read-only; the caller's registration re-checks for a duplicate under the lock, so a
+    concurrent allocation surfaces as "already registered" rather than as two entries
+    sharing a label.
+    """
+    labels: list[int] = []
+    for entry in get_user(user_name):
+        if entry.get("service_name") != service_name:
+            continue
+        try:
+            labels.append(int(str(entry.get("label", "0"))))
+        except (TypeError, ValueError):
+            continue
+    return str(max(labels) + 1) if labels else "0"
+
+
 def add_user(entry: dict[str, Any]) -> None:
     with transaction():
         users = list(_load())

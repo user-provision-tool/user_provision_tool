@@ -36,10 +36,11 @@ class Task:
 
     __slots__ = (
         "task_id", "type", "status", "created_at", "updated_at",
-        "result", "error", "_future", "_cancel_event", "log_file",
+        "result", "error", "_future", "_cancel_event", "log_file", "target",
     )
 
-    def __init__(self, task_id: str, task_type: str, future: Future = None, log_file: str = ""):
+    def __init__(self, task_id: str, task_type: str, future: Future = None, log_file: str = "",
+                 target: dict[str, Any] | None = None):
         self.task_id = task_id
         self.type = task_type          # "register" | "rebuild" | "remove"
         self.status = "pending"        # pending → running → completed | failed | cancelled
@@ -50,6 +51,10 @@ class Task:
         self._future = future
         self._cancel_event = threading.Event()
         self.log_file = log_file       # path to per-task log file
+        # The (user, service, label) this task works on, so a service card can
+        # find the task behind a `building` entry and cancel it (§4b) without
+        # the card depending on the task store for its own state.
+        self.target: dict[str, Any] = dict(target or {})
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -60,6 +65,7 @@ class Task:
             "updated_at": self.updated_at,
             "result": self.result,
             "error": self.error,
+            "target": self.target,
         }
 
     @classmethod
@@ -84,6 +90,29 @@ class Task:
         return d
 
 
+class TaskCapacityError(RuntimeError):
+    """The task pool is saturated; the work was NOT accepted.
+
+    Raised by :meth:`TaskManager.submit` instead of silently queueing behind a
+    full pool. There is deliberately **no timeout** on long-running tasks
+    (GRILLING G11 / doc §5.6), so this refusal is the mechanism that makes a
+    saturated platform discoverable — the remedy is for the operator to cancel
+    whatever has been hanging.
+    """
+
+    #: A stable code the UI can branch on — carried by the ERROR, not derived
+    #: from its text (user ruling 2026-09-20).
+    reason = "at_capacity"
+
+    def __init__(self, running: int, capacity: int):
+        self.running = running
+        self.capacity = capacity
+        super().__init__(
+            f"at capacity: {running} task(s) running (limit {capacity}); "
+            "cancel a task that has been hanging and retry"
+        )
+
+
 class TaskManager:
     """In-memory task pool backed by a ThreadPoolExecutor.
 
@@ -103,6 +132,7 @@ class TaskManager:
         max_tasks: int = 1000,
         log_dir: str = "",
     ):
+        self._max_workers = max_workers
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._tasks: dict[str, Task] = {}
         self._lock = threading.Lock()
@@ -161,6 +191,18 @@ class TaskManager:
     # Public API
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def new_task_id() -> str:
+        """A namespaced task id (GRILLING G28).
+
+        The -api's family is `api-`; the gateway's is `gt-`. The prefix makes an
+        id self-describing wherever it appears — a task list, a log filename, a
+        URL — so a `gt-` id can never be mistaken for one of the -api's tasks
+        (which is exactly the confusion that made a pre-session card's job link
+        point at a page listing only -api tasks).
+        """
+        return f"api-{uuid.uuid4().hex[:12]}"
+
     def submit(
         self,
         task_type: str,
@@ -168,16 +210,56 @@ class TaskManager:
         *args: Any,
         **kwargs: Any,
     ) -> str:
-        """Submit *fn* for background execution.  Returns a task UUID immediately."""
-        task_id = uuid.uuid4().hex[:12]
+        """Submit *fn* for background execution.  Returns a task UUID immediately.
+
+        Raises :class:`TaskCapacityError` when the pool is saturated (doc §4d):
+        ``ThreadPoolExecutor`` has an UNBOUNDED queue, so without this check a
+        submit past capacity would be accepted (202 + a task id) and then wait
+        forever with no signal to the operator.
+        """
+        task_id = self.new_task_id()
         log_file = str(self._log_dir / f"task-{task_id}.log")
 
         future = Future()
-        task = Task(task_id, task_type, future, log_file=log_file)
+        task = Task(
+            task_id, task_type, future, log_file=log_file,
+            target={
+                k: kwargs.get(k)
+                for k in ("user_name", "service_name", "label")
+                if kwargs.get(k) is not None
+            },
+        )
         with self._lock:
+            # In-flight = pending + running, EXCLUDING record-only tasks.
+            #
+            # The pool exists for the -api's own DEPLOYING work (register /
+            # rebuild / remove). A `custom` task is a bookkeeping record for work
+            # an external process performs (the gateway's generation session) —
+            # it occupies no worker, so counting it let generations exhaust a
+            # capacity they never consumed and refuse every deploy. On the
+            # user's ruling: the pool is for the deploying tasks only.
+            in_flight = sum(
+                1 for t in self._tasks.values()
+                if t.status in ("pending", "running")
+                and (t.target or {}).get("kind") != "record"
+            )
+            if in_flight >= self._max_workers:
+                raise TaskCapacityError(in_flight, self._max_workers)
             self._tasks[task_id] = task
             self._cleanup_excess()
             self._persist_to_disk()
+
+        # The task id is only known HERE, but the registry entry is created
+        # inside the task — so a target that declares `_task_id` (register,
+        # rebuild) receives it and stamps it on the entry (llm-based-fix-todo.md
+        # §4). Declared explicitly rather than injected blindly, so functions
+        # that take only the documented kwargs keep working.
+        try:
+            import inspect as _inspect
+            if "_task_id" in _inspect.signature(fn).parameters:
+                kwargs["_task_id"] = task_id
+        except (TypeError, ValueError):
+            pass
 
         real_future = self._executor.submit(
             self._run_task, task_id, task_type, fn, *args, **kwargs
@@ -265,6 +347,10 @@ class TaskManager:
         cancel_event = kwargs.pop("_cancel_event", None)
         if cancel_event is not None:
             task._cancel_event = cancel_event
+        # Hand the same event to docker_ops so a command already blocked in
+        # proc.wait() can be terminated — cooperative cancellation alone only
+        # fires between docker_ops calls (doc §4b).
+        docker_ops.set_cancel_event(task._cancel_event)
 
         try:
             result = fn(*args, **kwargs)
@@ -275,6 +361,7 @@ class TaskManager:
             task.status = "failed"
         finally:
             task.updated_at = time.time()
+            docker_ops.clear_cancel_event()
             docker_ops.clear_task_log_file()
             self._persist_to_disk()
 
@@ -284,7 +371,7 @@ class TaskManager:
         with self._lock:
             stale = [
                 (tid, t) for tid, t in self._tasks.items()
-                if t.status in ("completed", "failed", "cancelled", "unknown")
+                if t.status in self.TERMINAL_STATUSES
                 and (now - t.updated_at) > self._ttl
             ]
             if not stale:
@@ -294,17 +381,30 @@ class TaskManager:
                 del self._tasks[tid]
             self._persist_to_disk()
 
+    # The statuses G30's cleanup contract calls FINISHED and therefore eligible
+    # for eviction. `unknown` is the -api's OWN terminal status (a task whose
+    # state was lost across a restart) with no gateway counterpart.
+    TERMINAL_STATUSES = ("completed", "failed", "cancelled", "unknown")
+
     def _cleanup_excess(self) -> None:
-        """Remove oldest tasks if total exceeds _max_tasks and delete their logs."""
-        if len(self._tasks) <= self._max_tasks:
+        """Evict the OLDEST FINISHED tasks beyond the cap, with their logs.
+
+        G30's contract: "only **finished** records are eligible". This used to
+        sort EVERY task by `created_at` and delete the overflow regardless of
+        status — so at the cap it could evict a PENDING or RUNNING task: the
+        registry entry vanished while the container work kept going, and its log
+        (the thing the `LLM based fix` handoff reads to diagnose the failure) was
+        deleted mid-build. The gateway's `prune_excess` never had that hole;
+        G30 wants ONE contract, so this is the same eligibility rule.
+        """
+        finished = [
+            (tid, t) for tid, t in self._tasks.items()
+            if t.status in self.TERMINAL_STATUSES
+        ]
+        excess = len(finished) - self._max_tasks
+        if excess <= 0:
             return
-        # Sort oldest-first, remove the overflow
-        sorted_tasks = sorted(
-            self._tasks.items(),
-            key=lambda item: item[1].created_at,
-        )
-        to_remove = len(self._tasks) - self._max_tasks
-        for tid, t in sorted_tasks[:to_remove]:
+        for tid, t in sorted(finished, key=lambda item: item[1].created_at)[:excess]:
             self._delete_task_log(t.log_file)
             del self._tasks[tid]
         self._persist_to_disk()
@@ -323,6 +423,7 @@ class TaskManager:
 # ---------------------------------------------------------------------------
 
 task_manager = TaskManager(
+    max_workers=int(os.environ.get("TASK_MAX_CONCURRENCY", "4")),
     ttl_seconds=int(os.environ.get("TASK_TTL_SECONDS", "604800")),
     max_tasks=int(os.environ.get("TASK_MAX_COUNT", "1000")),
     log_dir=os.environ.get(

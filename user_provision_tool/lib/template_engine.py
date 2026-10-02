@@ -5,7 +5,8 @@ Template variables available in both compose and nginx templates:
   {{ service_name }}
   {{ label }}
   {{ domain_name }}
-  {{ container_prefix }}   ->  {service_name}-user_{user_name}-{label}-
+  {{ container_prefix }}   ->  {RESOURCE_PREFIX}{service_name}-user_{user_name}-{label}-
+  {{ network_name }}       ->  {RESOURCE_PREFIX}{service_name}-user_{user_name}-{label}
   {{ htpasswd_path }}      ->  absolute path to the generated .htpasswd file (nginx only)
   {{ volumes }}            ->  dict of host_path -> container_path mappings
 
@@ -37,13 +38,35 @@ def _make_env(template_path: str) -> tuple[Environment, str]:
     return env, tpl.name
 
 
+# Per-stack namespace for everything an instance creates (task doc §3, GRILLING G6).
+#
+# Networks, container names AND named volumes all live in Docker's GLOBAL namespaces, so two
+# stacks on one host derive the same names for the same (service, user, label) and collide — a
+# network created by one stack makes the other's deploy fail, because compose must replace a
+# network whose config changed and cannot remove one with an attached endpoint (task doc §2).
+# Setting this per stack (e.g. `RESOURCE_PREFIX=subnet-acl-` or `provision-`) removes the
+# possibility. Empty — the default — preserves the historical unprefixed names, so a stack can
+# adopt the mechanism without renaming objects that already exist.
+RESOURCE_PREFIX = os.environ.get("RESOURCE_PREFIX", "").strip()
+
+
+def _load_env() -> None:
+    """(Re-)read RESOURCE_PREFIX from the environment.
+
+    Mirrors ``subnet_manager._load_env()``: the -api calls both at register time so a value
+    set after import (by the process environment or by a test) is honoured.
+    """
+    global RESOURCE_PREFIX
+    RESOURCE_PREFIX = os.environ.get("RESOURCE_PREFIX", "").strip()
+
+
 def container_prefix(service_name: str, user_name: str, label: str) -> str:
-    return f"{service_name}-user_{user_name}-{label}-"
+    return f"{RESOURCE_PREFIX}{service_name}-user_{user_name}-{label}-"
 
 
 def user_network_name(service_name: str, user_name: str, label: str) -> str:
     """Return the isolated Docker network name for a user service instance."""
-    return f"{service_name}-user_{user_name}-{label}"
+    return f"{RESOURCE_PREFIX}{service_name}-user_{user_name}-{label}"
 
 
 def service_hostname(service_name: str, user_name: str, label: str, domain: str) -> str:

@@ -164,6 +164,55 @@ def regenerate_nginx_confs() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _sweep_transient_statuses() -> dict[str, Any]:
+    """Resolve entries left in a transient status by a restart (doc §4c).
+
+    - ``building`` (and the legacy ``error``) → ``failed`` with
+      ``failure.stage: "interrupted"``. The entry is KEPT (GRILLING G10), so the
+      card appears with a reason and the ordinary delete path can clean up.
+    - ``deleting`` → the teardown is **completed, not failed**: it is
+      idempotent and the entry is supposed to end up gone. Marking it failed
+      would strand a card that can never be removed.
+    """
+    from . import provisioner  # local import: avoid any import cycle at module load
+
+    swept = {"interrupted": 0, "delete_completed": 0, "delete_failed": 0}
+    for entry in registry.get_all_users():
+        status = str(entry.get("status") or "")
+        user_name = entry.get("user_name", "")
+        service_name = entry.get("service_name", "")
+        label = str(entry.get("label", "0"))
+        if not user_name or not service_name:
+            continue
+
+        if status in ("building", "error"):
+            try:
+                provisioner._mark_failed(
+                    user_name, service_name, label, "interrupted",
+                    "provision-api restarted while the deploy was running",
+                )
+                swept["interrupted"] += 1
+                print(f"[recovery] {user_name}/{service_name}/{label}: {status} → failed (interrupted)", flush=True)
+            except Exception as exc:
+                _log.warning("Failed to mark %s/%s/%s failed on startup: %s", user_name, service_name, label, exc)
+
+        elif status == "deleting":
+            print(f"[recovery] Completing interrupted delete of {user_name}/{service_name}/{label}", flush=True)
+            try:
+                provisioner.remove_user(
+                    user_name=user_name, service_name=service_name, label=label,
+                    nginx_container=entry.get("nginx_container") or "subnet-acl-nginx",
+                )
+                swept["delete_completed"] += 1
+            except Exception as exc:
+                # The teardown is idempotent — leave the entry for the next boot
+                # or a manual delete rather than failing a card that cannot go away.
+                swept["delete_failed"] += 1
+                _log.warning("Failed to complete delete of %s/%s/%s: %s", user_name, service_name, label, exc)
+
+    return swept
+
+
 def recover_on_startup(
     nginx_container: str = "subnet-acl-nginx",
 ) -> dict[str, Any]:
@@ -199,6 +248,10 @@ def recover_on_startup(
     except Exception:
         _log.exception("nginx conf regeneration failed during startup recovery")
 
+    # --- Sweep transient statuses BEFORE the zombie scan (doc §4c, GRILLING G11) ---
+    # Tasks live inside the -api process, so at boot any entry still in a
+    # transient status is by definition stale — nothing is working on it.
+    transient = _sweep_transient_statuses()
     all_users = registry.get_all_users()
 
     # --- Clean up zombie registry entries (written before compose_up but never started) ---
@@ -216,6 +269,14 @@ def recover_on_startup(
         user_name = entry.get("user_name", "")
         service_name = entry.get("service_name", "")
         label = str(entry.get("label", "0"))
+
+        # A FAILED entry has container_names but no containers by design (the
+        # failure path tears them down and keeps the entry). Restarting it here
+        # would silently resurrect a failed deploy and leave the registry saying
+        # `failed` while containers run — the operator's Retry is the only path
+        # back (GRILLING G17). `deleting` is already being torn down.
+        if str(entry.get("status") or "") in ("failed", "deleting"):
+            continue
 
         if not container_names:
             continue
@@ -276,6 +337,7 @@ def recover_on_startup(
         "nginx_reloaded": nginx_reloaded,
         "zombies_restarted": zombies_restarted,
         "zombies_cleaned": zombies_cleaned,
+        "transient_swept": transient,
     }
 
 

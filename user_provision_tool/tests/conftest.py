@@ -32,12 +32,19 @@ def registry_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     the mtime is None, so patching only the path let a previous test's (or the
     live registry's) cached list leak into this test — the cause of the
     order-dependent "environment" failures.
+
+    ``_state["path"]`` must be reset too: ``_load()`` only reloads when the
+    cached path DIFFERS from ``REGISTRY_FILE``, and ``_reload()`` early-returns
+    (without updating the path) when the file does not exist yet. Leaving a
+    stale path meant the first ``_load()`` of a test could still serve the
+    previously-loaded — or the live — registry's entries.
     """
     from lib import registry as reg_mod
     reg_path = tmp_path / "user_registry.yml"
     monkeypatch.setattr(reg_mod, "REGISTRY_FILE", reg_path)
     reg_mod._state["data"] = []
     reg_mod._state["mtime"] = None
+    reg_mod._state["path"] = str(reg_path)
     return reg_path
 
 

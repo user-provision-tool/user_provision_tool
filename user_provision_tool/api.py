@@ -30,8 +30,8 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, field_validator
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field, field_validator
 
 # Make lib/ importable when the file sits at the project root
 sys.path.insert(0, str(Path(__file__).parent))
@@ -39,7 +39,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from lib import docker_ops, provisioner, reconciliation, registry, subnet_manager, template_engine, validation
 from lib.compose_converter import compose_file_to_template, get_compose_service_names
 from lib.nginx_converter import nginx_file_to_template
-from lib.task_manager import Task, task_manager
+from lib.task_manager import Task, TaskCapacityError, task_manager
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -108,7 +108,13 @@ class RegisterRequest(BaseModel):
     profiles: list[str] | None = None
     # Optional per-user override of declared service env files (declared path → host path).
     service_env_files: dict[str, str] | None = None
-    label: str = "0"
+    # Label allocation (GRILLING G3 / task doc §1.4 Part B). The label is a REGISTRY KEY —
+    # `(user_name, service_name, label)` identifies an entry and its uniqueness is enforced
+    # here, under `registry.transaction()` (provisioner `register_service`). So the -api is
+    # the authority: omit it (or send "auto") and the next free label is allocated. A
+    # concrete label is still honoured verbatim, which is what the dashboard sends after
+    # computing its hint, and what every existing caller (CLI, tests, rebuild) sends.
+    label: str | None = None
     domain: str = "localhost"
     passwd: str = "123456"
     volumes: dict[str, str] = {}
@@ -128,7 +134,11 @@ class RegisterRequest(BaseModel):
 
     @field_validator("label")
     @classmethod
-    def _validate_label(cls, v: str) -> str:
+    def _validate_label(cls, v: str | None) -> str | None:
+        # None / "" / "auto" all mean "allocate the next free label" (see the field comment);
+        # they are not labels to validate.
+        if v is None or v.strip() in ("", "auto"):
+            return None
         try:
             validation.validate_label(v)
         except validation.ValidationError as e:
@@ -195,6 +205,25 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="User Provision Tool", version="1.0.0", lifespan=lifespan)
+
+
+@app.exception_handler(TaskCapacityError)
+async def _capacity_refusal_handler(request, exc: TaskCapacityError):
+    """A saturated pool must NOT look like an accepted task (doc §4d).
+
+    Without this, every submit site would 202 a task id that waits forever.
+    A distinct non-2xx lets the gateway propagate it and the dashboard branch
+    on it and show the persistent at-capacity alert.
+    """
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": str(exc),
+            "error": "at_capacity",
+            "running": exc.running,
+            "capacity": exc.capacity,
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -377,6 +406,15 @@ def register_user(
     env_file_path          = _resolve(req.env_file_path)
     env_files_resolved     = [_resolve(p) for p in (req.env_files or [])]
 
+    # --- Label allocation (GRILLING G3 / task doc §1.4 Part B) -----------------
+    # The registry owns `(user_name, service_name, label)`, so when the caller does not
+    # name a label the -api picks the next free one. The registration below re-checks for
+    # a duplicate under `registry.transaction()`, so a concurrent allocation fails loudly
+    # ("already registered") instead of silently writing a second entry under one label.
+    label = req.label if req.label is not None else registry.next_free_label(
+        req.user_name, req.service_name
+    )
+
     # --- Resolve compose template (convert plain file(s) if needed) ---
     compose_sources: list[str] = []
     if compose_file_paths:
@@ -463,7 +501,7 @@ def register_user(
     prov_kwargs = dict(
         user_name=req.user_name,
         service_name=req.service_name,
-        label=req.label,
+        label=label,
         compose_template=compose_template,
         output_dir=Path(compose_template).parent,
         nginx_output_dir=GENERATED_DIR,
@@ -913,56 +951,33 @@ def cancel_task(task_id: str) -> dict[str, Any]:
 # create a Tasks-page record and append session log lines (design §2).
 # ---------------------------------------------------------------------------
 
-@app.post("/tasks/custom")
-def create_custom_task(req: dict[str, Any]) -> dict[str, Any]:
-    """Create a task record owned by an external process (e.g. the gateway's
-    missing-files generation session). The caller gets a task_id + log path;
-    it appends lines via POST /tasks/{id}/log and finishes via
-    POST /tasks/{id}/finish."""
-    import uuid as _uuid
+@app.get("/tasks/{task_id}/logfile")
+def get_task_log_file(task_id: str) -> dict[str, Any]:
+    """The task's log, WHOLE (llm-based-fix-todo.md §1).
 
-    task_id = _uuid.uuid4().hex[:12]
-    log_file = str(task_manager._log_dir / f"task-{task_id}.log")
-    task = Task(task_id, req.get("type", "custom"), None, log_file=log_file)
-    task.status = "running"
-    task.result = {"target": req.get("target", ""), "detail": req.get("detail", {})}
-    with task_manager._lock:
-        task_manager._tasks[task_id] = task
-        task_manager._cleanup_excess()
-        task_manager._persist_to_disk()
-    return {"task_id": task_id, "log_file": log_file}
-
-
-@app.post("/tasks/{task_id}/log")
-def append_custom_task_log(task_id: str, req: dict[str, Any]) -> dict[str, Any]:
-    """Append a line to a custom task's log file."""
+    The `LLM based fix` job feeds the failed task's log to the generation
+    pipeline in full — not truncated, not summarised — and the gateway needs it
+    as one string, not as an SSE stream. 404 when the task (or its log) is gone,
+    which is exactly the condition the card renders as "task log is gone".
+    """
     task = task_manager.get(task_id)
     if task is None:
         raise HTTPException(404, f"Task not found: {task_id}")
     log_file = task_manager.get_log_file(task_id)
-    if not log_file:
-        raise HTTPException(404, f"Task log not found: {task_id}")
-    line = str((req or {}).get("line", ""))
-    with open(log_file, "a", encoding="utf-8") as f:
-        f.write(line if line.endswith("\n") else line + "\n")
-    return {"appended": True}
+    if not log_file or not Path(log_file).exists():
+        raise HTTPException(404, f"Task log is gone: {task_id}")
+    try:
+        text = Path(log_file).read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        raise HTTPException(404, f"Task log is gone: {task_id}") from e
+    return {
+        "task_id": task_id,
+        "status": task.get("status"),
+        "target": task.get("target") or {},
+        "log": text,
+        "bytes": len(text),
+    }
 
-
-@app.post("/tasks/{task_id}/finish")
-def finish_custom_task(task_id: str, req: dict[str, Any]) -> dict[str, Any]:
-    """Mark a custom task completed or failed (with an error string)."""
-    status = (req or {}).get("status", "completed")
-    if status not in ("completed", "failed"):
-        raise HTTPException(400, "status must be completed or failed")
-    if task_manager.get(task_id) is None:
-        raise HTTPException(404, f"Task not found: {task_id}")
-    task_manager.finish(task_id, status, str((req or {}).get("error", "")))
-    return {"task_id": task_id, "status": status}
-
-
-# ---------------------------------------------------------------------------
-# P2: GET /tasks/{task_id}/log  — SSE build log streaming
-# ---------------------------------------------------------------------------
 
 @app.get("/tasks/{task_id}/log")
 async def stream_task_log(
@@ -1478,6 +1493,12 @@ def _expected_container_names(entry: dict) -> list[str]:
     not intersect the entry's recorded (activated) ``profiles`` are NOT
     expected — with no profile activated, only unprofiled services are
     expected to run.
+
+    An EMPTY-STRING profile (``profiles: [""]``, the idiom graphiti uses) counts
+    as *ungated*, which is what compose does in practice: the service starts
+    with no profile activated. Treating it as gated made ``active_svcs`` empty
+    while compose had in fact started the containers, so nothing was expected,
+    no container was probed, and the card collapsed to "unknown".
     """
     compose_file = entry.get("compose_file_path", "")
     active_profiles = set(entry.get("profiles") or [])
@@ -1489,7 +1510,7 @@ def _expected_container_names(entry: dict) -> list[str]:
             name
             for name, svc in services.items()
             if not isinstance(svc, dict)
-            or not svc.get("profiles")
+            or not [p for p in (svc.get("profiles") or []) if p != ""]
             or any(p in active_profiles for p in (svc.get("profiles") or []))
         }
 
@@ -1541,9 +1562,46 @@ def _recipe_path_for_entry(entry: dict[str, Any]) -> str:
     return ""
 
 
+def _fix_available(task_id: str) -> bool:
+    """Whether `LLM based fix` can run for an entry (llm-based-fix-todo.md §5).
+
+    True only while the entry's task still resolves AND its log file is present.
+    Task records are TTL-pruned, so once the log is gone the fix cannot be fed
+    the failure — the card disables the button and says so instead. The log is
+    deliberately NOT persisted anywhere else to make the fix durable.
+    """
+    if not task_id:
+        return False
+    try:
+        log_file = task_manager.get_log_file(task_id)
+    except Exception:
+        return False
+    return bool(log_file) and Path(log_file).exists()
+
+
+def _task_available(task_id: str) -> bool:
+    """Whether the entry's associated task record still resolves.
+
+    This is what makes the card's `Task: <id>` link **clickable while the record
+    exists and greyed once it is gone** (GRILLING G24/G34). Task records leave by
+    the cleanup contract (G30: 7-day TTL / 1000 cap) and are then simply absent —
+    ids are never reused — so "can this link resolve?" is a fact only this side
+    knows, and the dashboard reads it off the status payload instead of probing
+    once per card. Same shape as `fix_available`, deliberately: a card must not
+    have to guess a second time about the same record.
+    """
+    if not task_id:
+        return False
+    try:
+        return task_manager.get(task_id) is not None
+    except Exception:
+        return False
+
+
 def _status_for_user(user_name: str, running: dict[str, str]) -> dict[str, Any]:
     entries = registry.get_user(user_name)
     healthy_services, unhealthy_services, missing_services = [], [], []
+    failed_services: list[dict[str, Any]] = []
 
     for entry in entries:
         compose_file = entry.get("compose_file_path", "")
@@ -1574,6 +1632,15 @@ def _status_for_user(user_name: str, running: dict[str, str]) -> dict[str, Any]:
             "label": entry["label"],
             "compose_template_path": entry.get("compose_template_path", ""),
             "compose_file_path": compose_file,
+            # The conf this instance's nginx was RENDERED FROM, beside the
+            # rendered output: the rendered one lives in `generated/` (outside
+            # every recipe), so the SOURCE template is the file in the recipe dir
+            # the card can open and edit — the same choice the compose row makes.
+            # nginx is one of the three deployed paths (G13) and this was the
+            # only one the card could not show; the field was read from the
+            # registry by the passthrough endpoints but never sent here.
+            "nginx_conf_template_path": entry.get("nginx_conf_template_path", ""),
+            "nginx_conf_path": entry.get("nginx_conf_path", ""),
             # Recipe subdir of THIS instance ('' = project root) + the effective
             # per-user env file — the dashboard's Deployment-Files links must
             # resolve inside the recipe dir, not the project root.
@@ -1585,6 +1652,14 @@ def _status_for_user(user_name: str, running: dict[str, str]) -> dict[str, Any]:
             "missing_containers": missing,
             "volumes": entry.get("volumes", {}),
             "subnet": entry.get("subnet", ""),
+            # The task this instance came from, whether its log still exists, and
+            # whether its record still resolves — all three facts live here
+            # (registry + tasks), so the dashboard keeps depending on the -api
+            # alone (llm-based-fix-todo.md §4/§5). `task_available` drives the
+            # card's greyed `Task:` link (G24/G34).
+            "task_id": entry.get("task_id", ""),
+            "fix_available": _fix_available(entry.get("task_id", "")),
+            "task_available": _task_available(entry.get("task_id", "")),
         }
         # If subnet not in registry, try to discover from Docker (legacy)
         if not svc["subnet"]:
@@ -1597,7 +1672,14 @@ def _status_for_user(user_name: str, running: dict[str, str]) -> dict[str, Any]:
         # Check if the service is currently being built
         svc["status"] = entry.get("status", "unknown")
 
-        if not Path(compose_file).exists():
+        # A recorded failure is its OWN bucket (GRILLING G10 / doc §3): the
+        # status comes from the registry, never from container health, so a
+        # failed entry does not render as an ordinary "0 up, 1 down". The
+        # bounded reason rides along for the card.
+        if svc["status"] == "failed":
+            svc["failure"] = entry.get("failure") or {}
+            failed_services.append(svc)
+        elif not Path(compose_file).exists():
             missing_services.append(svc)
         elif entry.get("status") == "building":
             # During build, containers don't exist yet — don't classify as missing/unhealthy
@@ -1616,10 +1698,12 @@ def _status_for_user(user_name: str, running: dict[str, str]) -> dict[str, Any]:
             "expected_services_#": total,
             "healthy_services_#": len(healthy_services),
             "unhealthy_services_#": len(unhealthy_services) + len(missing_services),
+            "failed_services_#": len(failed_services),
         },
         "healthy_services": healthy_services,
         "unhealthy_services": unhealthy_services,
         "missing_services": missing_services,
+        "failed_services": failed_services,
     }
 
 

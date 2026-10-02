@@ -6,6 +6,7 @@ Inside the deployed container, docker socket access is granted directly
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import sys
@@ -14,6 +15,8 @@ from pathlib import Path
 
 # Bound every docker subprocess so a hung daemon op cannot wedge the API forever.
 DOCKER_TIMEOUT = 30.0
+
+_log = logging.getLogger(__name__)
 
 
 
@@ -28,6 +31,43 @@ _task_log = threading.local()
 def set_task_log_file(path: str) -> None:
     """Set the per-task log file for the current thread."""
     _task_log.path = path
+
+
+class CommandCancelled(RuntimeError):
+    """The running command was terminated because the operator cancelled it.
+
+    Distinct from a genuine command failure: the entry records
+    ``stage: "cancelled"`` / *cancelled by operator* rather than a build error
+    (doc §4b). This is a user-initiated kill — there is deliberately no timeout.
+    """
+
+
+def set_cancel_event(event) -> None:
+    """Register the current task's cancel event for this thread (doc §4b).
+
+    ``_run`` consults it so a command blocked in ``proc.wait()`` can still be
+    terminated: cancellation is otherwise cooperative and only fires *between*
+    ``docker_ops`` calls, which a wedged build never reaches.
+    """
+    _task_log.cancel = event
+
+
+def clear_cancel_event() -> None:
+    """Drop the thread's cancel event (called when the task finishes)."""
+    _task_log.cancel = None
+
+
+def _terminate_on_cancel(proc, cancel_event) -> None:
+    """Terminate *proc* once *cancel_event* fires, or return when it exits."""
+    while True:
+        if cancel_event.wait(0.5):
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            return
+        if proc.poll() is not None:
+            return
 
 
 def clear_task_log_file() -> None:
@@ -54,6 +94,35 @@ def _write_log(text: str) -> None:
                 f.write(text)
         except Exception:
             pass
+
+
+#: How many trailing output lines to keep as a failure's "cause".
+_FAILURE_TAIL_LINES = 8
+
+
+def _failure_detail(stdout: str, stderr: str) -> str:
+    """The meaningful tail of a failed command's output.
+
+    ``docker compose build`` reports the real cause on **stdout** (the BuildKit
+    progress stream, e.g. "error: No solution found when resolving
+    dependencies") while stderr carries only the boilerplate "failed to solve:
+    process \\"/bin/sh -c …\\" did not complete successfully" plus a repeat of the
+    whole RUN command. Preferring stderr — as this used to — therefore stored a
+    megabyte of echoed Dockerfile and dropped the one useful line.
+    """
+    def _tail(text: str) -> list[str]:
+        lines = [ln.rstrip() for ln in (text or "").splitlines() if ln.strip()]
+        return lines[-_FAILURE_TAIL_LINES:]
+
+    tail_err, tail_out = _tail(stderr), _tail(stdout)
+    parts: list[str] = []
+    if tail_err:
+        parts.append("\n".join(tail_err))
+    if tail_out:
+        joined = "\n".join(tail_out)
+        if joined not in "\n".join(parts):
+            parts.append(joined)
+    return "\n".join(parts).strip()
 
 
 def _run(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
@@ -125,6 +194,12 @@ def _run(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
         t_err = threading.Thread(target=_read_stderr, args=(proc.stderr,), daemon=True)
         t_out.start()
         t_err.start()
+        # Operator cancel must reach a command already blocked in wait() (§4b).
+        _cancel_event = getattr(_task_log, "cancel", None)
+        if _cancel_event is not None:
+            threading.Thread(
+                target=_terminate_on_cancel, args=(proc, _cancel_event), daemon=True
+            ).start()
         proc.wait()
         # Close write ends so reader threads see EOF and exit
         proc.stdout.close()  # type: ignore[union-attr]
@@ -135,8 +210,11 @@ def _run(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
     stdout = "".join(stdout_lines)
     stderr = "".join(stderr_lines)
 
+    if _cancel_event is not None and _cancel_event.is_set() and proc.returncode != 0:
+        raise CommandCancelled("cancelled by operator")
+
     if check and proc.returncode != 0:
-        detail = (stderr or stdout or "").strip()
+        detail = _failure_detail(stdout, stderr)
         raise RuntimeError(
             f"Command failed (exit {proc.returncode}): {' '.join(args)}"
             + (f"\n{detail}" if detail else "")
@@ -441,22 +519,47 @@ def container_logs(container: str, tail: int = 100) -> str:
 
 
 def orphan_network_cleanup(network: str, nginx_container: str = "subnet-acl-nginx") -> bool:
-    """Clean up an orphaned network. Disconnect nginx and remove if only nginx is left.
-    Returns True if the network was removed."""
+    """Remove an orphaned network, disconnecting whatever is still attached to it.
+
+    Called on delete, after ``docker compose down``. ``nginx_container`` is retained for
+    signature compatibility and is used only to explain the log line — the platform's nginx
+    is **not** the only container that can hold an endpoint on an instance network. An
+    instance deployed by an earlier era (or before an nginx rename) can still be attached to
+    a differently-named nginx; disconnecting only the configured one leaves that endpoint in
+    place, ``network rm`` fails, and the stale network survives — after which compose can
+    never replace it (its config no longer matches) and every later deploy of the same
+    (user, service, label) dies on "network … has active endpoints" (task doc §2).
+
+    So this disconnects *every* attached container, then removes, then **reports**. The
+    failure is no longer swallowed: a silent one is what let a five-week-old network keep
+    poisoning deploys. Returns True when the network is gone.
+    """
     info = network_inspect(network)
     if info is None:
         return False
 
-    containers = info.get("Containers", {})
-    # Check what's connected
-    connected_names = {cdata.get("Name", "") for cdata in containers.values()}
-    
-    # If only provision-nginx is connected, clean up
-    if connected_names == {nginx_container} or len(connected_names) == 1:
-        network_disconnect(nginx_container, network)
-        result = subprocess.run(
-            ["docker", "network", "rm", network],
-            text=True, capture_output=True, timeout=DOCKER_TIMEOUT,
+    attached = [
+        cdata.get("Name", "")
+        for cdata in (info.get("Containers") or {}).values()
+        if cdata.get("Name")
+    ]
+    for name in attached:
+        if name != nginx_container:
+            # Worth naming: this is the case the old assumption got wrong.
+            _log.warning(
+                "orphan network %s holds a non-configured container %s — disconnecting it "
+                "before removal (configured nginx is %s)", network, name, nginx_container,
+            )
+        network_disconnect(name, network)
+
+    result = subprocess.run(
+        ["docker", "network", "rm", network],
+        text=True, capture_output=True, timeout=DOCKER_TIMEOUT,
+    )
+    if result.returncode != 0:
+        _log.warning(
+            "could not remove orphan network %s (attached before disconnect: %s): %s",
+            network, ", ".join(attached) or "-", (result.stderr or "").strip(),
         )
-        return result.returncode == 0
-    return False
+        return False
+    return True

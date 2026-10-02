@@ -22,6 +22,12 @@ services:
       - SOURCE_PROJECTS_DIR=${PROVISION_DIR:-/srv/provision_subnet_acl}/source_projects
       - REGISTRY_FILE=${PROVISION_DIR:-/srv/provision_subnet_acl}/generated/user_registry.yml
       - NGINX_CONTAINER=subnet-acl-nginx
+      # Per-stack namespace for instance networks, container names and named volumes.
+      # Networks/containers/volumes are global to the Docker daemon, so without this two
+      # stacks on one host derive the same names for the same (service, user, label) and the
+      # second deploy fails ("network … has active endpoints"). Set it per stack; empty
+      # preserves the historical unprefixed names.
+      - RESOURCE_PREFIX=${RESOURCE_PREFIX:-subnet-acl-}
       - DOCKER_OPS_LOG=${PROVISION_DIR:-/srv/provision_subnet_acl}/generated/docker_ops.log
       - TASK_LOG_DIR=${PROVISION_DIR:-/srv/provision_subnet_acl}/generated/task_logs
       - TASK_TTL_SECONDS=${TASK_TTL_SECONDS:-604800}

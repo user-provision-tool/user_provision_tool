@@ -6,6 +6,7 @@ import io
 import os
 import re
 import shutil
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -17,6 +18,30 @@ from lib import auth, docker_ops, provisioner, registry, template_engine, valida
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 COMPOSE_TEMPLATE = str(FIXTURES_DIR / "docker-compose.template.yml.j2")
 NGINX_TEMPLATE = str(FIXTURES_DIR / "myapp.template.nginx.conf.j2")
+
+
+def isolate_fixture_templates(tmp_path: Path, monkeypatch) -> None:
+    """Point COMPOSE_TEMPLATE / NGINX_TEMPLATE at copies in the test's own tree.
+
+    `POST /users` renders the per-user compose with
+    `output_dir=Path(compose_template).parent` — BESIDE its template. That is
+    right in production, where the template lives in the service's recipe dir,
+    but a test that registers with the repo's fixture template aims those writes
+    at `tests/fixtures/` — the directory the rest of the suite reads its inputs
+    from. Each run then left `docker-compose.user-<u>.0.yml` and
+    `.env.*.<u>.0` behind; found 2026-09-25 (10 strays, some written that day).
+
+    Call this from any class that drives `/users` with the fixture templates.
+    """
+    mod = sys.modules[__name__]
+    tpl_dir = tmp_path / "recipe"
+    tpl_dir.mkdir(exist_ok=True)
+    compose_copy = tpl_dir / "docker-compose.template.yml.j2"
+    nginx_copy = tpl_dir / "myapp.template.nginx.conf.j2"
+    compose_copy.write_text(Path(COMPOSE_TEMPLATE).read_text())
+    nginx_copy.write_text(Path(NGINX_TEMPLATE).read_text())
+    monkeypatch.setattr(mod, "COMPOSE_TEMPLATE", str(compose_copy))
+    monkeypatch.setattr(mod, "NGINX_TEMPLATE", str(nginx_copy))
 
 # ---------------------------------------------------------------------------
 # validation
@@ -606,6 +631,68 @@ server {
         n2 = template_engine.user_network_name("myapp", "alice", "1")
         assert n1 != n2
 
+    # --- RESOURCE_PREFIX (task doc §3 — networks + containers + named volumes) ---
+
+    def test_resource_prefix_applies_to_network_and_containers(self, monkeypatch):
+        """Both helpers carry the prefix — they cover all three global namespaces.
+
+        Volume names are not derived here directly: the templates build them from
+        ``{{ container_prefix }}`` (e.g. `name: {{ container_prefix }}n8n_data`), so
+        covering this helper covers volumes too.
+        """
+        monkeypatch.setenv("RESOURCE_PREFIX", "subnet-acl-")
+        template_engine._load_env()
+        try:
+            assert template_engine.user_network_name("myapp", "alice", "0") == \
+                "subnet-acl-myapp-user_alice-0"
+            assert template_engine.container_prefix("myapp", "alice", "0") == \
+                "subnet-acl-myapp-user_alice-0-"
+        finally:
+            monkeypatch.delenv("RESOURCE_PREFIX", raising=False)
+            template_engine._load_env()
+
+    def test_resource_prefix_unset_preserves_historical_names(self, monkeypatch):
+        """An unset prefix must keep producing today's unprefixed names."""
+        monkeypatch.delenv("RESOURCE_PREFIX", raising=False)
+        template_engine._load_env()
+        assert template_engine.user_network_name("myapp", "alice", "0") == "myapp-user_alice-0"
+        assert template_engine.container_prefix("myapp", "alice", "0") == "myapp-user_alice-0-"
+
+    # --- label allocation (GRILLING G3) ---
+
+    def test_next_free_label_starts_at_zero(self, monkeypatch):
+        monkeypatch.setattr(registry, "get_user", lambda u: [])
+        assert registry.next_free_label("alice", "myapp") == "0"
+
+    def test_next_free_label_skips_past_existing(self, monkeypatch):
+        monkeypatch.setattr(registry, "get_user", lambda u: [
+            {"service_name": "myapp", "label": "0"},
+            {"service_name": "myapp", "label": "1"},
+            {"service_name": "other", "label": "7"},   # different service — ignored
+        ])
+        assert registry.next_free_label("alice", "myapp") == "2"
+
+    def test_next_free_label_never_reuses_a_freed_label(self, monkeypatch):
+        """max+1, deliberately: a freed label can collide with surviving Docker objects."""
+        monkeypatch.setattr(registry, "get_user", lambda u: [
+            {"service_name": "myapp", "label": "0"},
+            {"service_name": "myapp", "label": "2"},
+        ])
+        assert registry.next_free_label("alice", "myapp") == "3"
+
+    def test_register_request_label_is_optional(self):
+        """Omitted, empty and "auto" all mean allocate; a concrete label is honoured."""
+        from api import RegisterRequest
+
+        def req(**kw):
+            return RegisterRequest(user_name="alice", service_name="myapp",
+                                   compose_file_path="/tmp/dc.yml", **kw)
+
+        assert req().label is None
+        assert req(label="").label is None
+        assert req(label="auto").label is None
+        assert req(label="2").label == "2"
+
     # --- network_name in rendered compose ---
 
     def test_render_compose_declares_named_network(self, tmp_path):
@@ -1159,16 +1246,55 @@ class TestDockerOps:
         rm_calls = [c for c in call_args if "rm" in c and "network" in c]
         assert len(rm_calls) >= 1
 
-    def test_orphan_network_cleanup_keeps_when_other_containers(self, monkeypatch):
-        """orphan_network_cleanup does not remove network when other containers are connected."""
+    def test_orphan_network_cleanup_disconnects_foreign_container(self, monkeypatch):
+        """A container that is NOT the configured nginx must be disconnected too.
+
+        Regression guard for task doc §2: the old helper disconnected only the configured
+        nginx and removed the network only when it was the sole attached container. A network
+        from an earlier era stays attached to the *old* nginx (`provision-nginx`), so the
+        disconnect was a no-op on the wrong container, `network rm` failed, and the stale
+        network survived — after which compose could never replace it and every redeploy of
+        the same (user, service, label) died on "network … has active endpoints".
+        """
         import subprocess as sp
-        fake_json = '[{"Name":"shared-net","Containers":{"abc":{"Name":"subnet-acl-nginx"},"def":{"Name":"myapp-web"}}}]'
-        monkeypatch.setattr(docker_ops.subprocess, "run",
-            lambda *a, **kw: sp.CompletedProcess([], 0, stdout=fake_json, stderr=""))
-        monkeypatch.setattr(docker_ops, "network_disconnect", lambda *a: None)
+        fake_json = '[{"Name":"shared-net","Containers":{"abc":{"Name":"provision-nginx"}}}]'
+        rm_results = []
+
+        def fake_run(args, **kw):
+            if "inspect" in args:
+                return sp.CompletedProcess([], 0, stdout=fake_json, stderr="")
+            if "rm" in args:
+                rm_results.append(list(args))
+                return sp.CompletedProcess([], 0, stdout="", stderr="")
+            return sp.CompletedProcess([], 0, stdout="", stderr="")
+
+        disconnected: list[tuple] = []
+        monkeypatch.setattr(docker_ops.subprocess, "run", fake_run)
+        monkeypatch.setattr(docker_ops, "network_disconnect",
+                            lambda c, n: disconnected.append((c, n)))
 
         result = docker_ops.orphan_network_cleanup("shared-net", "subnet-acl-nginx")
-        assert result is False
+        assert result is True
+        # The foreign container — not the configured nginx — was the one disconnected.
+        assert ("provision-nginx", "shared-net") in disconnected
+        assert rm_results, "network rm was never attempted"
+
+    def test_orphan_network_cleanup_reports_failed_removal(self, monkeypatch):
+        """A failed removal returns False (and is logged) instead of being swallowed."""
+        import subprocess as sp
+
+        def fake_run(args, **kw):
+            if "inspect" in args:
+                return sp.CompletedProcess([], 0,
+                    stdout='[{"Name":"busy-net","Containers":{"abc":{"Name":"provision-nginx"}}}]',
+                    stderr="")
+            return sp.CompletedProcess([], 1, stdout="",
+                                       stderr="error while removing network: active endpoints")
+
+        monkeypatch.setattr(docker_ops.subprocess, "run", fake_run)
+        monkeypatch.setattr(docker_ops, "network_disconnect", lambda *a: None)
+
+        assert docker_ops.orphan_network_cleanup("busy-net", "subnet-acl-nginx") is False
 
     def test_orphan_network_cleanup_nonexistent_network(self, monkeypatch):
         """orphan_network_cleanup returns False for nonexistent network."""
@@ -2281,6 +2407,65 @@ class TestProvisioner:
         assert (recipe / "docker-compose.yml").exists()
         assert (recipe / ".env.raw.bob.1").exists()
 
+    def test_purge_keeps_recipe_level_shared_artifacts(self, tmp_path):
+        """Regression (found live): deleting ONE user's instance must not remove
+        the recipe-level SHARED artifacts.
+
+        `docker-compose.fix.yml`, `nginx.fix.conf` and `.env.fix` carry no
+        per-user suffix — they belong to the recipe, not to a deploy. A stored
+        selection of ANOTHER deployment names them (the -api receives
+        `nginx.fix.conf` as `nginx_conf_file_path`), so a per-user purge that
+        deletes them 502s that other deployment on its next register. `.env.fix`
+        is recipe-level by the same argument and is kept too. Only the
+        `.{user}.{label}` artifacts and this user's data tree may go.
+
+        This test FAILS against the pre-fix code, which listed all three names in
+        its `fix_names` delete set."""
+        from lib.provisioner import _purge_user_artifacts
+
+        recipe = tmp_path / "recipe"
+        recipe.mkdir()
+        # Recipe-level shared artifacts — must survive BYTE-IDENTICAL.
+        shared = {}
+        for name in (
+            "docker-compose.fix.yml",
+            "nginx.fix.conf",
+            ".env.fix",
+            "docker-compose.fix.yml.j2",
+            "nginx.fix.conf.j2",
+        ):
+            (recipe / name).write_text(f"shared {name}\n")
+            shared[name] = (recipe / name).read_bytes()
+        # Per-user artifacts for THIS instance (must be purged).
+        for name in (".env.raw.alice.0", ".env.1.alice.0", "docker-compose.user-alice.0.yml"):
+            (recipe / name).write_text("x")
+        (recipe / ".env.raw.alice.0.generated").write_text("")
+        # Original recipe + another instance's per-user artifact (must survive).
+        (recipe / "docker-compose.yml").write_text("services: {}")
+        (recipe / ".env.raw.bob.1").write_text("keep me")
+
+        tree = tmp_path / "user_data" / "alice" / "myapp" / "0"
+        (tree / "app_data").mkdir(parents=True)
+        (tree / "app_data" / "db.sqlite").write_text("payload")
+
+        entry = {
+            "compose_file_path": str(recipe / "docker-compose.user-alice.0.yml"),
+            "volumes": {"app_data": str(tree / "app_data")},
+        }
+        _purge_user_artifacts("alice", "myapp", "0", entry)
+
+        # The user's own tree and per-user recipe files are gone...
+        assert not tree.exists(), "the user's data tree must still go"
+        for name in (".env.raw.alice.0", ".env.1.alice.0", "docker-compose.user-alice.0.yml"):
+            assert not (recipe / name).exists(), name
+        assert not (recipe / ".env.raw.alice.0.generated").exists()
+        # ...while the recipe-level shared set is untouched.
+        for name, before in shared.items():
+            assert (recipe / name).exists(), f"{name} is recipe-level, must survive"
+            assert (recipe / name).read_bytes() == before, f"{name} bytes changed"
+        assert (recipe / "docker-compose.yml").exists()
+        assert (recipe / ".env.raw.bob.1").exists()
+
 
 # ---------------------------------------------------------------------------
 # provisioner — env_file_path registry storage + rebuild
@@ -2870,6 +3055,7 @@ class TestAPIProjectRoot:
         monkeypatch.setattr(api, "USER_DATA_DIR", ud_dir)
         monkeypatch.setattr(api, "SOURCE_PROJECTS_DIR", sp_dir)
         monkeypatch.setattr(reg_mod, "REGISTRY_FILE", tmp_path / "user_registry.yml")
+        isolate_fixture_templates(tmp_path, monkeypatch)
 
         class _FakeProc:
             def __init__(self, args, **kwargs):
@@ -3199,6 +3385,7 @@ class TestAPINewEndpoints:
         monkeypatch.setattr(api, "SOURCE_PROJECTS_DIR", sp_dir)
         monkeypatch.setattr(api, "SSL_DIR", ssl_dir)
         monkeypatch.setattr(reg_mod, "REGISTRY_FILE", tmp_path / "user_registry.yml")
+        isolate_fixture_templates(tmp_path, monkeypatch)
 
         # Mock docker_ops subprocess.Popen
         class _FakeProc:
@@ -3585,46 +3772,6 @@ class TestAPINewEndpoints:
         response = self.client.get("/tasks/nonexistent/log?tail=5&follow=false")
         assert response.status_code == 200
         assert "text/event-stream" in response.headers["content-type"]
-
-    def test_custom_task_lifecycle_endpoint(self, tmp_path, monkeypatch):
-        """Feature 5: POST /tasks/custom → append log → finish surfaces a
-        generate-missing-files task in GET /tasks with its log file readable
-        via SSE (regression: create_custom_task previously called the
-        nonexistent ``task_manager.Task`` attribute → 500)."""
-        from pathlib import Path
-        from lib.task_manager import TaskManager
-
-        # Isolate the task store so nothing touches the shared singleton dir.
-        tm = TaskManager(max_workers=1, log_dir=str(tmp_path / "task_logs"))
-        monkeypatch.setattr(self.api, "task_manager", tm)
-
-        r = self.client.post("/tasks/custom", json={
-            "type": "generate-missing-files",
-            "target": "dify @ docker / specialsync",
-            "detail": {"service_name": "dify"},
-        })
-        assert r.status_code == 200, r.text
-        tid = r.json()["task_id"]
-        assert r.json()["log_file"]
-
-        # Task appears in the list with its type.
-        types = [t["type"] for t in self.client.get("/tasks").json()["tasks"]]
-        assert "generate-missing-files" in types
-
-        # Append a session-log line (single JSON line) then finish.
-        logline = '{"stage": "env.turn2", "reasoning": "resolved urls"}'
-        assert self.client.post(f"/tasks/{tid}/log", json={"line": logline}).status_code == 200
-        assert self.client.post(f"/tasks/{tid}/finish", json={"status": "completed"}).status_code == 200
-
-        # The line is persisted to the task's log file and served by SSE.
-        logfiles = list((tmp_path / "task_logs").glob("task-*.log"))
-        assert len(logfiles) == 1
-        assert "env.turn2" in logfiles[0].read_text()
-
-        sse = self.client.get(f"/tasks/{tid}/log?tail=10&follow=false")
-        assert sse.status_code == 200
-        assert "env.turn2" in sse.text
-        assert "event: done" in sse.text
 
     # ── Helper: register a user for dependent tests ──
 
@@ -4948,3 +5095,405 @@ class TestVolumePurgeOnDelete:
         src = inspect.getsource(provisioner.remove_user)
         assert "remove_volumes=True" in src
         assert "remove_project_volumes" in src
+
+
+# ---------------------------------------------------------------------------
+# Failed-instance state (failed-instance-state-todo.md §2/§3, GRILLING G10/G17)
+# ---------------------------------------------------------------------------
+
+
+class TestFailedInstanceState:
+    """A failure is instance-scoped state: the entry stays, marked `failed`."""
+
+    def _add(self, registry_file, sample_entry, **overrides):
+        entry = {**sample_entry, **overrides}
+        registry.add_user(entry)
+        return entry
+
+    def test_mark_failed_keeps_the_entry(self, registry_file, sample_entry):
+        self._add(registry_file, sample_entry)
+        provisioner._mark_failed("alice", "myapp", "0", "build", "boom")
+        entries = registry.get_user("alice")
+        assert len(entries) == 1, "the entry must NOT be removed (G10/G17)"
+        assert entries[0]["status"] == "failed"
+        assert entries[0]["failure"]["stage"] == "build"
+        assert entries[0]["failure"]["message"] == "boom"
+        assert entries[0]["failure"]["at"]
+
+    def test_failure_message_is_bounded(self, registry_file, sample_entry):
+        self._add(registry_file, sample_entry)
+        provisioner._mark_failed("alice", "myapp", "0", "build", "x" * 50_000)
+        msg = registry.get_user("alice")[0]["failure"]["message"]
+        assert len(msg) <= provisioner.FAILURE_MESSAGE_MAX
+
+    def test_failure_message_keeps_the_head_and_the_tail(self):
+        """The cause is LAST in a docker failure — a head-only cut loses it."""
+        command = "Command failed (exit 1): docker compose -f /x.yml build " + "y" * 4000
+        cause = "error: No solution found when resolving dependencies"
+        msg = provisioner._bounded_failure_message(command + "\n" + cause)
+        assert len(msg) <= provisioner.FAILURE_MESSAGE_MAX
+        assert msg.startswith("Command failed (exit 1): docker compose")
+        assert msg.endswith(cause), "the real cause must survive the bound"
+
+    def test_mark_failed_survives_a_non_matching_target(self, registry_file, sample_entry):
+        self._add(registry_file, sample_entry)
+        provisioner._mark_failed("nobody", "nothing", "9", "up", "boom")
+        assert registry.get_user("alice")[0].get("status") != "failed"
+
+    def test_running_clears_a_stale_failure(self, registry_file, sample_entry):
+        self._add(registry_file, sample_entry, status="failed",
+                  failure={"stage": "build", "message": "old", "at": "t"})
+        provisioner._update_registry_status("alice", "myapp", "0", "running")
+        entry = registry.get_user("alice")[0]
+        assert entry["status"] == "running"
+        assert "failure" not in entry
+
+    def test_stage_is_tagged_from_the_failing_step(self):
+        """A DeployFailure carries its stage so the entry can record it."""
+        exc = provisioner.DeployFailure("up", "compose up failed")
+        assert exc.stage == "up"
+        assert isinstance(exc, RuntimeError), "must stay catchable by the RuntimeError path"
+
+
+class TestFailedClassification:
+    """§3 — classification reads the registry status, not container health."""
+
+    def _entry(self, sample_entry, status="failed", **over):
+        return {**sample_entry, "status": status, **over}
+
+    def test_failed_entry_lands_in_its_own_bucket(self, registry_file, sample_entry):
+        from api import _status_for_user
+        registry.add_user(self._entry(sample_entry, failure={"stage": "build", "message": "m", "at": "t"}))
+        result = _status_for_user("alice", {})
+        mine = [s for s in result["failed_services"] if s["service_name"] == "myapp"]
+        assert len(mine) == 1, "the failed entry must be its own bucket, not missing/unhealthy"
+        assert mine[0]["failure"]["stage"] == "build"
+        # ...and it must NOT also appear in the container-health buckets.
+        assert not [s for s in result["missing_services"] if s["service_name"] == "myapp"]
+        assert not [s for s in result["unhealthy_services"] if s["service_name"] == "myapp"]
+        assert not [s for s in result["healthy_services"] if s["service_name"] == "myapp"]
+
+    def test_failed_bucket_is_forwarded_by_the_payload(self, registry_file, sample_entry):
+        from api import _status_for_user
+        registry.add_user(self._entry(sample_entry))
+        result = _status_for_user("alice", {})
+        # The gateway passes the per-user object through verbatim, so the key
+        # existing here is what makes the dashboard able to render the card.
+        assert "failed_services" in result
+
+
+class TestProfileGating:
+    """`profiles: [""]` (graphiti's idiom) is UNGATED, matching compose.
+
+    Regression: treating it as gated made `_expected_container_names` return []
+    for a running service, so no container was probed and the card collapsed to
+    "unknown (0 healthy, 1 unhealthy)".
+    """
+
+    def _write_compose(self, tmp_path: Path) -> Path:
+        p = tmp_path / "docker-compose.user-alice.0.yml"
+        p.write_text(
+            "services:\n"
+            "  graph:\n"
+            "    profiles: ['']\n"
+            "    image: x\n"
+            "  neo4j:\n"
+            "    profiles: ['']\n"
+            "    image: y\n"
+            "  falkordb:\n"
+            "    profiles: ['falkordb']\n"
+            "    image: z\n"
+            "  plain:\n"
+            "    image: w\n"
+        )
+        return p
+
+    def test_empty_string_profile_counts_as_ungated(self, tmp_path):
+        from api import _expected_container_names
+        compose = self._write_compose(tmp_path)
+        entry = {
+            "service_name": "graphiti", "user_name": "alice", "label": "0",
+            "compose_file_path": str(compose), "profiles": [],
+            "container_names": [
+                "graphiti-user_alice-0-graph",
+                "graphiti-user_alice-0-neo4j",
+                "graphiti-user_alice-0-falkordb",
+                "graphiti-user_alice-0-plain",
+            ],
+        }
+        names = _expected_container_names(entry)
+        # graph/neo4j/plain are ungated → expected; falkordb is gated → not.
+        assert "graphiti-user_alice-0-graph" in names
+        assert "graphiti-user_alice-0-neo4j" in names
+        assert "graphiti-user_alice-0-plain" in names
+        assert "graphiti-user_alice-0-falkordb" not in names
+
+    def test_gated_profile_is_expected_once_activated(self, tmp_path):
+        from api import _expected_container_names
+        compose = self._write_compose(tmp_path)
+        entry = {
+            "service_name": "graphiti", "user_name": "alice", "label": "0",
+            "compose_file_path": str(compose), "profiles": ["falkordb"],
+            "container_names": ["graphiti-user_alice-0-falkordb"],
+        }
+        assert _expected_container_names(entry) == ["graphiti-user_alice-0-falkordb"]
+
+
+class TestRecoveryDoesNotResurrectFailed:
+    """`recover_on_startup` must leave a failed entry alone.
+
+    Regression found live: the zombie scan (container_names present, no
+    containers) matched a failed entry and ran compose_up, resurrecting the
+    deploy while the registry still said `failed`.
+    """
+
+    def test_zombie_scan_skips_failed_and_deleting(self):
+        import inspect
+        from lib import reconciliation
+        src = inspect.getsource(reconciliation.recover_on_startup)
+        assert '"failed"' in src and '"deleting"' in src, (
+            "the zombie scan must skip entries that are not meant to be running"
+        )
+
+    def test_failed_entry_is_not_restarted(self, registry_file, sample_entry, monkeypatch):
+        from lib import docker_ops, reconciliation
+        registry.add_user({
+            **sample_entry, "status": "failed",
+            "container_names": ["myapp-user_alice-0-app"],
+            "failure": {"stage": "build", "message": "m", "at": "t"},
+        })
+        calls = []
+        monkeypatch.setattr(docker_ops, "container_exists", lambda c: False)
+        monkeypatch.setattr(docker_ops, "compose_up",
+                            lambda *a, **k: calls.append(("up", a, k)))
+        monkeypatch.setattr(docker_ops, "network_connect", lambda *a, **k: None)
+        monkeypatch.setattr(docker_ops, "nginx_reload", lambda *a, **k: None)
+        monkeypatch.setattr(reconciliation, "regenerate_nginx_confs",
+                            lambda *a, **k: {"regenerated": 0, "is_browser_stripped": 0,
+                                             "errors": [], "strip_errors": []})
+
+        reconciliation.recover_on_startup()
+        assert not [c for c in calls if c[0] == "up"], (
+            "a failed entry must NOT be restarted by startup recovery"
+        )
+        # ...and it is still there, still failed.
+        entry = registry.get_user("alice")[0]
+        assert entry["status"] == "failed"
+
+
+class TestFailureDetailExtraction:
+    """`_failure_detail` must surface the CAUSE, not echoed Dockerfile text.
+
+    Measured on a graphiti build with a bogus version: the real cause
+    ("error: No solution found when resolving dependencies") is on stdout,
+    while stderr holds a repeat of the entire RUN command.
+    """
+
+    def test_stdout_cause_is_included(self):
+        stderr = (
+            '#18 ERROR: process "/bin/sh -c set -eu; ' + "x" * 3000 + '" did not complete successfully: exit code: 1\n'
+            'failed to solve: process "/bin/sh -c set -eu; ' + "x" * 3000 + '" did not complete successfully: exit code: 1'
+        )
+        stdout = (
+            "#17 [stage-0 9/11] RUN uv sync\n"
+            "#18 [stage-0 10/11] RUN --mount=type=cache ...\n"
+            "5.471 error: No solution found when resolving dependencies\n"
+            "5.471   cause: Because there is no version of graphiti-core==99.99.99"
+        )
+        detail = docker_ops._failure_detail(stdout, stderr)
+        assert "No solution found when resolving dependencies" in detail
+        assert "graphiti-core==99.99.99" in detail
+        # ...and it still keeps the stderr context.
+        assert "did not complete successfully" in detail
+
+    def test_detail_is_bounded_to_a_tail(self):
+        stdout = "\n".join(f"line {i}" for i in range(500))
+        detail = docker_ops._failure_detail(stdout, "")
+        assert "line 499" in detail
+        assert "line 0" not in detail, "only the tail is kept"
+
+    def test_empty_output_yields_no_detail(self):
+        assert docker_ops._failure_detail("", "") == ""
+
+
+class TestLLMBasedFixAPISide:
+    """The -api owns the task id, the log and the availability flag (§4/§5/§7.7)."""
+
+    def test_entry_records_the_task_id(self, registry_file, sample_entry):
+        registry.add_user({**sample_entry, "task_id": "abc123"})
+        assert registry.get_user("alice")[0]["task_id"] == "abc123"
+
+    def test_fix_unavailable_without_a_task_id(self):
+        from api import _fix_available
+        assert _fix_available("") is False
+
+    def test_fix_unavailable_when_the_log_is_gone(self):
+        from api import _fix_available
+        assert _fix_available("no-such-task-id") is False
+
+    def test_status_payload_carries_task_id_and_availability(self, registry_file, sample_entry):
+        from api import _status_for_user
+        registry.add_user({**sample_entry, "status": "failed", "task_id": "t1",
+                           "failure": {"stage": "build", "message": "m", "at": "t"}})
+        svc = [s for s in _status_for_user("alice", {})["failed_services"]
+               if s["service_name"] == "myapp"][0]
+        assert svc["task_id"] == "t1"
+        assert svc["fix_available"] is False, "no such task → the log is gone"
+
+    def test_task_available_tracks_the_record_not_the_log(self):
+        """`task_available` is the card's greyed-link flag (GRILLING G24/G34).
+
+        A record leaves by the cleanup contract (G30) and is then simply absent —
+        ids are never reused — so "can the card's `Task:` link resolve?" is a fact
+        only this side knows, and the card must not probe per instance. It is NOT
+        the same question as `fix_available`: that one also needs the LOG, and a
+        terminal-but-unpruned record has a record and no live log.
+        """
+        from api import _task_available
+        assert _task_available("") is False
+        assert _task_available("no-such-task-id") is False
+
+    def test_status_payload_carries_the_nginx_path(self, registry_file, sample_entry):
+        """The card's `nginx:` row reads this field (§10).
+
+        nginx is one of the three deployed paths (G13), and the registry records
+        it on every entry — but the status payload never included it, so the row
+        could only ever have rendered "none". The SOURCE template is the field
+        sent, not the rendered output: the latter lives in `generated/`, outside
+        every recipe dir, and the card's file editor resolves inside the recipe.
+        """
+        from api import _status_for_user
+        registry.add_user({**sample_entry, "status": "running",
+                           "nginx_conf_template_path": "/src/recipes/x/nginx.fix.conf.j2"})
+        payload = _status_for_user("alice", {})
+        svc = [s for bucket in ("healthy_services", "unhealthy_services", "missing_services")
+               for s in payload[bucket] if s["service_name"] == "myapp"][0]
+        assert svc["nginx_conf_template_path"].endswith("nginx.fix.conf.j2")
+        assert "nginx_conf_path" in svc
+
+    def test_status_payload_carries_task_available(self, registry_file, sample_entry):
+        from api import _status_for_user
+        # The bucket depends on container/compose state, which this fixture does
+        # not set up — so read the entry out of whichever bucket it landed in.
+        registry.add_user({**sample_entry, "status": "running", "task_id": "t1"})
+        payload = _status_for_user("alice", {})
+        svc = [s for bucket in ("healthy_services", "unhealthy_services", "missing_services")
+               for s in payload[bucket] if s["service_name"] == "myapp"][0]
+        assert "task_available" in svc
+        assert svc["task_available"] is False, (
+            "the fixture's task record is not in the store → the link is greyed")
+
+    def test_whole_log_endpoint_404s_when_gone(self):
+        from fastapi.testclient import TestClient
+        import api as api_mod
+        c = TestClient(api_mod.app)
+        r = c.get("/tasks/does-not-exist/logfile")
+        assert r.status_code == 404
+        assert "Task not found" in r.text
+
+    def test_purge_preserves_recipe_level_fix_variants(self, tmp_path):
+        """A `.fix` artifact is RECIPE-level: it carries no per-user suffix, so a
+        per-user delete must NOT remove it. `nginx.fix.conf` is the very path a
+        stored selection hands to the -api as `nginx_conf_file_path`; deleting it
+        with one user's instance 502s every other deployment on the recipe
+        (`nginx_conf_file_path not found`, found live). Before this fix the purge
+        deleted all three names (and their `.generated` markers) with the
+        instance — this test failed against that code."""
+        from lib import provisioner
+        compose = tmp_path / "docker-compose.user-alice.0.yml"
+        compose.write_text("services: {}\n")
+        shared = {}
+        for name in ("docker-compose.fix.yml", "nginx.fix.conf", ".env.fix"):
+            (tmp_path / name).write_text(f"contents of {name}\n")
+            (tmp_path / f"{name}.generated").write_text("")
+            shared[name] = (tmp_path / name).read_bytes()
+        keeper = tmp_path / "docker-compose.yml"
+        keeper.write_text("original\n")
+        provisioner._purge_user_artifacts(
+            "alice", "myapp", "0", {"compose_file_path": str(compose)},
+        )
+        for name in ("docker-compose.fix.yml", "nginx.fix.conf", ".env.fix"):
+            assert (tmp_path / name).exists(), f"{name} is recipe-level and must survive"
+            assert (tmp_path / name).read_bytes() == shared[name], f"{name} bytes changed"
+            assert (tmp_path / f"{name}.generated").exists()
+        assert not compose.exists(), "the per-user compose is still purged"
+        assert keeper.exists(), "the original recipe file is never touched"
+
+
+class TestRecordTasksDoNotConsumeThePool:
+    """The pool is for the -api's DEPLOYING tasks only (user ruling, 2026-09-20).
+
+    `POST /tasks/custom` — the endpoint that CREATED a record for the gateway's
+    generation session — is gone (GRILLING G28: the `record` mirror is removed,
+    so the gateway keeps its own store). The exclusion below is kept because it
+    still has a live input: `_load_from_disk` restores the tasks a previous
+    release persisted, and a legacy row that carries `target.kind == "record"`
+    would otherwise consume a slot until it TTL-prunes.
+    """
+
+    def test_record_tasks_are_excluded_from_in_flight(self):
+        from lib.task_manager import Task, TaskManager
+        tm = TaskManager(max_workers=1, log_dir="/tmp/tmrecord")
+        with tm._lock:
+            for i in range(5):
+                t = Task(f"rec{i}", "generate-missing-files")
+                t.status = "running"
+                t.target["kind"] = "record"
+                tm._tasks[t.task_id] = t
+        # Five record tasks, one worker: a real deploy must still be accepted.
+        tid = tm.submit("register", lambda: None, user_name="u", service_name="s", label="0")
+        assert tid
+
+
+class TestFailureReasonIsMachineReadable:
+    """The -api records a stable reason CODE; the card branches on it.
+
+    User ruling (2026-09-20): the dashboard must not pattern-match the -api's
+    human-facing wording, which may be reworded.
+    """
+
+    def test_at_capacity_is_classified(self):
+        from lib.provisioner import classify_failure_reason
+        assert classify_failure_reason(
+            "at capacity: 4 task(s) running (limit 4); cancel a task that has "
+            "been hanging and retry") == "at_capacity"
+        assert classify_failure_reason("Command failed (exit 1): docker compose") == "unknown"
+
+    def test_mark_failed_records_the_reason(self, registry_file, sample_entry):
+        from lib import provisioner, registry
+        registry.add_user(sample_entry)
+        provisioner._mark_failed(
+            "alice", "myapp", "0", "deploy",
+            "at capacity: 4 task(s) running (limit 4); cancel a task and retry",
+        )
+        f = registry.get_user("alice")[0]["failure"]
+        assert f["reason"] == "at_capacity"
+        assert f["message"]  # the prose is kept for humans
+
+
+class TestFailureReasonTravelsWithTheError:
+    """The reason is CARRIED by the error, not parsed from its text.
+
+    User ruling (2026-09-20): as more conditions get names, the -api should raise
+    typed errors carrying the reason rather than the UI classifying prose.
+    Text classification survives only as a fallback for errors without one.
+    """
+
+    def test_capacity_error_carries_its_reason(self):
+        from lib.task_manager import TaskCapacityError
+        assert TaskCapacityError(4, 4).reason == "at_capacity"
+
+    def test_mark_failed_prefers_the_explicit_reason(self, registry_file, sample_entry):
+        from lib import provisioner, registry
+        registry.add_user(sample_entry)
+        # A message the text classifier would NOT recognise, but a typed reason.
+        provisioner._mark_failed("alice", "myapp", "0", "deploy",
+                                 "some future wording", reason="at_capacity")
+        assert registry.get_user("alice")[0]["failure"]["reason"] == "at_capacity"
+
+    def test_text_classification_remains_the_fallback(self, registry_file, sample_entry):
+        from lib import provisioner, registry
+        registry.add_user(sample_entry)
+        provisioner._mark_failed("alice", "myapp", "0", "deploy",
+                                 "at capacity: 4 task(s) running (limit 4)")
+        assert registry.get_user("alice")[0]["failure"]["reason"] == "at_capacity"

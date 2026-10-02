@@ -19,6 +19,107 @@ from .compose_converter import ensure_subnet_ipam_block, get_compose_service_nam
 # lock file) — around every read-modify-write.
 
 
+class DeployFailure(RuntimeError):
+    """A deploy step failed; carries the *stage* so the entry can record it.
+
+    Subclasses RuntimeError so existing ``except RuntimeError`` rollback paths
+    keep catching it.
+    """
+
+    def __init__(self, stage: str, message: str):
+        super().__init__(message)
+        self.stage = stage
+
+
+#: Bounded failure message — the build log can be megabytes, and the entry is
+#: an inventory record, not a log sink. The full text stays in the task log.
+FAILURE_MESSAGE_MAX = 500
+
+
+def _bounded_failure_message(message: str) -> str:
+    """Bound a failure message to a few hundred chars (inventory-sized).
+
+    Keeps the HEAD **and** the TAIL: a docker failure reads
+    ``Command failed (exit 1): <the whole command>\\n<the real cause>`` — the
+    real cause is last, so a head-only truncation would store the command and
+    throw away the only useful line. The full text stays in the task log.
+    """
+    text = " ".join(str(message or "").split())
+    if len(text) <= FAILURE_MESSAGE_MAX:
+        return text
+    head = FAILURE_MESSAGE_MAX // 3
+    tail = FAILURE_MESSAGE_MAX - head - len(" … ")  # 3 chars for the separator
+    return text[:head] + " … " + text[-tail:]
+
+
+#: Machine-readable failure reasons the UI branches on, so a card never has to
+#: pattern-match prose that may be reworded. Extend as the -api names more.
+_REASON_PATTERNS = (
+    ("at_capacity", ("at capacity",)),
+)
+
+
+def classify_failure_reason(message: str) -> str:
+    """A stable reason code for *message* — `"unknown"` when none matches.
+
+    The dashboard must not regex the -api's wording — the wording is for humans
+    and may change; this code is the contract (user ruling 2026-09-20). The
+    fallback is the literal ``"unknown"`` so the field is never empty and the UI
+    has one value to render.
+    """
+    text = str(message or "").lower()
+    for reason, needles in _REASON_PATTERNS:
+        if any(n in text for n in needles):
+            return reason
+    return "unknown"
+
+
+def _mark_failed(
+    user_name: str,
+    service_name: str,
+    label: str,
+    stage: str,
+    message: str,
+    reason: str | None = None,
+) -> None:
+    """Record a failure ON the entry instead of dropping it (GRILLING G10).
+
+    Failure is instance-scoped state, so the entry stays (``status: failed``)
+    with a bounded ``failure`` payload, keeping the services page answerable
+    from the instance store alone and leaving the ordinary delete path able to
+    clean up whatever Docker residue the attempt left behind (G17).
+
+    Thread-safe and process-safe: runs under registry.transaction().
+    """
+    import datetime
+
+    failure = {
+        "stage": stage,
+        "message": _bounded_failure_message(message),
+        # A stable code for the UI to branch on. PREFERRED SOURCE is the raising
+        # error's own `reason` (typed, travels with the failure); classifying the
+        # text is only the fallback for errors that do not carry one.
+        "reason": reason or classify_failure_reason(message),
+        "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+    }
+    with registry.transaction():
+        users = registry._load()
+        matched = False
+        for u in users:
+            if (
+                u.get("user_name") == user_name
+                and u.get("service_name") == service_name
+                and str(u.get("label", "")) == str(label)
+            ):
+                u["status"] = "failed"
+                u["failure"] = failure
+                matched = True
+                break
+        # Save ONLY on a real match — same guard as _update_registry_status.
+        if matched:
+            registry._save(users)
+
+
 def _update_registry_status(user_name: str, service_name: str, label: str, status: str) -> None:
     """Update the status field of a registry entry (building → running).
 
@@ -35,6 +136,9 @@ def _update_registry_status(user_name: str, service_name: str, label: str, statu
                 and str(u.get("label", "")) == str(label)
             ):
                 u["status"] = status
+                # A successful transition clears any stale failure payload.
+                if status in ("running", "building"):
+                    u.pop("failure", None)
                 matched = True
                 break
         # Save ONLY on a real match: writing back an unchanged (possibly empty)
@@ -165,15 +269,18 @@ def _register_render_and_start(
     _all_env: list[str] = list(env_files or [])
     if env_file and env_file not in _all_env:
         _all_env.insert(0, env_file)
-    copied_env = template_engine.render_compose(
-        compose_template, compose_out,
-        user_name, service_name, label, volumes,
-        env_file=_all_env[0] if _all_env else None,
-        env_files_all=_all_env or None,
-        env_files=service_env_files or None,
-        subnet=_subnet,
-        gateway=_gateway,
-    )
+    try:
+        copied_env = template_engine.render_compose(
+            compose_template, compose_out,
+            user_name, service_name, label, volumes,
+            env_file=_all_env[0] if _all_env else None,
+            env_files_all=_all_env or None,
+            env_files=service_env_files or None,
+            subnet=_subnet,
+            gateway=_gateway,
+        )
+    except Exception as exc:
+        raise DeployFailure("render", str(exc)) from exc
 
     # --- Always-pass explicit per-user --env-file invariant (design G17) ---
     # Compose auto-reads <project-dir>/.env when no --env-file is given; an
@@ -244,9 +351,22 @@ def _register_render_and_start(
     # --- Start containers ---
     # Profiles: explicit per-user --profile flags; default (none) activates
     # no profile plus the implicit "" services.
+    def _stage_for(exc: Exception, default: str) -> str:
+        # An operator cancel is not a build failure (§4b) — it gets its own
+        # stage so the card can say *cancelled by operator*.
+        if isinstance(exc, docker_ops.CommandCancelled):
+            return "cancelled"
+        return default
+
     if build_args:
-        docker_ops.compose_build(compose_out, env_file=_env_files_used, project_name=entry["network_name"], build_args=build_args, profiles=profiles)
-    docker_ops.compose_up(compose_out, env_file=_env_files_used, project_name=entry["network_name"], profiles=profiles)
+        try:
+            docker_ops.compose_build(compose_out, env_file=_env_files_used, project_name=entry["network_name"], build_args=build_args, profiles=profiles)
+        except Exception as exc:
+            raise DeployFailure(_stage_for(exc, "build"), str(exc)) from exc
+    try:
+        docker_ops.compose_up(compose_out, env_file=_env_files_used, project_name=entry["network_name"], profiles=profiles)
+    except Exception as exc:
+        raise DeployFailure(_stage_for(exc, "up"), str(exc)) from exc
     return copied_env
 
 
@@ -311,6 +431,7 @@ def register_user(
     fullchain: str | None = None,
     privkey: str | None = None,
     ssl_base_dir: str = "/provision/ssl",
+    _task_id: str | None = None,
 ) -> dict[str, Any]:
     """Register a user and start their service containers.
 
@@ -484,8 +605,9 @@ def register_user(
     # enabled. If the template lacks the {% if subnet %} ipam block, the
     # allocation below would reserve a subnet that never renders (Docker then
     # auto-assigns → allocation leak). Re-convert (back up as .bak) first.
-    # Re-load env so tests that set SUBNET_POOLS after import are honored.
+    # Re-load env so tests that set SUBNET_POOLS/RESOURCE_PREFIX after import are honored.
     subnet_manager._load_env()
+    template_engine._load_env()
     if subnet_manager.SUBNET_POOLS:
         ensure_subnet_ipam_block(compose_template)
 
@@ -513,6 +635,10 @@ def register_user(
         "passwd": passwd_hash,
         "service_name": service_name,
         "label": label,
+        # The task that produced this entry — recorded on EVERY entry, not just
+        # failed ones, so the card can link to the task and fix availability can
+        # be decided from the entry alone (llm-based-fix-todo.md §4).
+        "task_id": _task_id or "",
         "network_name": template_engine.user_network_name(service_name, user_name, label),
         "compose_template_path": compose_template,
         "nginx_conf_template_path": nginx_template,
@@ -543,11 +669,19 @@ def register_user(
 
     # Duplicate check + add are atomic to prevent concurrent registrations
     with registry.transaction():
-        if registry.get_user_service(user_name, service_name, label):
-            raise ValueError(
-                f"User '{user_name}' with service '{service_name}' "
-                f"and label '{label}' is already registered."
-            )
+        existing = registry.get_user_service(user_name, service_name, label)
+        if existing:
+            # Retry must REPLACE a failed entry rather than collide with it
+            # (doc §5.1): the failed entry keeps the (user, service, label) key
+            # on purpose, so the duplicate gate would otherwise reject the retry
+            # that the failed card exists to offer. Every other status still
+            # blocks — a running instance is never silently overwritten.
+            if str(existing.get("status") or "") != "failed":
+                raise ValueError(
+                    f"User '{user_name}' with service '{service_name}' "
+                    f"and label '{label}' is already registered."
+                )
+            registry.remove_user_service(user_name, service_name, label)
         registry.add_user(entry)
 
     # --- Materialize declared service env files from .example siblings ---
@@ -558,9 +692,12 @@ def register_user(
     _materialize_env_examples(Path(compose_template).parent)
 
     # --- Render compose file → start containers (rollback on ANY failure) ---
-    # Any exception after the registry entry is added must remove the entry —
-    # a stale entry (e.g. from a Jinja render error caused by an incomplete
-    # volume mapping) blocks every retry with "already registered".
+    # A failure here KEEPS the entry (GRILLING G10/G17, corrected 2026-09-26):
+    # `_mark_failed` records the reason on the entry and leaves it, so the card
+    # survives with `Retry`/`Delete`. This comment used to claim the opposite —
+    # that any exception after the entry was added must REMOVE it — which
+    # contradicts the code below and the retry gate that replaces a `failed`
+    # entry (`if status != "failed": raise ValueError(...)`, above).
     try:
         copied_env = _register_render_and_start(
             user_name=user_name, service_name=service_name, label=label,
@@ -576,10 +713,15 @@ def register_user(
             build_args=build_args, profiles=profiles,
             _subnet=_subnet, _gateway=_gateway,
         )
-    except RuntimeError:
+    except RuntimeError as exc:
         # Rollback: tear down any partially-created Docker resources
-        # (containers, networks) so a retry doesn't hit "already exists" errors,
-        # then remove the registry entry.
+        # (containers, networks) so a retry doesn't hit "already exists" errors.
+        #
+        # The registry entry is NOT removed: failure is instance-scoped state
+        # (GRILLING G10), so it is UPDATED to `failed` with a bounded reason and
+        # left for the ordinary delete path to clean up (G17). Removing it here
+        # is what made a failed deploy indistinguishable from "nothing was ever
+        # deployed" and put the Docker residue beyond the registry's reach.
         import logging
         _log = logging.getLogger(__name__)
         try:
@@ -587,12 +729,17 @@ def register_user(
                 docker_ops.compose_down(compose_out, project_name=entry["network_name"])
         except Exception as down_err:
             _log.warning("Failed to clean up Docker resources after failed deploy: %s", down_err)
-        with registry.transaction():
-            registry.remove_user_service(user_name, service_name, label)
+        _mark_failed(
+            user_name, service_name, label,
+            getattr(exc, "stage", "deploy"),
+            str(exc),
+            reason=getattr(exc, "reason", None),
+        )
         raise
-    except Exception:
-        with registry.transaction():
-            registry.remove_user_service(user_name, service_name, label)
+    except Exception as exc:
+        # Broader path: no Docker teardown (nothing is known to have started),
+        # but the entry still records the failure rather than vanishing.
+        _mark_failed(user_name, service_name, label, "deploy", str(exc))
         raise
 
     # --- Mark as running (containers started successfully) ---
@@ -616,7 +763,14 @@ def _purge_user_artifacts(
     """Delete every artifact belonging to one (user, service, label) deploy:
     per-user env copies / rendered compose / markers in the recipe dir, and the
     user_data volume tree. Original recipe files are untouched (matched by the
-    ``.{user}.{label}`` / ``.user-{user}.{label}`` suffixes)."""
+    ``.{user}.{label}`` / ``.user-{user}.{label}`` suffixes) — as are the
+    recipe-level shared artifacts, which carry no per-user suffix and are
+    therefore not this instance's to remove: the ``.fix`` family
+    (``docker-compose.fix.<job>.yml``, ``nginx.fix.<job>.conf``, ``.env.fix``)
+    and the generated ``.base`` family
+    (``docker-compose.base.<job>.yml``, ``nginx.base.<job>.conf``) — the
+    ``<job>`` there is a COLLISION TOKEN, not an owner (GRILLING G33): those
+    files belong to the recipe and outlive the job that wrote them."""
     import shutil as _sh
 
     # 1) per-user files in the recipe (compose) directory.
@@ -631,6 +785,23 @@ def _purge_user_artifacts(
     if compose_dir:
         m1 = f".{user_name}.{label}"       # .env.raw.specialsync.0, .env.1.specialsync.0, redis.env.specialsync.0, …
         m2 = f".user-{user_name}.{label}"  # docker-compose.user-specialsync.0.yml
+        # ONLY names carrying THIS instance's per-user suffix are purged.
+        #
+        # The recipe-level shared artifacts are deliberately NOT in the delete
+        # set. `docker-compose.base.<job>.yml`, `nginx.base.<job>.conf`,
+        # `docker-compose.fix.<job>.yml`, `nginx.fix.<job>.conf` and `.env.fix`
+        # carry NO per-user suffix: they belong to the recipe, not to a deploy.
+        # A deployment's stored selection hands one of them to the -api as
+        # `nginx_conf_file_path`, and `.env.fix` is recipe-level by the same
+        # argument — a genuine `fix` job's output, shared by the whole recipe
+        # (generation_jobs.py: `_recipe_level_env`, FIX_FILENAME). A shared file
+        # has no per-user ownership, so NO per-user operation may delete it:
+        # removing one user's instance must never break another deployment whose
+        # stored selection points at those files. Deleting them here made a
+        # single user's remove 502 every other deployment on the recipe
+        # (`nginx_conf_file_path not found: …/nginx.fix.conf`, found live).
+        # The `<job>` in those names is the collision token (GRILLING G33), not
+        # an owner, so it does NOT make the file per-user either.
         for f in list(compose_dir.iterdir()):
             name = f.name
             if (m1 in name or m2 in name) and f.is_file():

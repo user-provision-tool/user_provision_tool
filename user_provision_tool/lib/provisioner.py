@@ -964,8 +964,16 @@ def change_password(
     1. Look up registration entry.
     2. Re-hash new password.
     3. Re-write .htpasswd file.
-    4. Update registry entry with new hash.
+    4. Update the registry entry with the new hash **and the new plaintext**.
     5. Reload nginx.
+
+    Step 4's plaintext is not cosmetic: the gateway rebuilds
+    ``Authorization: Basic user_name:passwd_plain`` from the registry on every
+    allowed request (gateway ``_get_service_basic_credential``), because a bcrypt
+    hash is one-way and cannot be replayed. A hash without a matching plaintext
+    leaves the instance protected by an ``auth_basic`` the gate can never satisfy
+    — the gate passes, the instance answers 401 with its OWN realm, and the
+    service is unopenable through the gate.
 
     Raises
     ------
@@ -973,6 +981,9 @@ def change_password(
         If no registration is found.
     FileNotFoundError
         If the htpasswd file path is missing or the file doesn't exist.
+    ValueError
+        If *passwd* is empty (removing protection is ``remove_password``'s job —
+        an empty password would hash to "" and lock the service out).
     """
     import logging
     _log = logging.getLogger(__name__)
@@ -991,12 +1002,20 @@ def change_password(
     if not Path(htpasswd_path).exists():
         raise FileNotFoundError(f"htpasswd file not found: {htpasswd_path}")
 
+    if not passwd:
+        # `hash_password("")` returns "" (lib/auth.py:26), and writing that to the
+        # htpasswd produces an entry no password can match — the service would be
+        # locked out entirely. register_user guards this (`if passwd else ""`);
+        # removing protection is remove_password()'s job, never a silent rewrite.
+        raise ValueError("passwd must be non-empty (use remove_password to drop protection)")
+
     passwd_hash = auth.hash_password(user_name, passwd)
     auth.write_htpasswd_file(htpasswd_path, user_name, passwd_hash)
 
     # Update registry
     with registry.transaction():
         users = registry._load()
+        matched = False
         for u in users:
             if (
                 u.get("user_name") == user_name
@@ -1004,8 +1023,104 @@ def change_password(
                 and str(u.get("label", "")) == str(label)
             ):
                 u["passwd"] = passwd_hash
+                # The plaintext MUST track the hash: it is what the gate injects
+                # upstream as Basic. Losing it makes the service unopenable
+                # through the gate (see the docstring).
+                u["passwd_plain"] = passwd
+                matched = True
                 break
-        registry._save(users)
+        # Save ONLY on a real match — same guard as _mark_failed and
+        # _update_registry_status: writing back an unchanged (possibly empty)
+        # list is how an empty registry could be persisted over real data.
+        if matched:
+            registry._save(users)
+
+    docker_ops.nginx_reload(nginx_container)
+
+    return {"user_name": user_name, "service_name": service_name, "label": label}
+
+
+def remove_password(
+    *,
+    user_name: str,
+    service_name: str,
+    label: str,
+    nginx_container: str = "subnet-acl-nginx",
+) -> dict[str, str]:
+    """Remove a service's password protection and reload nginx.
+
+    Steps
+    -----
+    1. Look up registration entry.
+    2. Re-render the nginx conf with NO htpasswd — ``render_nginx_conf`` strips
+       the ``auth_basic`` directives when the htpasswd path is falsy
+       (template_engine.py:600-604), so the instance stops asking for a password
+       the gate can no longer supply.
+    3. Clear ``passwd`` / ``passwd_plain`` / ``htpasswd_path`` on the entry.
+    4. Delete the htpasswd file (and its ``.generated`` marker).
+    5. Reload nginx.
+
+    This is the exit for a protected service whose plaintext is gone: bcrypt is
+    one-way, so the original password cannot be recovered and the gate can never
+    satisfy that ``auth_basic`` again. The service KEEPS its ACL gate — only the
+    instance's own second layer is dropped.
+
+    Raises
+    ------
+    KeyError
+        If no registration is found.
+    """
+    entry = registry.get_user_service(user_name, service_name, label)
+    if not entry:
+        raise KeyError(f"No registration found for {user_name}/{service_name}/{label}.")
+
+    htpasswd_path = entry.get("htpasswd_path") or ""
+    nginx_tpl = entry.get("nginx_conf_template_path") or ""
+    nginx_out = entry.get("nginx_conf_path") or ""
+
+    # --- Re-render the conf WITHOUT auth_basic ---
+    if nginx_tpl and nginx_out:
+        # Same derivation as reconciliation.regenerate_nginx_confs:
+        # hostname = f"{service}-{user}-{label}.{domain}".
+        domain = "localhost"
+        hostname = entry.get("hostname", "")
+        if hostname and "." in hostname:
+            domain = hostname.split(".", 1)[1]
+        template_engine.render_nginx_conf(
+            nginx_tpl, nginx_out,
+            user_name, service_name, label,
+            domain, "",  # no htpasswd -> the render strips auth_basic
+            https=bool(entry.get("https")),
+            ssl_certificate_path=entry.get("ssl_certificate_path") or "",
+            ssl_certificate_key_path=entry.get("ssl_certificate_key_path") or "",
+        )
+
+    # --- Registry ---
+    with registry.transaction():
+        users = registry._load()
+        matched = False
+        for u in users:
+            if (
+                u.get("user_name") == user_name
+                and u.get("service_name") == service_name
+                and str(u.get("label", "")) == str(label)
+            ):
+                u.pop("passwd", None)
+                u.pop("passwd_plain", None)
+                u["htpasswd_path"] = None
+                matched = True
+                break
+        # Save ONLY on a real match.
+        if matched:
+            registry._save(users)
+
+    # --- The htpasswd file itself (never leave a served secret behind) ---
+    if htpasswd_path:
+        for path in (htpasswd_path, htpasswd_path + ".generated"):
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                pass
 
     docker_ops.nginx_reload(nginx_container)
 

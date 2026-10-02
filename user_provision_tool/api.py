@@ -643,7 +643,10 @@ def stop_user_service(
 # ---------------------------------------------------------------------------
 
 class PasswordChangeRequest(BaseModel):
-    passwd: str
+    # Empty is REJECTED: hash_password("") returns "", which would write `user:`
+    # into the htpasswd and lock the service out. Removing protection is the
+    # DELETE below.
+    passwd: str = Field(..., min_length=1)
 
 @app.put("/users/{user_name}/services/{service_name}/{label}/password")
 def change_user_password(
@@ -662,7 +665,33 @@ def change_user_password(
         raise HTTPException(404, str(e))
     except FileNotFoundError as e:
         raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     return {"message": "Password updated. Nginx reloaded.", **result}
+
+
+@app.delete("/users/{user_name}/services/{service_name}/{label}/password")
+def remove_user_password(
+    user_name: str, service_name: str, label: str,
+) -> dict[str, Any]:
+    """Drop a service's password protection (auth_basic) and reload nginx.
+
+    The exit for a protected service whose plaintext was never recorded or was
+    lost: the gate can never satisfy that auth_basic again, and bcrypt gives no
+    way back to the original password. The ACL gate still protects the instance.
+    """
+    try:
+        result = provisioner.remove_password(
+            user_name=user_name,
+            service_name=service_name,
+            label=label,
+            nginx_container=NGINX_CONTAINER,
+        )
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    return {"message": "Password removed. Nginx reloaded.", **result}
 
 
 # ---------------------------------------------------------------------------

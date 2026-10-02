@@ -463,12 +463,18 @@ Stops a service's containers without removing them (`docker compose stop`).
 
 ## `PUT /users/{user_name}/services/{service_name}/{label}/password` — Change Password
 
-Re-hashes the password, updates the `.htpasswd` file and registry, then reloads nginx.
+Re-hashes the password, rewrites the `.htpasswd` file, re-records the registry's `passwd` **and
+`passwd_plain`**, then reloads nginx. The registry stores the plaintext because the gateway rebuilds
+`Authorization: Basic user_name:passwd_plain` on every allowed request (a bcrypt hash cannot be
+replayed) — if the plaintext does not track the hash, the instance's `auth_basic` can never be
+satisfied and the service becomes unopenable through the gate.
 
 **Request body**
 ```json
 { "passwd": "newsecret" }
 ```
+`passwd` must be non-empty: `hash_password("")` returns `""`, which would write `user:` into the
+htpasswd and lock the service out. To drop protection use the `DELETE` below.
 
 **Response `200`**
 ```json
@@ -484,7 +490,36 @@ Re-hashes the password, updates the `.htpasswd` file and registry, then reloads 
 
 | Code | Cause |
 |---|---|
+| `400` | `passwd` empty (removing protection is `DELETE .../password`) |
 | `404` | No registration found, or htpasswd file missing |
+
+---
+
+## `DELETE /users/{user_name}/services/{service_name}/{label}/password` — Remove Password
+
+Drops the service's own password layer: re-renders the nginx conf with no htpasswd (so
+`render_nginx_conf` strips the `auth_basic` directives), clears `passwd` / `passwd_plain` /
+`htpasswd_path` on the registry entry, deletes the htpasswd file, and reloads nginx.
+
+This is the exit for a protected service whose plaintext was never recorded or was lost — bcrypt is
+one-way, so the original password cannot be recovered. The service keeps its **ACL gate**; only the
+instance's second layer is removed.
+
+**Response `200`**
+```json
+{
+  "message": "Password removed. Nginx reloaded.",
+  "user_name": "alice",
+  "service_name": "myapp",
+  "label": "0"
+}
+```
+
+**Error codes**
+
+| Code | Cause |
+|---|---|
+| `404` | No registration found |
 
 ---
 

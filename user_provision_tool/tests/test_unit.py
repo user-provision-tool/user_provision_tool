@@ -2684,6 +2684,14 @@ class TestProvisionerEnvFile:
         assert new_hash != old_hash, "Password hash should change"
         assert new_hash.startswith("$2"), "Should be bcrypt hash"
 
+        # The gate rebuilds `Authorization: Basic user:passwd_plain` from the
+        # registry, so the plaintext must track the htpasswd: a stale or absent
+        # plaintext makes a protected service unopenable through the gate
+        # (the instance answers 401 with its OWN realm while the gate passes).
+        assert entry_after.get("passwd_plain") == "newpass", (
+            "change_password must re-record the plaintext beside the new hash"
+        )
+
         # htpasswd file should contain new hash
         htpasswd_path = entry_after.get("htpasswd_path", "")
         assert htpasswd_path, "htpasswd_path should be set"
@@ -2699,6 +2707,119 @@ class TestProvisionerEnvFile:
                 label="0",
                 passwd="secret",
             )
+
+    def test_change_password_rejects_empty_passwd(self):
+        """An empty password must never reach the htpasswd.
+
+        ``hash_password("")`` returns "" (lib/auth.py:26), and writing that
+        produces an htpasswd line no password can match — the service would be
+        locked out entirely. Removing protection is remove_password()'s job.
+        """
+        provisioner.register_user(
+            user_name="pwuser",
+            service_name="myapp",
+            label="0",
+            compose_template=COMPOSE_TEMPLATE,
+            nginx_template=NGINX_TEMPLATE,
+            output_dir=self.tmp_path,
+            nginx_output_dir=self.tmp_path,
+            user_data_dir=self.user_data_dir,
+            passwd="oldpass",
+        )
+        entry_before = registry.get_user_service("pwuser", "myapp", "0")
+        htpasswd_before = Path(entry_before["htpasswd_path"]).read_text()
+
+        with pytest.raises(ValueError, match="non-empty"):
+            provisioner.change_password(
+                user_name="pwuser",
+                service_name="myapp",
+                label="0",
+                passwd="",
+                nginx_container="subnet-acl-nginx",
+            )
+
+        # Neither the htpasswd nor the registry hash may move.
+        assert Path(entry_before["htpasswd_path"]).read_text() == htpasswd_before
+        assert registry.get_user_service("pwuser", "myapp", "0")["passwd"] == entry_before["passwd"]
+
+    def test_change_password_without_a_matching_entry_never_writes_the_registry(self, monkeypatch):
+        """The write-back is guarded on a real match.
+
+        Same rule as _mark_failed / _update_registry_status: an unguarded save
+        writes back an unchanged (possibly empty) list, which is how an empty
+        registry gets persisted over real data. The lookup can succeed while the
+        write-back loop sees a list that no longer holds the entry — the race
+        this guard exists for.
+        """
+        provisioner.register_user(
+            user_name="pwuser",
+            service_name="myapp",
+            label="0",
+            compose_template=COMPOSE_TEMPLATE,
+            nginx_template=NGINX_TEMPLATE,
+            output_dir=self.tmp_path,
+            nginx_output_dir=self.tmp_path,
+            user_data_dir=self.user_data_dir,
+            passwd="oldpass",
+        )
+        entry = registry.get_user_service("pwuser", "myapp", "0")
+        before = Path(registry.REGISTRY_FILE).read_bytes()
+
+        monkeypatch.setattr(registry, "get_user_service", lambda *a, **k: entry)
+        monkeypatch.setattr(registry, "_load", lambda: [])
+        saves = []
+        monkeypatch.setattr(registry, "_save", lambda users: saves.append(users))
+
+        provisioner.change_password(
+            user_name="pwuser",
+            service_name="myapp",
+            label="0",
+            passwd="newpass",
+            nginx_container="subnet-acl-nginx",
+        )
+
+        assert saves == [], "an unmatched change_password must not write the registry back"
+        assert Path(registry.REGISTRY_FILE).read_bytes() == before
+
+    def test_remove_password_strips_auth_basic_and_clears_the_entry(self):
+        """The exit for a protected service whose plaintext is gone.
+
+        bcrypt gives no way back to the original password, so the instance's own
+        layer has to come off: the conf is re-rendered without auth_basic, the
+        entry loses passwd/passwd_plain/htpasswd_path, and the secret file goes.
+        """
+        provisioner.register_user(
+            user_name="pwuser",
+            service_name="myapp",
+            label="0",
+            compose_template=COMPOSE_TEMPLATE,
+            nginx_template=NGINX_TEMPLATE,
+            output_dir=self.tmp_path,
+            nginx_output_dir=self.tmp_path,
+            user_data_dir=self.user_data_dir,
+            passwd="oldpass",
+        )
+        entry = registry.get_user_service("pwuser", "myapp", "0")
+        htpasswd_path = entry["htpasswd_path"]
+        conf_path = entry["nginx_conf_path"]
+        assert "auth_basic" in Path(conf_path).read_text()
+        assert Path(htpasswd_path).exists()
+
+        provisioner.remove_password(
+            user_name="pwuser",
+            service_name="myapp",
+            label="0",
+            nginx_container="subnet-acl-nginx",
+        )
+
+        after = registry.get_user_service("pwuser", "myapp", "0")
+        assert not after.get("passwd"), "the hash must be cleared"
+        assert not after.get("passwd_plain"), "the plaintext must be cleared"
+        assert not after.get("htpasswd_path"), "the htpasswd reference must be cleared"
+        assert not Path(htpasswd_path).exists(), "the secret file must be deleted"
+        assert "auth_basic" not in Path(conf_path).read_text(), (
+            "the re-rendered conf must have no auth_basic"
+        )
 
     # ── remove_user orphan network cleanup ──
 
@@ -4391,8 +4512,37 @@ class TestAclHelpersTemplate:
         assert "location = /_auth_jwt {" in content
         assert "internal;" in content
         assert "proxy_pass http://subnet-acl-gateway:8770/api/auth/verify;" in content
-        assert "proxy_set_header X-Provision-Token $cookie_provision_token;" in content
         assert "proxy_set_header X-Original-URI $request_uri;" in content
+
+    def test_auth_jwt_forwards_the_clients_credential(self):
+        """The subrequest must forward the CLIENT's credential — the API key in
+        `X-Provision-Token` — not a value of nginx's own choosing.
+
+        This is the guard that would have caught the 2026-09-29 defect. The line
+        used to read `$cookie_provision_token`, and `proxy_set_header` REPLACES
+        the header: whatever a non-browser client sent was discarded and the
+        gateway was handed the cookie's value (empty without a cookie), so a
+        VALID API key behaved exactly like no credential and the documented
+        non-browser route to a service (`api_references.md` `GET /api/auth/verify`
+        — "the alternative to cookie, for non-browser clients"; features.md
+        ACL2/ACL4) was dead. The previous version of this test asserted that very
+        string, i.e. it pinned the bug instead of the contract.
+
+        The browser flow rides on `Cookie: $http_cookie`, relayed on its own
+        line, and `verify` reads `token = cookie or header` (cookie first) — so
+        an empty header here keeps cookie/text-html requests classified
+        `browser`.
+        """
+        content = ACL_HELPERS_FILE.read_text()
+        assert "proxy_set_header X-Provision-Token $http_x_provision_token;" in content, (
+            "the /_auth_jwt subrequest must forward the client's X-Provision-Token")
+        # The DIRECTIVE must not name the cookie (comments explaining the old
+        # behaviour are fine — only the live directive decides).
+        assert "proxy_set_header X-Provision-Token $cookie_provision_token;" not in content, (
+            "the cookie must travel as the Cookie header, never re-labelled as the "
+            "client's X-Provision-Token — that overwrites a real key with an empty value")
+        assert "proxy_set_header Cookie $http_cookie;" in content, (
+            "the browser cookie flow must still be relayed")
 
     def test_set_token_exchange(self):
         """F7: /_set_token is token-less (outside the gated location /) and

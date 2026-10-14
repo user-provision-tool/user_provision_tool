@@ -101,6 +101,13 @@ class RegisterRequest(BaseModel):
     # Optionally one of:
     nginx_conf_template_path: str | None = None
     nginx_conf_file_path: str | None = None
+    # R9.2's second conf slot: the payload carries the instance's confs as a LIST,
+    # exactly as the compose slot already does. An http conf and a stream conf
+    # travel in one deploy, and the CATEGORY comes from the file name — which is
+    # why the stream conf's name is load-bearing (`*.stream.conf` is the pattern
+    # the internal nginx includes).
+    nginx_conf_template_paths: list[str] | None = None
+    nginx_conf_file_paths: list[str] | None = None
     # Repeatable interpolation env files (order preserved, later wins).
     env_file_path: str | None = None
     env_files: list[str] | None = None
@@ -119,7 +126,16 @@ class RegisterRequest(BaseModel):
     passwd: str = "123456"
     volumes: dict[str, str] = {}
     build_args: dict[str, str] | None = None
-    https: bool = False
+    # The TLS toggle (task-doc R9.1 / GRILLING G41). Its meaning is "TLS is in
+    # play for this deployment": it gates the instance's TLS vhost AND its stream
+    # confs — which is why it is no longer called `https` (the stream confs are
+    # not https at all).
+    #
+    # `https` is kept as a DEPRECATED alias for one round: both keys, one value.
+    # Supplying both with DIFFERENT values is refused rather than resolved — a
+    # caller that says two things is not a caller to guess for.
+    tls: bool | None = None
+    https: bool | None = None
     fullchain: str | None = None
     privkey: str | None = None
 
@@ -158,11 +174,38 @@ class RegisterRequest(BaseModel):
             raise ValueError("compose_template_path, compose_file_path and compose_file_paths are mutually exclusive")
         if self.nginx_conf_template_path and self.nginx_conf_file_path:
             raise ValueError("nginx_conf_template_path and nginx_conf_file_path are mutually exclusive")
-        if self.https:
+        _lists = bool(self.nginx_conf_template_paths) + bool(self.nginx_conf_file_paths)
+        _singles = bool(self.nginx_conf_template_path) + bool(self.nginx_conf_file_path)
+        if _lists and _singles:
+            raise ValueError(
+                "the conf LIST and the single conf fields are mutually exclusive — "
+                "pass nginx_conf_template_paths/nginx_conf_file_paths (or one single field)"
+            )
+        if (self.nginx_conf_template_paths and self.nginx_conf_file_paths):
+            raise ValueError("nginx_conf_template_paths and nginx_conf_file_paths are mutually exclusive")
+        # Resolve the toggle once, here, so nothing downstream has to know about
+        # the deprecated alias.
+        if self.tls is not None and self.https is not None and bool(self.tls) != bool(self.https):
+            raise ValueError("tls and https disagree — pass one (https is a deprecated alias of tls)")
+        tls_on = bool(self.tls if self.tls is not None else self.https)
+        object.__setattr__(self, "tls", tls_on)
+
+        has_certs = bool(self.fullchain) or bool(self.privkey)
+        if tls_on:
+            # Both certs, or the vhost cannot be rendered (unchanged behaviour).
             if not self.fullchain:
-                raise ValueError("fullchain is required when https=True")
+                raise ValueError("fullchain is required when tls=True")
             if not self.privkey:
-                raise ValueError("privkey is required when https=True")
+                raise ValueError("privkey is required when tls=True")
+        elif has_certs:
+            # R9.1's second incoherent combination, and the one real footgun in
+            # the old shape: certs supplied with the toggle OFF used to be
+            # silently ignored — the operator believed they had TLS and got
+            # plain HTTP with no hint at all. Loud, never silent.
+            raise ValueError(
+                "certificates were supplied but tls=false — either set tls=true "
+                "or drop the certificates (they are ignored otherwise)"
+            )
         return self
 
 
@@ -201,6 +244,25 @@ async def lifespan(app: FastAPI):
         )
     except Exception:
         _log.exception("Startup recovery failed")
+    # The recovery above runs when THIS process starts; it cannot run when the
+    # INTERNAL NGINX is recreated underneath it — and a recreate is what destroys
+    # the per-user attachments in the first place (GRILLING G46; measured
+    # 2026-10-11 — see `watch_for_recreates`). The watcher closes that hole: it
+    # holds Docker's own event stream and repairs the moment the container
+    # starts, so the outage lasts seconds instead of until the next restart or
+    # the next scheduled reconcile — which is disabled by default.
+    import threading
+    threading.Thread(
+        target=reconciliation.watch_for_recreates,
+        kwargs={"nginx_container": NGINX_CONTAINER},
+        name="nginx-recreate-watch",
+        daemon=True,
+    ).start()
+    # `print`, not `_log`: this module's logger has no handler under uvicorn, so
+    # an INFO line goes nowhere and a watcher that failed to start would be
+    # indistinguishable from one that is quietly working.
+    print(f"[provision-api] nginx recreate watcher started "
+          f"(container={NGINX_CONTAINER})", flush=True)
     yield
 
 
@@ -403,6 +465,14 @@ def register_user(
     compose_template_path  = _resolve(req.compose_template_path)
     nginx_conf_file_path   = _resolve(req.nginx_conf_file_path)
     nginx_conf_template_path = _resolve(req.nginx_conf_template_path)
+    # The conf slot as a LIST, whatever shape the caller used: a single field is
+    # a one-element list, so everything downstream has one code path (R9.2).
+    nginx_conf_files: list[str] = [
+        _resolve(p) for p in (req.nginx_conf_file_paths or [])
+    ] or ([nginx_conf_file_path] if nginx_conf_file_path else [])
+    nginx_conf_templates: list[str] = [
+        _resolve(p) for p in (req.nginx_conf_template_paths or [])
+    ] or ([nginx_conf_template_path] if nginx_conf_template_path else [])
     env_file_path          = _resolve(req.env_file_path)
     env_files_resolved     = [_resolve(p) for p in (req.env_files or [])]
 
@@ -473,29 +543,48 @@ def register_user(
     except Exception:
         pass
 
-    nginx_template: str | None = None
-    if nginx_conf_file_path:
-        src = Path(nginx_conf_file_path)
+    # Each conf is CONVERTED BY CATEGORY — the category being its file name
+    # (R9.2): an http conf takes the http substitutions, a stream conf takes the
+    # stream's own (no auth_basic, no ssl guard, the canonical name kept — G42.1).
+    # The names are the contract: `*.stream.conf` is what the internal nginx's
+    # include matches, so it is required, not cosmetic.
+    nginx_templates: list[str] = []
+    for _path in nginx_conf_files:
+        src = Path(_path)
         if not src.exists():
-            raise HTTPException(404, f"nginx_conf_file_path not found: {nginx_conf_file_path}")
-
-        # --- Validate: every proxy_pass host must reference a compose service ---
-        if _compose_svc_names:
-            _validate_nginx_proxy_targets(src, _compose_svc_names)
-
+            raise HTTPException(404, f"nginx conf not found: {_path}")
         template_out = str(src.parent / f"{src.name}.j2")
-        try:
-            nginx_file_to_template(
-                str(src), template_out, req.service_name,
-                compose_service_names=_compose_svc_names or None,
-            )
-        except Exception as e:
-            raise HTTPException(422, f"could not convert nginx conf file: {e}")
-        nginx_template = template_out
-    elif nginx_conf_template_path:
-        if not Path(nginx_conf_template_path).exists():
-            raise HTTPException(404, f"nginx_conf_template_path not found: {nginx_conf_template_path}")
-        nginx_template = nginx_conf_template_path
+        if src.name.endswith(".stream.conf"):
+            from lib.nginx_converter import convert_stream_conf
+            try:
+                Path(template_out).write_text(
+                    convert_stream_conf(
+                        src.read_text(encoding="utf-8", errors="replace"),
+                        req.service_name,
+                        compose_service_names=_compose_svc_names or None,
+                    ),
+                    encoding="utf-8",
+                )
+            except Exception as e:
+                raise HTTPException(422, f"could not convert stream conf: {e}")
+        else:
+            # --- Validate: every proxy_pass host must reference a compose service ---
+            if _compose_svc_names:
+                _validate_nginx_proxy_targets(src, _compose_svc_names)
+            try:
+                nginx_file_to_template(
+                    str(src), template_out, req.service_name,
+                    compose_service_names=_compose_svc_names or None,
+                )
+            except Exception as e:
+                raise HTTPException(422, f"could not convert nginx conf file: {e}")
+        nginx_templates.append(template_out)
+    for _tpl in nginx_conf_templates:
+        if not Path(_tpl).exists():
+            raise HTTPException(404, f"nginx_conf_template_path not found: {_tpl}")
+        nginx_templates.append(_tpl)
+
+    nginx_template: str | None = nginx_templates[0] if nginx_templates else None
 
     # --- Build kwargs for provisioner call ---
     prov_kwargs = dict(
@@ -509,6 +598,7 @@ def register_user(
         user_data_dir=USER_DATA_DIR,
         passwd=req.passwd,
         nginx_template=nginx_template,
+        nginx_conf_templates=list(nginx_templates),
         domain=req.domain,
         env_file=env_file_path,
         env_files=env_files_resolved or None,
@@ -517,7 +607,11 @@ def register_user(
         compose_sources=compose_sources or None,
         nginx_container=NGINX_CONTAINER,
         build_args=req.build_args,
-        https=req.https,
+        # The REGISTRY's stored key stays `https`: it is read by three services
+        # and by nine existing entries, and the doc's rename covers the request,
+        # the CLI and the template variable — not the stored field. The mapping
+        # lives here, in one place.
+        https=bool(req.tls),
         fullchain=req.fullchain,
         privkey=req.privkey,
         ssl_base_dir=str(SSL_DIR),
@@ -791,30 +885,13 @@ def get_nginx_connections() -> dict[str, Any]:
 
 @app.post("/nginx/reconnect-all")
 def reconnect_all() -> dict[str, Any]:
-    """Iterate all entries in user_registry, reconnect provision-nginx to each
-    network (idempotent), then reload nginx."""
-    all_users = registry.get_all_users()
-    networks = set()
-    for entry in all_users:
-        net = entry.get("network_name", "")
-        if net:
-            networks.add(net)
+    """Reconnect provision-nginx to every network in the registry, then reload.
 
-    reconnected = 0
-    for net in sorted(networks):
-        try:
-            docker_ops.network_connect(NGINX_CONTAINER, net)
-            reconnected += 1
-        except Exception:
-            pass
-
-    docker_ops.nginx_reload(NGINX_CONTAINER)
-
-    return {
-        "total_networks": len(networks),
-        "reconnected": reconnected,
-        "nginx_reloaded": True,
-    }
+    ONE implementation with the recreate watcher (`watch_for_recreates`) — the
+    operator's manual repair and the automatic one must be the same rule, or the
+    two drift and only one of them is ever right.
+    """
+    return reconciliation.repair_nginx_attachments(NGINX_CONTAINER)
 
 
 # ---------------------------------------------------------------------------
@@ -1105,6 +1182,17 @@ def check_missing_files(
     files = [f.name for f in project_dir.iterdir() if f.is_file()]
 
     has_compose = any(_is_compose_name(f) for f in files)
+    # The serving-ports artifact (task-doc R1.1 / GRILLING G20): a recipe without
+    # one cannot deploy, so this scan reports it missing exactly as it does a
+    # compose. Same naming convention as the gateway's candidate scan — the two
+    # are a MIRROR (separate services), and if they disagree the deploy has a
+    # phase that never runs and no file to deploy.
+    has_serving_ports = any(
+        (f.startswith("serving_ports") or f.startswith("serving-ports"))
+        and (f.endswith(".yml") or f.endswith(".yaml"))
+        and not f.endswith(".generated") and not f.endswith(".j2")
+        for f in files
+    )
     has_nginx = any(
         f.endswith(".conf.j2") or
         (f.endswith(".conf") and not f.endswith(".j2"))
@@ -1140,6 +1228,11 @@ def check_missing_files(
         existing.append("docker-compose")
     else:
         missing.append("docker-compose")
+
+    if has_serving_ports:
+        existing.append("serving_ports")
+    else:
+        missing.append("serving_ports")
 
     if has_nginx:
         existing.append("nginx.conf")
@@ -1641,6 +1734,29 @@ def _status_for_user(user_name: str, running: dict[str, str]) -> dict[str, Any]:
             # registry by the passthrough endpoints but never sent here.
             "nginx_conf_template_path": entry.get("nginx_conf_template_path", ""),
             "nginx_conf_path": entry.get("nginx_conf_path", ""),
+            # R6.1: the sub-services this instance exposes a STREAM endpoint for,
+            # as the canonical names its rendered stream conf selects on. The card
+            # decides what to offer from THIS — the recorded state — never by
+            # re-deriving "TLS is on and a row exists" in the panel. Empty (or
+            # absent) means nothing is exposed, which is also the TLS-off case by
+            # construction: nothing was recorded.
+            # R1.5/R6.2 — the instance's OWN host, from the registry entry, which
+            # is the single source of truth for it (`service_hostname`). The card
+            # needs it to build every `/go/` link; without it the panel composed
+            # the name itself and hard-coded `.localhost`, so on any other domain
+            # the service URL — and each extra endpoint — pointed at a host that
+            # does not exist.
+            "hostname": entry.get("hostname") or "",
+            "stream_sub_services": entry.get("stream_sub_services") or [],
+            # R1.5/R6.2 — the EXTRA http endpoints the instance serves
+            # (`<instance host>--<sub_service>.<domain>`), read from the rendered
+            # conf at deploy time — the same shape `stream_sub_services` uses.
+            # The card's URL section keys its `/go/` rows by these; the primary is
+            # not among them (it is the instance's own URL, keyed `primary`).
+            "http_endpoints": entry.get("http_endpoints") or [],
+            # Every conf the deploy carried (R9.2), beside the singular fields the
+            # card reads today.
+            "nginx_conf_paths": entry.get("nginx_conf_paths") or [],
             # Recipe subdir of THIS instance ('' = project root) + the effective
             # per-user env file — the dashboard's Deployment-Files links must
             # resolve inside the recipe dir, not the project root.
@@ -1881,6 +1997,52 @@ class SSLCertUploadRequest(BaseModel):
     ssl_path: str = ""     # Path to dir containing fullchain.pem + privkey.pem (path mode)
 
 
+def _cert_dns_names(cert_pem: str) -> list[str]:
+    """The DNS names a certificate claims: every SAN DNS entry + the CN.
+
+    Parsed by openssl (the same tool `_get_cert_expiry` uses) on a temporary
+    file, because openssl is what this image has and a hand-rolled DER parser is
+    not worth its bugs. Returns [] when the certificate cannot be read — the
+    caller treats that as "not a wildcard", which is the fail-closed direction.
+    """
+    # Imported HERE, like the file's other helpers: `re` and `subprocess` are not
+    # module-level names in this module, and a missing import inside a
+    # `try/except` that returns [] is invisible — it made this function answer
+    # "no wildcard" for every certificate, including a real wildcard (measured).
+    import re
+    import subprocess
+    import tempfile
+
+    names: list[str] = []
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as fh:
+            fh.write(cert_pem)
+            tmp = fh.name
+        try:
+            out = subprocess.run(
+                ["openssl", "x509", "-noout", "-subject", "-ext", "subjectAltName", "-in", tmp],
+                capture_output=True, text=True, timeout=10,
+            )
+        finally:
+            try:
+                Path(tmp).unlink()
+            except OSError:
+                pass
+        text = (out.stdout or "") + (out.stderr or "")
+        for m in re.finditer(r"DNS:([^,\s]+)", text):
+            names.append(m.group(1).strip())
+        m = re.search(r"CN\s*=\s*([^,\n/]+)", text)
+        if m:
+            names.append(m.group(1).strip())
+    except Exception:
+        return []
+    seen: list[str] = []
+    for n in names:
+        if n and n not in seen:
+            seen.append(n)
+    return seen
+
+
 def _get_cert_expiry(cert_path: Path) -> tuple[str, int]:
     """Return (iso8601-date, days_until_expiry) for a certificate file.
 
@@ -1947,10 +2109,13 @@ def upload_ssl_cert(req: SSLCertUploadRequest) -> dict[str, Any]:
         raise HTTPException(400, "Invalid domain name")
 
     cert_dir = SSL_DIR / domain
-    cert_dir.mkdir(parents=True, exist_ok=True)
 
     fullchain_content: str
     privkey_content: str
+    # R9.4 — filled in path mode only, and PERSISTED only once the certificate has
+    # been accepted. A refusal must leave the store byte-for-byte as it was: the
+    # directory is created below, after the check, for the same reason.
+    _source_path: str | None = None
 
     if req.ssl_path:
         # Path mode: read files from the provided directory path
@@ -1966,12 +2131,42 @@ def upload_ssl_cert(req: SSLCertUploadRequest) -> dict[str, Any]:
             raise HTTPException(400, f"privkey.pem not found in: {req.ssl_path}")
         fullchain_content = chain_src.read_text()
         privkey_content = key_src.read_text()
-        # Store source path for later refresh
-        (cert_dir / ".source_path").write_text(str(src))
+        _source_path = str(src)
     else:
         # Paste mode: use the PEM content from the request
         fullchain_content = req.fullchain
         privkey_content = req.privkey
+
+    # ---------------------------------------------------------------
+    # R9.4 — WILDCARDS ONLY on the upload path.
+    #
+    # The exposure handle is minted AFTER the certificate exists ("the name comes
+    # only after selecting the certs, never the reverse" — GRILLING G41), so the
+    # only shape the platform can actually use is `*.<domain>`: one certificate
+    # per domain, covering every one-label name under it. Anything else is
+    # refused HERE, with an actionable message, rather than discovered later as a
+    # handshake that presents nothing.
+    #
+    # Scope, deliberately narrow: this gates UPLOADS. Entries already in the
+    # store are grandfathered, and the portal's own certificate does not come
+    # through this path.
+    # ---------------------------------------------------------------
+    _names = _cert_dns_names(fullchain_content)
+    if not any(n.startswith("*.") for n in _names):
+        raise HTTPException(
+            400,
+            "only WILDCARD certificates are accepted (a CN or SAN entry of the form "
+            "`*.<domain>`): the platform serves every one-label name under the domain "
+            f"from a single certificate, so a single-host certificate would be "
+            f"unusable. Got: {', '.join(_names) or 'no readable DNS names'}",
+        )
+
+    # ONLY NOW does anything reach the store (R2-F5): the directory, the
+    # `.source_path` marker and the two PEM files are all written after the
+    # certificate has been accepted, so a refused upload is a no-op on disk.
+    cert_dir.mkdir(parents=True, exist_ok=True)
+    if _source_path is not None:
+        (cert_dir / ".source_path").write_text(_source_path)
 
     (cert_dir / "fullchain.pem").write_text(fullchain_content)
     (cert_dir / "privkey.pem").write_text(privkey_content)

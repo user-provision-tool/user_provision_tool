@@ -110,7 +110,7 @@ def migrate(generated_dir: Path, dry_run: bool = False) -> dict[str, Any]:
                     str(entry.get("label", "0")),
                     _domain_of(entry),
                     entry.get("htpasswd_path") or "",
-                    https=bool(entry.get("https")),
+                    https=registry.entry_tls(entry),
                     ssl_certificate_path=entry.get("ssl_certificate_path") or "",
                     ssl_certificate_key_path=entry.get("ssl_certificate_key_path") or "",
                 )

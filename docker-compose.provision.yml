@@ -46,13 +46,30 @@ services:
     image: nginx:alpine
     container_name: subnet-acl-nginx
     ports:
-      # Minimal deployment (v5 §2.2): the internal nginx is the exposed entry.
-      # In fullset the edge -nginx-acl is the entry; suppressing these host
-      # ports is deferred (v5 §14 — override/profile mechanics), so minimal and
-      # fullset share this base file and the internal confs are byte-identical.
-      - "${NGINX_HTTP_PORT:-8080}:80"
-      - "${NGINX_HTTPS_PORT:-8443}:443"
-      - "${NGINX_STREAM_PORT:-8769}:7687"
+      # THIS BASE FILE IS THE FULLSET SHAPE: the edge -nginx-acl is the only host
+      # door, so the internal nginx publishes no STREAM port here — its stream
+      # listener routes for the edge alone (task-doc R8.1/T5). The minimal shape
+      # publishes that door with the overlay: `-f docker-compose.provision.yml
+      # -f docker-compose.minimal.yml`. Publishing in the base and suppressing in
+      # an overlay would have made the INSECURE shape the default.
+      #
+      # The 80/443 publishes stay — but LOOPBACK-BOUND (GRILLING G44). The
+      # end state is the platform's own premise: the edge is the only door, so
+      # the internal nginx's web ports are not reachable from another machine.
+      # They remain reachable from the OPERATOR's machine, which is what lets the
+      # minimal shape's behaviours be exercised on this stack without bringing a
+      # second one up — and that is the whole point of keeping them at all.
+      #
+      # Measured before it was ruled: the published door delivers onto a CUSTOMER
+      # network's address (the port DNATs to the container's address on a tenant
+      # bridge, so an outside client is logged as that bridge's gateway — a
+      # customer-pool address), which is why the small shape's test was refused.
+      # Round 1 read that as "the guard refuses the very client it exists for"
+      # and proposed weakening the guard; the guard is CORRECT (the pools are
+      # disjoint), and the defect is where the door delivers. Loopback binding is
+      # the publish-side half of that answer and needs no guard change.
+      - "127.0.0.1:${NGINX_HTTP_PORT:-8080}:80"
+      - "127.0.0.1:${NGINX_HTTPS_PORT:-8443}:443"
     volumes:
       # Same-path bind-mount so htpasswd paths in generated confs resolve correctly
       - ${PROVISION_DIR:-/srv/provision_subnet_acl}:${PROVISION_DIR:-/srv/provision_subnet_acl}:ro

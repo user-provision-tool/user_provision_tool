@@ -339,9 +339,47 @@ def compose_build(compose_file: str, no_cache: bool = False, env_file: str | lis
     _run(cmd)
 
 
-def network_connect(container: str, network: str) -> None:
-    """Connect *container* to *network*. Silently no-ops if already connected."""
-    _run(["docker", "network", "connect", network, container], check=False)
+# A per-user network is attached **subordinate to the platform's own**.
+#
+# Docker gives a container one "top" network — the one that supplies its default
+# gateway, and the one whose address a *published* port is delivered to. It is
+# chosen by `gw-priority` (default 0; documented in the Engine networking guide,
+# "Connecting to multiple networks"), and ties are broken by network name.
+#
+# Attached at the default, a per-user network TIES with the platform's
+# `subnet_acl_shared` and wins the tie-break — `subnet-acl-<service>-user_…`
+# sorts before `subnet_acl_shared`, because `-` (0x2D) precedes `_` (0x5F). The
+# internal nginx's published door then lands on a **tenant** address, so a client
+# arriving at it is logged as that tenant bridge's gateway (`100.96.0.1`) and the
+# conf's `allow 172.17.0.0/16; deny all;` refuses it BEFORE the handshake —
+# measured 2026-10-11: `403` instead of a route.
+#
+# A negative priority makes the platform's network unambiguously the top one.
+# Measured after the fix: the door stays on the platform's address and the client
+# arrives as `172.17.0.1`, inside the allow.
+TENANT_GW_PRIORITY = -1
+
+
+def network_connect(
+    container: str, network: str, gw_priority: int | None = TENANT_GW_PRIORITY
+) -> None:
+    """Connect *container* to *network*, **subordinate to the platform's network**.
+
+    Idempotent AND self-correcting: a bare `docker network connect` on an
+    existing membership is refused by the daemon and changes nothing, so a
+    membership made before this rule existed would keep its priority forever.
+    The membership is therefore re-made here — which is what lets the recreate
+    repair bring old attachments up to the rule, not just new ones.
+
+    ``gw_priority=None`` attaches with no flag at all, for a caller that wants
+    Docker's default (nothing in this platform does today).
+    """
+    cmd = ["docker", "network", "connect"]
+    if gw_priority is not None:
+        cmd += ["--gw-priority", str(gw_priority)]
+    cmd += [network, container]
+    network_disconnect(container, network)
+    _run(cmd, check=False)
 
 
 def network_disconnect(container: str, network: str) -> None:

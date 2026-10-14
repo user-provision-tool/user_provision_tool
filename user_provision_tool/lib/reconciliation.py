@@ -117,7 +117,7 @@ def regenerate_nginx_confs() -> dict[str, Any]:
                 label,
                 domain,
                 entry.get("htpasswd_path") or "",
-                https=bool(entry.get("https")),
+                https=registry.entry_tls(entry),
                 ssl_certificate_path=entry.get("ssl_certificate_path") or "",
                 ssl_certificate_key_path=entry.get("ssl_certificate_key_path") or "",
             )
@@ -485,6 +485,129 @@ def _derive_container_names(entry: dict) -> list[str]:
         except Exception:
             pass
     return []
+
+
+def repair_nginx_attachments(nginx_container: str = "subnet-acl-nginx") -> dict[str, Any]:
+    """Re-attach the internal nginx to every registered per-user network.
+
+    Those attachments are **imperative state**: Docker keeps them on the
+    container, not in the compose file, so any RECREATE of `subnet-acl-nginx`
+    destroys them and every service's upstream fails at once (task-doc §4 row
+    17; round-1 rev 17 (b)). The compose file cannot express them — the per-user
+    networks do not exist when it is written (`docker network connect` at deploy
+    time is what creates the membership).
+
+    **Measured 2026-10-11, while landing the loopback port policy (G44):** a
+    recreate of the internal nginx left the container with `subnet_acl_shared`
+    alone — 9 per-user attachments gone — and *nothing* repaired it. The
+    gateway's docker-events monitor, written for exactly this trigger, cannot
+    work: that container mounts no docker socket, so its `docker.from_env()`
+    raises and the watcher retries forever. And the gateway's periodic reconcile
+    defaults to **disabled** (`reconciliation_interval_min` absent → interval 0
+    → the loop sleeps 60 s and never calls). The repair therefore lives HERE, in
+    the component that has the socket and already owns every docker operation.
+
+    Idempotent: `docker network connect` on an existing membership errors, and
+    the caller swallows it (the count reports the attempts, not the changes).
+    """
+    all_users = registry.get_all_users()
+    networks = sorted({e["network_name"] for e in all_users if e.get("network_name")})
+
+    reconnected = 0
+    for net in networks:
+        try:
+            docker_ops.network_connect(nginx_container, net)
+            reconnected += 1
+        except Exception:
+            pass
+
+    reloaded = True
+    try:
+        docker_ops.nginx_reload(nginx_container)
+    except Exception:
+        reloaded = False
+
+    _log.info(
+        "nginx attachments repaired: %d/%d networks, reload %s",
+        reconnected, len(networks), "sent" if reloaded else "FAILED",
+    )
+    return {
+        "total_networks": len(networks),
+        "reconnected": reconnected,
+        "nginx_reloaded": reloaded,
+    }
+
+
+def watch_for_recreates(
+    nginx_container: str = "subnet-acl-nginx",
+    *,
+    proc_factory=None,
+    _once: bool = False,
+) -> None:
+    """Block: repair the attachments whenever the internal nginx STARTS.
+
+    The trigger is Docker's own event stream, not a timer, because the outage is
+    total and immediate: the moment the container is recreated every service is
+    unreachable through the platform, while a timer would leave it broken for
+    however long its interval is. A `start` event covers both shapes of recreate
+    — `docker compose up -d` after a config change, and any manual
+    `docker rm`/`create` — since the container name is fixed.
+
+    Started by the -api's lifespan as a daemon thread. `proc_factory` and `_once`
+    exist so a test can drive one iteration without the docker daemon.
+    """
+    import subprocess
+    import time
+
+    # NO `--format`: the event stream's message type has no `.Status` field (it
+    # is `.Action`), so a format string written from the OLD `docker events`
+    # output shape makes the CLI exit at once with
+    # `Error parsing format: ... can't evaluate field Status`. With stderr
+    # discarded and stdout then empty, the reader saw a clean end-of-stream and
+    # retried every 5 s forever — a watcher that never watched. Measured
+    # 2026-10-11: the recreate left the internal nginx on one network for 60 s
+    # with this thread running. The line CONTENT is irrelevant (any line is a
+    # matching event), so the default text format is enough and cannot break.
+    cmd = [
+        "docker", "events",
+        "--filter", "type=container",
+        "--filter", f"container={nginx_container}",
+        "--filter", "event=start",
+    ]
+    factory = proc_factory or (
+        lambda: subprocess.Popen(  # noqa: S603 — a fixed argv, no shell
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+    )
+    while True:
+        proc = None
+        try:
+            proc = factory()
+            for _line in proc.stdout:
+                # The chained `start` event fires as the container begins; give
+                # its entrypoint a moment (envsubst + nginx) before attaching.
+                time.sleep(3)
+                repair_nginx_attachments(nginx_container)
+                if _once:
+                    return
+            # The stream ENDED — the daemon went away, the socket was revoked, or
+            # the argv was rejected. Silence here is how the first version of
+            # this watcher failed invisibly, so it says so. `print`, not `_log`:
+            # this module's logger has no handler under uvicorn, so an INFO line
+            # is discarded and only stdout reaches `docker logs`.
+            print(f"[provision-api] docker events stream ended; retrying in 5s "
+                  f"(container={nginx_container})", flush=True)
+        except Exception:
+            _log.exception("docker events stream for %s failed; retrying", nginx_container)
+        finally:
+            if proc is not None:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+        if _once:
+            return
+        time.sleep(5)
 
 
 def get_nginx_state() -> dict[str, Any]:

@@ -549,6 +549,29 @@ def _strip_location_blocks(content: str, prefix: str) -> str:
     return "\n".join(out)
 
 
+def rendered_conf_name(service_name: str, user_name: str, label: str, template_path: str) -> str:
+    """The rendered file name for one conf template — BY CATEGORY (task-doc R9.2).
+
+    The category is the FILE NAME, which is why the name is load-bearing rather
+    than cosmetic: the internal nginx's `stream` block includes
+    `*.stream.conf`, so a stream conf that lands under any other name simply has
+    no route. The http conf keeps today's `*.nginx.conf` (R1.1's rename to
+    `*.http.conf` and its one-off sweep are that requirement's own work), and a
+    mail conf would land as `*.mail.conf` — the third category the artifact's
+    kinds can produce.
+    """
+    name = Path(template_path).name
+    if name.endswith(".j2"):
+        name = name[:-3]
+    if name.endswith(".stream.conf"):
+        ext = "stream.conf"
+    elif name.endswith(".mail.conf"):
+        ext = "mail.conf"
+    else:
+        ext = "nginx.conf"
+    return f"{service_name}.user-{user_name}.{label}.{ext}"
+
+
 def render_nginx_conf(
     template_path: str,
     output_path: str,
@@ -590,7 +613,22 @@ def render_nginx_conf(
         # Single source of truth for the served hostname (feature 3): the same
         # builder the pre-deploy /service-url-base endpoint and the registry use.
         "hostname": service_hostname(service_name, user_name, label, domain_name),
+        # R1.5 — the SAME host without its domain, so a second endpoint of one
+        # instance can be composed in a template as
+        # `{{ hostname_stem }}--<sub_service>.{{ domain_name }}`. The converter
+        # emits exactly that for a `server_name` carrying `--`
+        # (lib/nginx_converter.py), which is what makes an extra `kind: http` row
+        # reachable at `<instance host>--<sub_service>.<domain>` — one label under
+        # the domain, so the single wildcard certificate still serves it.
+        "hostname_stem": f"{service_name}-{user_name}-{label}",
         "htpasswd_path": htpasswd_path,
+        # R9.1's rename: the variable answers "does this instance's vhost get its
+        # TLS block?", and it now ALSO gates the stream confs (which are not
+        # https at all) — so `tls` is the name and `https` is kept as a
+        # DEPRECATED alias for one round. Both keys, one value: a template
+        # written against either renders identically, which is what makes the
+        # rename invisible to every hand-written template during the transition.
+        "tls": https,
         "https": https,
         "ssl_certificate_path": ssl_certificate_path,
         "ssl_certificate_key_path": ssl_certificate_key_path,
@@ -636,6 +674,39 @@ def render_nginx_conf(
     rendered = re.sub(
         r"^(?P<indent>[ \t]*)proxy_pass\s+(?P<scheme>https?://)(?P<host>[^:;\s]+)(?P<port>:\d+)?\s*;",
         _rewrite_proxy_pass,
+        rendered,
+        flags=re.MULTILINE,
+    )
+
+    # ------------------------------------------------------------------
+    # R4-F63 — forward the client's Host WITH its port, not `$host`.
+    #
+    # `$host` is the hostname with the port STRIPPED, so an application that
+    # builds an absolute URL from the host it was given — which is the normal
+    # thing to do — produces one that names the scheme's default port. On a
+    # deployment whose edge is remapped off 443 that is a dead end: the client
+    # follows e.g. `https://<host>/browser/` to :443, which the topology does
+    # not publish. Measured 2026-10-11 through the card's own `/go/` hand-off
+    # (see the round's F63): the app answered `303 … Location:
+    # https://<host>/browser/` and the browser got an empty response, while the
+    # same redirect at the published port loaded.
+    #
+    # `$http_host` is exactly the Host the client sent — port and all, and no
+    # port when the client used the default one — which is the truthful answer
+    # to "which URL did you reach me at?", and needs no knowledge of the
+    # deployment's ports. It is safe to use bare here (where `$host` would be
+    # the guarded choice) because the EDGE normalises the header before this
+    # server sees it: a client that sends no Host at all is given `$host` there,
+    # so `$http_host` on this hop is never empty.
+    #
+    # The rewrite lives HERE, beside the proxy_pass normalisation and for the
+    # same reason: the renderer owns what the conf becomes, so a template
+    # written before this rule is corrected on its next render rather than
+    # only in confs generated after it.
+    # ------------------------------------------------------------------
+    rendered = re.sub(
+        r"^(?P<indent>[ \t]*)proxy_set_header[ \t]+Host[ \t]+\$host[ \t]*;",
+        r"\g<indent>proxy_set_header Host $http_host;",
         rendered,
         flags=re.MULTILINE,
     )

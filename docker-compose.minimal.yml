@@ -1,0 +1,26 @@
+# Minimal shape overlay — the internal nginx IS the host's door.
+#
+# Usage:  docker compose -f docker-compose.provision.yml -f docker-compose.minimal.yml up -d
+#
+# Why an overlay rather than a line in the base: the base file is the FULLSET
+# shape, in which the edge -nginx-acl is the only host door and the internal
+# nginx's stream listener routes for the edge alone (task-doc R8.1 / GRILLING
+# G40). If the publish lived in the base, the *default* way to bring the stack
+# up would be the insecure one, and every fullset run would carry a host door
+# into every tenant's stream services that bypasses the edge's gate.
+#
+# What this publishes is the STREAM door only — the internal listener's host port
+# (`NGINX_STREAM_PORT`, 8769 in this stack, targeting the container's 7687). The
+# 80/443 publishes are in the base, so both shapes have them; that asymmetry is
+# deliberate and stated in the base file: suppressing those is a separate,
+# still-deferred decision (v5 §14), and this feature takes only the stream port.
+#
+# In minimal there is no gateway and no edge, so **the ACL is not adopted**: the
+# door's only control is the sub-service's own credential (task-doc §3.8). The
+# generated `*.stream.conf` files, the listener and the certificate path they
+# reference are byte-identical to fullset's — only the host publish differs.
+
+services:
+  subnet-acl-nginx:
+    ports:
+      - "${NGINX_STREAM_PORT:-8769}:7687"

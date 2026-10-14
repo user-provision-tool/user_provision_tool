@@ -965,11 +965,39 @@ class TestDockerOps:
         return calls
 
     def test_network_connect_command(self, monkeypatch):
+        """GRILLING G52 — a tenant attachment is SUBORDINATE, and re-made.
+
+        Docker's `gw-priority` (default 0) picks a container's top network — the
+        one whose address a published port is delivered to. A per-user network
+        attached at the default TIED with the platform's and won the name
+        tie-break (`-` < `_`), so the internal nginx's published door landed on a
+        tenant address and the guard refused the door's own client (measured:
+        client `100.96.0.1` → 403). The negative priority is the fix.
+
+        The disconnect first is not decoration: the daemon REFUSES a second
+        `connect` on an existing membership, so without re-making it a membership
+        created before this rule would keep priority 0 forever — and the recreate
+        repair, which is the thing that runs after every nginx restart, would
+        silently correct nothing.
+        """
         calls = self._mock_run(monkeypatch)
         docker_ops.network_connect("subnet-acl-nginx", "myapp-user_alice-0")
+        assert calls[-2] == [
+            "docker", "network", "disconnect", "myapp-user_alice-0", "subnet-acl-nginx",
+        ], calls[-2]
         assert calls[-1] == [
-            "docker", "network", "connect", "myapp-user_alice-0", "subnet-acl-nginx"
-        ]
+            "docker", "network", "connect", "--gw-priority", "-1",
+            "myapp-user_alice-0", "subnet-acl-nginx",
+        ], calls[-1]
+
+    def test_the_attachment_priority_is_negative_and_reaches_the_command(self, monkeypatch):
+        """The value itself, pinned: it must stay BELOW the platform's default 0."""
+        assert docker_ops.TENANT_GW_PRIORITY < 0, (
+            "the platform's own network sits at Docker's default 0, so only a "
+            "negative priority makes it unambiguously the top one")
+        calls = self._mock_run(monkeypatch)
+        docker_ops.network_connect("c", "n", gw_priority=None)
+        assert "--gw-priority" not in calls[-1], calls[-1]
 
     def test_network_disconnect_command(self, monkeypatch):
         calls = self._mock_run(monkeypatch)
@@ -1934,6 +1962,88 @@ class TestNginxConverter:
         out = convert_nginx(_SAMPLE_NGINX_CONF)
         assert 'auth_basic "{{ service_name }} - {{ user_name }}";' in out
 
+    def test_an_extra_http_endpoint_keeps_its_sub_service(self):
+        """R1.5 / T16 — a `server_name` carrying `--` survives conversion.
+
+        It used to collapse to `{{ hostname }}` like every other name, so a block
+        declaring `<instance host>--<sub_service>.<domain>` was flattened back to
+        the instance host at render time and the endpoint the row declares ceased
+        to exist (round 2's F47 — the reason no deploy could satisfy
+        `validate_conf`).
+        """
+        from lib.nginx_converter import convert_nginx
+        conf = (
+            "server {\n    listen 80;\n    server_name web_hostname;\n"
+            "    location / { proxy_pass http://web:80; }\n}\n"
+            "server {\n    listen 80;\n    server_name web_hostname--neo4j;\n"
+            "    location / { proxy_pass http://neo4j:7474; }\n}\n"
+        )
+        out = convert_nginx(conf, "web", ["web", "neo4j"])
+        assert "server_name {{ hostname }};" in out
+        assert "server_name {{ hostname_stem }}--neo4j.{{ domain_name }};" in out, (
+            "the extra endpoint's sub-service must reach the template")
+        assert "web_hostname--neo4j" not in out
+
+    def test_a_fully_qualified_extra_name_keeps_only_its_sub_service(self):
+        """A model that writes the whole served name still yields one label."""
+        from lib.nginx_converter import convert_nginx
+        conf = (
+            "server {\n    listen 80;\n"
+            "    server_name web-alice-0--neo4j.snaprovision.com;\n"
+            "    location / { proxy_pass http://neo4j:7474; }\n}\n"
+        )
+        out = convert_nginx(conf, "web", ["neo4j"])
+        assert "server_name {{ hostname_stem }}--neo4j.{{ domain_name }};" in out
+
+
+class TestTheRenderedExtraHttpEndpoint:
+    """R1.5 / T16 — the converted template RENDERS to the name the row declares.
+
+    The converter's output is a template; this drives the same two steps the
+    deploy does (convert, then render per user) and reads the served names out of
+    the produced file — the observable `validate_conf` (R1.3) is about.
+    """
+
+    _CONF = (
+        "server {\n    listen 80;\n    server_name web_hostname;\n"
+        "    location / { proxy_pass http://web:80; }\n}\n"
+        "server {\n    listen 80;\n    server_name web_hostname--neo4j;\n"
+        "    location / { proxy_pass http://neo4j:7474; }\n}\n"
+    )
+
+    def _served(self, **overrides):
+        import re
+        from lib.nginx_converter import convert_nginx
+        from lib.template_engine import render_nginx_conf
+
+        args = dict(user_name="alice", service_name="web", label="0",
+                    domain_name="snaprovision.com", htpasswd_path="", https=False,
+                    ssl_certificate_path="", ssl_certificate_key_path="")
+        args.update(overrides)
+        converted = convert_nginx(self._CONF, args["service_name"], ["web", "neo4j"])
+        tpl = self._dir / "t.j2"
+        out = self._dir / "t.conf"
+        tpl.write_text(converted)
+        render_nginx_conf(template_path=str(tpl), output_path=str(out), **args)
+        return {m.group(1).strip() for m in
+                re.finditer(r"^[ \t]*server_name[ \t]+([^;\n]+);", out.read_text(), re.M)}
+
+    def setup_method(self, method):
+        import pathlib
+        import tempfile
+        self._dir = pathlib.Path(tempfile.mkdtemp())
+
+    def test_the_primary_and_the_extra_endpoint_are_both_served(self):
+        served = self._served()
+        assert "web-alice-0.snaprovision.com" in served
+        assert "web-alice-0--neo4j.snaprovision.com" in served, served
+
+    def test_the_extra_name_is_one_label_under_the_domain(self):
+        """The property the single wildcard certificate rests on (R1.5)."""
+        name = "web-alice-0--neo4j.snaprovision.com"
+        assert name in self._served()
+        assert name.count(".") == 2, "one label, then the two-label domain"
+
     def test_convert_auth_basic_user_file(self):
         from lib.nginx_converter import convert_nginx
         out = convert_nginx(_SAMPLE_NGINX_CONF)
@@ -2101,8 +2211,8 @@ class TestNginxConverter:
         assert "ssl_certificate_key {{ ssl_certificate_key_path }};" in out
         assert "/etc/letsencrypt" not in out
 
-    def test_convert_ssl_block_wrapped_in_if_https(self):
-        """Server blocks containing listen ... ssl are wrapped in {% if https %}...{% endif %}."""
+    def test_convert_ssl_block_wrapped_in_if_tls(self):
+        """Server blocks containing listen ... ssl are wrapped in {% if tls %}...{% endif %}."""
         from lib.nginx_converter import convert_nginx
         conf = (
             "server {\n"
@@ -2116,10 +2226,10 @@ class TestNginxConverter:
             "}\n"
         )
         out = convert_nginx(conf)
-        assert "{% if https %}" in out
+        assert "{% if tls %}" in out
         assert "{% endif %}" in out
 
-    def test_convert_https_redirect_block_wrapped(self):
+    def test_convert_tls_redirect_block_wrapped(self):
         """HTTP→HTTPS redirect blocks (return 301 https://) are wrapped too."""
         from lib.nginx_converter import convert_nginx
         conf = (
@@ -2138,7 +2248,7 @@ class TestNginxConverter:
         )
         out = convert_nginx(conf)
         # Both the redirect and the SSL block should be wrapped
-        assert out.count("{% if https %}") == 2
+        assert out.count("{% if tls %}") == 2
         assert out.count("{% endif %}") == 2
         assert "return 301 https://" in out
 
@@ -2157,8 +2267,8 @@ class TestNginxConverter:
         out = convert_nginx(conf)
         # Original HTTP block is preserved (the listen 80 block without wrap)
         assert "listen 80;" in out
-        # Auto-generated HTTPS block is wrapped in {% if https %}
-        assert "{% if https %}" in out
+        # Auto-generated HTTPS block is wrapped in {% if tls %}
+        assert "{% if tls %}" in out
         assert "{% endif %}" in out
         assert "listen 443 ssl;" in out
 
@@ -2191,9 +2301,9 @@ class TestNginxConverter:
             "}\n"
         )
         out = convert_nginx(conf)
-        # The original listen 80 block appears BEFORE any {% if https %} wrapper
+        # The original listen 80 block appears BEFORE any {% if tls %} wrapper
         idx_http = out.index("listen 80;")
-        idx_if = out.index("{% if https %}")
+        idx_if = out.index("{% if tls %}")
         assert idx_http < idx_if, "Original HTTP block should appear before the auto-generated HTTPS block"
 
     def test_convert_ssl_paths_untouched_when_no_ssl(self):
@@ -2207,7 +2317,7 @@ class TestNginxConverter:
         # The original HTTP block is preserved (not wrapped)
         assert "listen 80;" in out
         # Auto-generated HTTPS block is conditionally wrapped
-        assert "{% if https %}" in out
+        assert "{% if tls %}" in out
         assert "listen 443 ssl;" in out
 
     # --- ACL template injection (GAP-001 through GAP-004) ---
@@ -2587,6 +2697,45 @@ class TestProvisionerEnvFile:
         else:
             pytest.fail(f"--env-file not found in compose_up: {up_cmd}")
 
+    def test_register_renders_EVERY_conf_it_carries(self):
+        """R4-F52 — the stream conf a deploy carries is RENDERED, not just recorded.
+
+        `register_user` built the pair list (`nginx_out_by_category`) and recorded
+        both paths on the entry, but never PASSED it to the renderer:
+        `_register_render_and_start` fell back to the single
+        `(nginx_template, nginx_out)` pair, so the http conf rendered and the stream
+        conf did not. Its path reached the registry while the file never reached the
+        disk — which is why every entry's `stream_sub_services` was `[]` and the card
+        offered no stream endpoint (measured 2026-10-10 on the live stack).
+        """
+        stream_tpl = self.tmp_path / "myapp.user-stream.stream.conf.j2"
+        stream_tpl.write_text(
+            "server {\n"
+            "    listen 7687 ssl;\n"
+            "    server_name myapp-streamuser-0--bolt.localhost;\n"
+            "}\n"
+        )
+        provisioner.register_user(
+            user_name="streamuser",
+            service_name="myapp",
+            label="0",
+            compose_template=COMPOSE_TEMPLATE,
+            nginx_template=NGINX_TEMPLATE,
+            nginx_conf_templates=[NGINX_TEMPLATE, str(stream_tpl)],
+            output_dir=self.tmp_path,
+            nginx_output_dir=self.tmp_path,
+            user_data_dir=self.user_data_dir,
+        )
+        rendered = self.tmp_path / "myapp.user-streamuser.0.stream.conf"
+        assert rendered.exists(), (
+            "the stream conf the deploy carried must be rendered on disk — recording "
+            "its path without writing the file is the defect; tree: "
+            f"{sorted(p.name for p in self.tmp_path.iterdir())}"
+        )
+        assert "myapp-streamuser-0--bolt.localhost" in rendered.read_text()
+        entry = registry.get_user_service("streamuser", "myapp", "0")
+        assert entry["stream_sub_services"] == ["myapp-streamuser-0--bolt.localhost"], entry
+
     # ── rebuild_user ───────────────────────────────────────────
 
     def test_rebuild_uses_per_user_env_from_registry(self):
@@ -2652,7 +2801,10 @@ class TestProvisionerEnvFile:
 
         entry = registry.get_user_service("httpsuser", "myapp", "0")
         assert entry is not None
-        assert entry.get("https") is True
+        # The record's toggle is `tls` (ruled 2026-10-10, renamed from `https`);
+        # the old name must no longer be written, or the rename buys nothing.
+        assert entry.get("tls") is True
+        assert "https" not in entry
 
         ssl_cert = entry.get("ssl_certificate_path", "")
         ssl_key = entry.get("ssl_certificate_key_path", "")
@@ -2691,7 +2843,8 @@ class TestProvisionerEnvFile:
 
         entry = registry.get_user_service("barehttps", "myapp", "0")
         assert entry is not None
-        assert entry.get("https") is True
+        assert entry.get("tls") is True
+        assert "https" not in entry
 
         ssl_cert = entry.get("ssl_certificate_path", "")
         ssl_key = entry.get("ssl_certificate_key_path", "")
@@ -2770,7 +2923,7 @@ class TestProvisionerEnvFile:
 
         entry = registry.get_user_service("nohttps", "myapp", "0")
         assert entry is not None
-        assert entry.get("https") is False
+        assert entry.get("tls") is False
         assert entry.get("ssl_certificate_path") == ""
         assert entry.get("ssl_certificate_key_path") == ""
 
@@ -3028,6 +3181,50 @@ class TestProvisionerEnvFile:
         )
         down_calls = [c for c in self.calls if "down" in c]
         assert len(down_calls) >= 1, "Expected compose_down to be called during removal"
+
+    def test_the_delete_passes_the_instance_profiles_to_compose_down(self, monkeypatch):
+        """R4-F59 — a profile-gated service survives a delete without `--profile`.
+
+        `docker compose down` acts on the services in the ACTIVE profile set, and
+        a service gated by `profiles: [x]` is not in the default set. Measured
+        2026-10-11 on `shared2/graphiti-local/2` (deployed with the `falkordb`
+        profile): the registry entry went, two of the four containers went, and
+        `…-falkordb` / `…-graph-falkordb` stayed `Up` while their network was
+        removed underneath them. §10's step 11 expects the stack to be HEALTHY
+        after a delete, so this is that step failing.
+        """
+        from lib import docker_ops, provisioner, registry
+        monkeypatch.setattr(docker_ops, "network_disconnect", lambda *a, **k: None)
+        monkeypatch.setattr(docker_ops, "nginx_reload", lambda *a, **k: None)
+        monkeypatch.setattr(docker_ops, "remove_project_volumes", lambda *a, **k: [])
+        monkeypatch.setattr(provisioner, "_purge_user_artifacts", lambda *a, **k: None)
+        seen: dict = {}
+
+        def _down(compose_file, **kw):
+            seen.update(kw)
+            seen["compose_file"] = compose_file
+
+        monkeypatch.setattr(docker_ops, "compose_down", _down)
+
+        # An entry with a profile, exactly as register_user records it.
+        entry = {
+            "user_name": "profuser", "service_name": "myapp", "label": "0",
+            "compose_file_path": str(self.tmp_path / "docker-compose.user-profuser.0.yml"),
+            "network_name": "subnet-acl-myapp-user_profuser-0",
+            "profiles": ["falkordb"],
+        }
+        (self.tmp_path / "docker-compose.user-profuser.0.yml").write_text("services: {}\n")
+        monkeypatch.setattr(registry, "get_user_service", lambda *a, **k: entry)
+        monkeypatch.setattr(registry, "remove_user_service", lambda *a, **k: True)
+
+        provisioner.remove_user(
+            user_name="profuser", service_name="myapp", label="0",
+            nginx_container="subnet-acl-nginx",
+        )
+
+        assert seen.get("profiles") == ["falkordb"], (
+            "the entry's profiles must reach compose_down, or the profiled "
+            f"containers are never selected for teardown: {seen}")
 
 
 # ---------------------------------------------------------------------------
@@ -3850,6 +4047,9 @@ class TestCheckMissingFiles:
         svc_dir = tmp_path / "myapp"
         svc_dir.mkdir()
         (svc_dir / "docker-compose.yml").write_text("services:\n  web:\n    build: .")
+        # A complete recipe carries the serving-ports artifact too (R1.1/G20):
+        # without it the recipe cannot deploy, so "nothing missing" needs it.
+        (svc_dir / "serving_ports.yml").write_text("ports: []\n")
         (svc_dir / "nginx.conf").write_text("server { listen 80; }")
         (svc_dir / "Dockerfile").write_text("FROM python:3.13")
         (svc_dir / ".env").write_text("DEBUG=true")
@@ -3864,7 +4064,10 @@ class TestCheckMissingFiles:
             data = response.json()
             assert data["ready"] is True
             assert data["missing"] == []
-            assert len(data["existing"]) == 4
+            # FOUR became FIVE with the serving-ports artifact (R1.1/G20): it is
+            # demanded exactly as the compose and the nginx conf are.
+            assert len(data["existing"]) == 5
+            assert "serving_ports" in data["existing"]
         finally:
             api.SOURCE_PROJECTS_DIR = original
 
@@ -3880,6 +4083,9 @@ class TestCheckMissingFiles:
             "services:\n  web:\n    image: nginx:${TAG}"
         )
         (svc_dir / "nginx.conf.j2").write_text("server { server_name {{ hostname }}; }")
+        # ...and the serving-ports artifact (a template counts for presence, but
+        # the artifact is demanded all the same — R1.1/G20).
+        (svc_dir / "serving_ports.yml").write_text("ports: []\n")
         (svc_dir / "Dockerfile").write_text("FROM python:3.13")
 
         original = api.SOURCE_PROJECTS_DIR
@@ -3907,6 +4113,9 @@ class TestCheckMissingFiles:
         svc_dir = tmp_path / "novars"
         svc_dir.mkdir()
         (svc_dir / "docker-compose.yml").write_text("services:\n  web:\n    image: nginx:alpine")
+        # A complete recipe carries the serving-ports artifact too (R1.1/G20):
+        # without it the recipe cannot deploy, so "nothing missing" needs it.
+        (svc_dir / "serving_ports.yml").write_text("ports: []\n")
         (svc_dir / "nginx.conf").write_text("server { listen 80; }")
         (svc_dir / "Dockerfile").write_text("FROM python:3.13")
 
@@ -3934,6 +4143,8 @@ class TestCheckMissingFiles:
         recipe_dir.mkdir(parents=True)
         # Root has nothing deployable; the recipe subdir has all essential files
         (recipe_dir / "docker-compose.yml").write_text("services:\n  web:\n    build: .")
+        # A complete recipe carries the serving-ports artifact too (R1.1/G20).
+        (recipe_dir / "serving_ports.yml").write_text("ports: []\n")
         (recipe_dir / "nginx.conf").write_text("server { listen 80; }")
         (recipe_dir / "Dockerfile").write_text("FROM python:3.13")
         (recipe_dir / ".env").write_text("DEBUG=true")
@@ -3948,7 +4159,10 @@ class TestCheckMissingFiles:
             data = response.json()
             assert data["ready"] is True
             assert data["missing"] == []
-            assert len(data["existing"]) == 4
+            # FOUR became FIVE with the serving-ports artifact (R1.1/G20): it is
+            # demanded exactly as the compose and the nginx conf are.
+            assert len(data["existing"]) == 5
+            assert "serving_ports" in data["existing"]
         finally:
             api.SOURCE_PROJECTS_DIR = original
 
@@ -3960,7 +4174,9 @@ class TestCheckMissingFiles:
         svc_dir = tmp_path / "multisvc"
         svc_dir.mkdir()
         (svc_dir / "docker-compose.yml").write_text("services:\n  web:\n    build: .")
-
+        # A complete recipe carries the serving-ports artifact too (R1.1/G20):
+        # without it the recipe cannot deploy, so "nothing missing" needs it.
+        (svc_dir / "serving_ports.yml").write_text("ports: []\n")
         original = api.SOURCE_PROJECTS_DIR
         try:
             api.SOURCE_PROJECTS_DIR = tmp_path
@@ -3997,7 +4213,10 @@ class TestCheckMissingFiles:
             # No compose in the recipe → no interpolation → .env not required
             assert data["needs_env"] is False
             assert ".env" not in data["missing"]
-            assert len(data["missing"]) == 3
+            # FOUR, not three: the serving-ports artifact is demanded with the
+            # rest (R1.1/G20), so an empty recipe misses it too.
+            assert len(data["missing"]) == 4
+            assert "serving_ports" in data["missing"]
         finally:
             api.SOURCE_PROJECTS_DIR = original
 
@@ -4206,7 +4425,13 @@ class TestV5PortalDDeprecated:
         """nginx.provision.conf has NO portal.d include and keeps services.d + 444."""
         repo = Path(__file__).resolve().parents[2]  # _users_provision
         conf = (repo / "nginx.provision.conf").read_text()
-        assert "include /etc/nginx/services.d/*.conf;" in conf
+        # F21 (2026-10-10): the http include is CATEGORY-narrowed. `*.conf` also
+        # matched the stream category (`<svc>.user-<user>.<label>.stream.conf`),
+        # so the first stream conf made nginx refuse the WHOLE configuration —
+        # platform-wide, and a restart (not a reload) is what surfaces it.
+        assert "include /etc/nginx/services.d/*.nginx.conf;" in conf
+        assert "include /etc/nginx/services.d/*.conf;" not in conf, (
+            "the category-blind glob is what loaded a stream conf into http")
         assert "include /etc/nginx/portal.d" not in conf
         assert "include /etc/nginx/env.d" not in conf
         assert "listen 80 default_server;" in conf
@@ -4536,10 +4761,20 @@ class TestEdgeTemplate:
         the image-baked placeholder (satisfies nginx startup only)."""
         content = EDGE_TEMPLATE_FILE.read_text()
         assert "map $ssl_server_name $cert_pem" in content
-        assert "default     /etc/nginx/acl/placeholder/fullchain.pem;" in content
-        assert "~^(?<d>.+)$ /certs/$d/fullchain.pem;" in content
+        # Whitespace-insensitive on purpose: the point is the VALUE (the
+        # image-baked placeholder, decision 11), and the alignment of the map
+        # body changed when T4 lengthened the pattern. Pinning padding would
+        # make a formatting change look like a behavioural one.
+        assert " /etc/nginx/acl/placeholder/fullchain.pem;" in content
+        assert "default" in content.split("map $ssl_server_name $cert_pem")[1].split("}")[0]
+        # T4 (2026-10-10): the key is DOMAIN-AGNOSTIC — it drops the first label
+        # and takes the rest as the domain, so the ONE wildcard per domain serves
+        # every name under it (and a name that is not one label under a domain
+        # falls to the placeholder → its handshake fails, fail-closed).
+        assert "~^(?<rest>[^.]+)\\.(?<d>.+)$ /certs/$d/fullchain.pem;" in content
+        assert "~^(?<d>.+)$ /certs/$d/fullchain.pem;" not in content, "the old full-SNI key must be gone"
         assert "map $ssl_server_name $cert_key" in content
-        assert "default     /etc/nginx/acl/placeholder/privkey.pem;" in content
+        assert " /etc/nginx/acl/placeholder/privkey.pem;" in content
 
     def test_portal_blocks(self):
         """§4.3 portal: host + verify/exchange 404 (GAP-31), /api/ SSE timeout,
@@ -4567,7 +4802,12 @@ class TestEdgeTemplate:
         assert "error_page 401 = @auth_401;" in content
         assert "error_page 403 = @auth_403;" in content
         assert 'proxy_set_header Authorization "Basic $service_basic";' in content
-        assert "proxy_set_header Host $host;" in content
+        # R4-F63 — the client's Host WITH its port, via the `$forwarded_host` map
+        # (`$http_host`, falling back to `$host` when the client sent none).
+        # `$host` alone strips the port, and an application that builds an
+        # absolute URL from the host it was given then names the scheme's
+        # default port — a dead end on a remapped edge port.
+        assert "proxy_set_header Host $forwarded_host;" in content
         assert "include /etc/nginx/acl/acl-helpers.conf;" in content
         # Internal proxy mirroring the client scheme (decision 14 double TLS).
         assert "proxy_pass http://subnet-acl-nginx;" in content
@@ -4607,14 +4847,26 @@ class TestEdgeTemplate:
 
     def test_acl_off_preserves_host_header(self):
         """§8.4 (B5): in ACL-off the edge is a transparent pass-through — it MUST
-        set `proxy_set_header Host $host;` on BOTH the http and https service
-        servers, otherwise nginx's default `Host $proxy_host` forwards the
-        upstream IP and the internal nginx's server_name routing fails (falls to
-        the `return 444` catch-all) — live-verified regression."""
+        forward the CLIENT's Host on BOTH the http and https service servers,
+        otherwise nginx's default `Host $proxy_host` forwards the upstream IP and
+        the internal nginx's server_name routing fails (falls to the `return 444`
+        catch-all) — live-verified regression.
+
+        R4-F63 (2026-10-11): the value is `$forwarded_host` — a map over
+        `$http_host` (`$host` when the client sent no Host at all). The claim is
+        unchanged and strictly stronger: the client's host still arrives, now
+        with its port, so an application that builds an absolute URL from it
+        names the port it was actually reached on. nginx's server_name matching
+        strips a port, so the internal router still matches.
+        """
         content = EDGE_TEMPLATE_FILE.read_text()
         # Four service servers (http+https × ACL-on+ACL-off); every one of them
-        # must preserve the original Host so the internal router can match.
-        assert content.count("proxy_set_header Host $host;") == 4
+        # must preserve the client's Host so the internal router can match.
+        assert content.count("proxy_set_header Host $forwarded_host;") == 4
+        assert content.count("proxy_set_header Host $host;") == 0, (
+            "the auth subrequest's $host lives in the acl-helpers include, not here")
+        assert "map $http_host $forwarded_host" in content, (
+            "the map is what keeps a Host-less client from forwarding an empty header")
 
     def test_multi_location_gate_no_service_bypass(self):
         """GAP-13: the gate runs at the edge BEFORE internal routing. Inside the
@@ -5497,3 +5749,716 @@ class TestFailureReasonTravelsWithTheError:
         provisioner._mark_failed("alice", "myapp", "0", "deploy",
                                  "at capacity: 4 task(s) running (limit 4)")
         assert registry.get_user("alice")[0]["failure"]["reason"] == "at_capacity"
+
+
+class TestTlsToggle:
+    """T17 / R9.1 — `https` becomes `tls`, and BOTH incoherent combinations are loud.
+
+    The old shape had one real footgun: certificates supplied with the toggle OFF
+    were silently ignored, so an operator could believe an instance was TLS-enabled
+    while it served plain HTTP. That silence is what this test exists to prevent.
+    `https` stays as a deprecated alias for one round: both keys, one value.
+    """
+
+    _CERT = {"fullchain": "/certs/example.com/fullchain.pem", "privkey": "/certs/example.com/privkey.pem"}
+    _BASE = {"service_name": "svc", "user_name": "alice", "compose_file_path": "/tmp/c.yml"}
+
+    def test_tls_true_requires_both_certs(self):
+        from pydantic import ValidationError
+        from api import RegisterRequest
+        try:
+            RegisterRequest(**self._BASE, tls=True)
+            raised = False
+        except ValidationError as e:
+            raised = True
+            assert "fullchain is required when tls=True" in str(e), str(e)
+        assert raised
+
+    def test_certs_with_tls_false_is_an_error_not_silence(self):
+        """The footgun: certs + tls=false used to be accepted and ignored."""
+        from pydantic import ValidationError
+        from api import RegisterRequest
+        try:
+            RegisterRequest(**self._BASE, tls=False, **self._CERT)
+            raised = False
+        except ValidationError as e:
+            raised = True
+            assert "tls=false" in str(e), str(e)
+        assert raised, "certs with the toggle off must be refused, never silently ignored"
+
+    def test_the_https_alias_still_works(self):
+        from pydantic import ValidationError
+        from api import RegisterRequest
+        # the alias resolves to the same requirement...
+        try:
+            RegisterRequest(**self._BASE, https=True)
+            raised = False
+        except ValidationError as e:
+            raised = True
+            assert "fullchain is required when tls=True" in str(e)
+        assert raised
+        # ...and the same acceptance.
+        req = RegisterRequest(**self._BASE, https=True, **self._CERT)
+        assert req.tls is True
+
+    def test_disagreeing_aliases_are_refused(self):
+        from pydantic import ValidationError
+        from api import RegisterRequest
+        try:
+            RegisterRequest(**self._BASE, tls=True, https=False, **self._CERT)
+            raised = False
+        except ValidationError as e:
+            raised = True
+            assert "disagree" in str(e), str(e)
+        assert raised, "a caller that says two things is not a caller to guess for"
+
+    def test_tls_true_with_both_certs_is_accepted(self):
+        from api import RegisterRequest
+        req = RegisterRequest(**self._BASE, tls=True, **self._CERT)
+        assert req.tls is True and req.fullchain and req.privkey
+
+
+class TestStreamConfConversion:
+    """T18 / R9.2 + GRILLING G42.1 — the stream conf's OWN conversion.
+
+    Running a stream conf through the http converter is a measured defect, not a
+    style question: it wraps the TLS block in an ssl guard (the block's TLS
+    listener is structural and the file's existence is the switch), injects
+    `auth_basic` (a directive the stream module does not have — the conf FAILS
+    `nginx -t` for a password-protected instance, and passes for an unprotected
+    one, the worst kind of conditional defect), and rewrites `server_name` to the
+    instance host where the block must be selected by the CANONICAL NAME.
+    """
+
+    _CONF = """server {
+    listen              7687 ssl;
+    server_name         example-mcp-alice-3--fastapi-app.snaprovision.com;
+    ssl_certificate     /srv/provision_subnet_acl/ssl/snaprovision.com/fullchain.pem;
+    ssl_certificate_key /srv/provision_subnet_acl/ssl/snaprovision.com/privkey.pem;
+    allow               172.17.0.0/16;
+    deny                all;
+    resolver            127.0.0.11 valid=30s ipv6=off;
+    set $stream_upstream fastapi-app:8100;
+    proxy_pass          $stream_upstream;
+}
+"""
+
+    def test_the_stream_conversion_applies_only_what_applies(self):
+        from lib.nginx_converter import convert_stream_conf
+        out = convert_stream_conf(self._CONF, "example-mcp", ["fastapi-app"])
+        # the two http-only transformations are NOT applied
+        assert "{% if tls %}" not in out and "{% if https %}" not in out, "no ssl guard"
+        assert "auth_basic" not in out, "the stream module has no auth_basic"
+        assert "example-mcp-alice-3--fastapi-app.snaprovision.com" in out, (
+            "server_name stays the canonical name — it is what the edge dials")
+        # the two that do apply
+        assert "ssl_certificate     {{ ssl_certificate_path }};" in out
+        assert "ssl_certificate_key {{ ssl_certificate_key_path }};" in out
+        assert "set $stream_upstream {{ container_prefix }}fastapi-app:8100;" in out
+        # and everything structural is left alone
+        assert "listen              7687 ssl;" in out
+        assert "allow               172.17.0.0/16;" in out
+        assert "resolver            127.0.0.11 valid=30s ipv6=off;" in out
+        assert "proxy_pass          $stream_upstream;" in out
+
+    def test_an_unknown_upstream_host_is_left_alone(self):
+        from lib.nginx_converter import convert_stream_conf
+        conf = self._CONF.replace("fastapi-app:8100", "some-external-host:6379")
+        out = convert_stream_conf(conf, "svc", ["fastapi-app"])
+        assert "some-external-host:6379" in out and "{{ container_prefix }}" not in out
+
+    def test_the_http_converter_would_have_broken_it(self):
+        """The regression this check exists to prevent, stated as a comparison."""
+        from lib.nginx_converter import convert_nginx, convert_stream_conf
+        http_out = convert_nginx(self._CONF, "example-mcp", ["fastapi-app"])
+        assert "{% if tls %}" in http_out or "{% if https %}" in http_out or "auth_basic" in http_out, (
+            "the http path must still do its http-only work — this asserts the two "
+            "paths really are different, so the stream path is not redundant")
+        assert "{% if" not in convert_stream_conf(self._CONF, "example-mcp", ["fastapi-app"])
+
+
+class TestRenderedConfNames:
+    """R9.2 — the rendered conf's name is decided by its CATEGORY (the file name).
+
+    Load-bearing, not cosmetic: the internal nginx's `stream` block includes
+    `*.stream.conf`, so a stream conf under any other name has no route at all.
+    """
+
+    def test_stream_and_http_and_mail(self):
+        from lib.template_engine import rendered_conf_name as n
+        assert n("svc", "alice", "3", "nginx.base.355.conf.j2") == "svc.user-alice.3.nginx.conf"
+        assert n("svc", "alice", "3", "example.nginx.conf.j2") == "svc.user-alice.3.nginx.conf"
+        assert n("svc", "alice", "3", "x.stream.conf.j2") == "svc.user-alice.3.stream.conf"
+        assert n("svc", "alice", "3", "x.mail.conf.j2") == "svc.user-alice.3.mail.conf"
+
+    def test_the_stream_name_is_what_the_include_matches(self):
+        """The contract, stated as the include sees it."""
+        from lib.template_engine import rendered_conf_name as n
+        name = n("example-mcp", "alice", "3", "x.stream.conf.j2")
+        assert name.endswith(".stream.conf")
+        # the internal nginx includes exactly this pattern
+        from pathlib import Path
+        conf = Path(__file__).resolve().parents[2] / "nginx.provision.conf"
+        assert "include ${GENERATED_DIR}/*.stream.conf;" in conf.read_text()
+
+
+class TestTheConfSlotList:
+    """R9.2 — the payload's conf slot is a LIST that generalises the single field."""
+
+    def test_the_list_and_the_singles_are_mutually_exclusive(self):
+        from pydantic import ValidationError
+        from api import RegisterRequest
+        base = {"service_name": "svc", "user_name": "alice", "compose_file_path": "/tmp/c.yml"}
+        try:
+            RegisterRequest(**base, nginx_conf_file_path="/tmp/a.conf", nginx_conf_file_paths=["/tmp/b.conf"])
+            raised = False
+        except ValidationError as e:
+            raised = True
+            assert "mutually exclusive" in str(e)
+        assert raised
+
+    def test_a_single_field_normalises_to_a_one_element_list(self):
+        """The downstream code sees one shape; the normalisation is in the handler,
+        so this asserts the CONTRACT the handler relies on."""
+        from api import RegisterRequest
+        base = {"service_name": "svc", "user_name": "alice", "compose_file_path": "/tmp/c.yml"}
+        single = RegisterRequest(**base, nginx_conf_file_path="/tmp/a.conf")
+        listed = RegisterRequest(**base, nginx_conf_file_paths=["/tmp/a.conf", "/tmp/b.stream.conf"])
+        assert (single.nginx_conf_file_paths or []) == []
+        assert listed.nginx_conf_file_paths == ["/tmp/a.conf", "/tmp/b.stream.conf"]
+
+
+class TestDeleteRemovesEveryRecordedConf:
+    """R7.1's -api half — and why it is safety, not tidiness.
+
+    A leftover stream conf names an upstream container that no longer exists, and
+    the internal nginx resolves literal upstreams at CONFIG-PARSE time: the next
+    restart of that container fails (`host not found in upstream`) and takes every
+    service down with it. Measured 2026-10-10 while testing the minimal door.
+    """
+
+    def test_the_sweep_walks_the_recorded_list(self, tmp_path):
+        import lib.provisioner as prov
+        from pathlib import Path
+
+        # two rendered confs, as T18's deploy records them
+        http_conf = tmp_path / "svc.user-alice.3.nginx.conf"
+        stream_conf = tmp_path / "svc.user-alice.3.stream.conf"
+        for p in (http_conf, stream_conf):
+            p.write_text("x")
+            Path(str(p) + ".generated").write_text("")
+
+        entry = {
+            "nginx_conf_path": str(http_conf),
+            "nginx_conf_paths": [str(http_conf), str(stream_conf)],
+        }
+        # the removal block, exercised exactly as the delete path runs it
+        for key in ("compose_file_path", "nginx_conf_path", "htpasswd_path"):
+            fpath = entry.get(key, "")
+            if fpath:
+                Path(fpath).unlink(missing_ok=True)
+                Path(str(fpath) + ".generated").unlink(missing_ok=True)
+        for fpath in (entry.get("nginx_conf_paths") or []):
+            if fpath:
+                Path(fpath).unlink(missing_ok=True)
+                Path(str(fpath) + ".generated").unlink(missing_ok=True)
+
+        assert not http_conf.exists()
+        assert not stream_conf.exists(), "the stream conf must go with the instance"
+        assert not Path(str(stream_conf) + ".generated").exists()
+
+
+class TestWildcardOnlyUploads:
+    """T19 / R9.4 — the certificate upload path accepts WILDCARDS only.
+
+    The exposure handle is minted AFTER the certificate exists ("the name comes
+    only after selecting the certs, never the reverse" — G41), so the only shape
+    the platform can use is `*.<domain>`: one certificate per domain, covering
+    every one-label name under it. A single-host certificate would be unusable,
+    and saying so AT UPLOAD TIME is the whole point — the alternative is a
+    handshake that presents nothing, discovered later by a client.
+    """
+
+    def _cert(self, path, cn, san=None, days=2):
+        import subprocess
+        args = ["openssl", "req", "-x509", "-nodes", "-newkey", "rsa:2048", "-days", str(days),
+                "-keyout", str(path) + ".key", "-out", str(path), "-subj", f"/CN={cn}"]
+        if san:
+            args += ["-addext", f"subjectAltName={san}"]
+        subprocess.run(args, capture_output=True, timeout=30)
+        return Path(path).read_text()
+
+    def test_the_parser_reads_the_names(self, tmp_path):
+        from api import _cert_dns_names
+        wildcard = self._cert(tmp_path / "w.pem", "*.example.com", "DNS:*.example.com")
+        single = self._cert(tmp_path / "s.pem", "example.com", "DNS:example.com")
+        assert _cert_dns_names(wildcard) == ["*.example.com"]
+        assert _cert_dns_names(single) == ["example.com"]
+        assert _cert_dns_names("not a pem") == []
+
+    def _upload(self, tmp_path, monkeypatch, cert_pem):
+        import api
+        from api import SSLCertUploadRequest, upload_ssl_cert
+        monkeypatch.setattr(api, "SSL_DIR", tmp_path, raising=False)
+        return upload_ssl_cert(SSLCertUploadRequest(
+            domain="example.com", fullchain=cert_pem,
+            privkey="-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----\n",
+        ))
+
+    def test_a_single_host_certificate_is_refused_with_a_reason(self, tmp_path, monkeypatch):
+        from fastapi import HTTPException
+        pem = self._cert(tmp_path / "s2.pem", "example.com", "DNS:example.com")
+        try:
+            self._upload(tmp_path, monkeypatch, pem)
+            raised = None
+        except HTTPException as e:
+            raised = e
+        assert raised is not None and raised.status_code == 400
+        assert "WILDCARD" in raised.detail and "example.com" in raised.detail, (
+            "the refusal must say what is wrong AND why the platform needs a wildcard")
+        assert not (tmp_path / "example.com" / "fullchain.pem").exists(), (
+            "nothing is persisted for a refused upload")
+        # R2-F5 — the weaker form of this assertion ("no fullchain.pem") passed
+        # while the handler still created the domain DIRECTORY before validating,
+        # so the store grew an empty `ssl/example.com/`. "Untouched" means no
+        # trace of the attempt, so the directory is asserted too.
+        assert not (tmp_path / "example.com").exists(), (
+            "a refused upload must not touch the store at all — not even by "
+            "creating the domain directory")
+
+    def test_a_refused_path_mode_upload_leaves_no_source_marker(self, tmp_path, monkeypatch):
+        """R2-F5, path mode. `.source_path` used to be written BEFORE the wildcard
+        check, so a refusal left both the directory and the marker behind."""
+        import api
+        from api import SSLCertUploadRequest, upload_ssl_cert
+        from fastapi import HTTPException
+        src = tmp_path / "src"
+        src.mkdir()
+        pem = self._cert(tmp_path / "s3.pem", "example.com", "DNS:example.com")
+        (src / "fullchain.pem").write_text(pem)
+        (src / "privkey.pem").write_text("-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----\n")
+        ssl_dir = tmp_path / "ssl"
+        ssl_dir.mkdir()
+        monkeypatch.setattr(api, "SSL_DIR", ssl_dir, raising=False)
+        import pytest
+        with pytest.raises(HTTPException):
+            upload_ssl_cert(SSLCertUploadRequest(domain="example.com", ssl_path=str(src)))
+        assert list(ssl_dir.iterdir()) == [], (
+            "a refused path-mode upload leaves the store empty — no directory, "
+            "no `.source_path`")
+
+    def test_an_unreadable_certificate_is_refused(self, tmp_path, monkeypatch):
+        from fastapi import HTTPException
+        try:
+            self._upload(tmp_path, monkeypatch, "not a certificate at all")
+            raised = None
+        except HTTPException as e:
+            raised = e
+        assert raised is not None and raised.status_code == 400, (
+            "fail-closed: an unreadable certificate cannot be shown to be a wildcard")
+
+    def test_a_wildcard_certificate_is_accepted(self, tmp_path, monkeypatch):
+        pem = self._cert(tmp_path / "w2.pem", "*.example.com", "DNS:*.example.com")
+        result = self._upload(tmp_path, monkeypatch, pem)
+        assert result["domain"] == "example.com"
+        assert Path(result["fullchain_path"]).is_file()
+
+
+class TestTheReservedSeparator:
+    """T16 / R1.5 — `--` is reserved, so the served name always parses.
+
+    `<instance host>--<sub_service>.<domain>` is one label carrying TWO facts. If
+    a component could contain `--`, a reader (or the card, or the gateway's
+    hostname index) could not tell where the instance ends and the sub-service
+    begins — so the character sequence is refused at validation, before anything
+    is stored.
+    """
+
+    def test_a_name_with_the_separator_is_refused(self):
+        from lib.validation import validate_name, ValidationError
+        import pytest
+        for bad in ("my--svc", "svc--", "--svc"):
+            with pytest.raises(ValidationError):
+                validate_name(bad, "service_name")
+
+    def test_ordinary_names_still_pass(self):
+        from lib.validation import validate_name
+        for good in ("alice", "example-service", "graphiti-local", "a_b-1", "shared2"):
+            assert validate_name(good, "service_name") == good
+
+    def test_the_served_name_is_one_label_below_the_domain(self):
+        """The property the whole naming scheme rests on: every platform name is
+        exactly ONE label under the domain, which is what lets a single wildcard
+        certificate serve all of them."""
+        from lib.validation import validate_name
+        host = f"{validate_name('example-mcp','s')}-{validate_name('alice','u')}-3"
+        domain = "snaprovision.com"
+        served = f"{host}--neo4j.{domain}"
+        # ONE label under the domain: the label itself contains no dot, and the
+        # domain's own dots are all that remain.
+        label = served.split(".", 1)[0]
+        assert "." not in label, label
+        assert served.count(".") == domain.count(".") + 1, served
+        left, right = label.split("--", 1)
+        assert left == host and right == "neo4j", (left, right)
+
+
+class TestTheRecordedHttpEndpoints:
+    """R1.5 / R6.2 — the EXTRA http endpoints, read from the RENDERED conf.
+
+    The card lists one `/go/` row per exposed HTTP endpoint, keyed by the
+    sub-service (the primary keyed `primary`), and R6.2 says every row is read
+    from the artifacts — never typed. So the entry must RECORD the names, and it
+    records what the internal nginx actually routes: the served names of the
+    rendered conf.
+    """
+
+    def _pairs(self, tmp_path, conf_text, name="svc.user-alice.0.nginx.conf"):
+        p = tmp_path / name
+        p.write_text(conf_text)
+        return [(name, str(p))]
+
+    def test_the_extras_are_recorded_and_the_primary_is_not(self, tmp_path):
+        from lib.provisioner import _http_endpoints
+        conf = (
+            "server {\n listen 80;\n server_name web-alice-0.snaprovision.com;\n}\n"
+            "server {\n listen 80;\n server_name web-alice-0--neo4j.snaprovision.com;\n}\n"
+            "server {\n listen 80;\n server_name web-alice-0--mcp.snaprovision.com;\n}\n"
+        )
+        assert _http_endpoints(self._pairs(tmp_path, conf), "web-alice-0") == [
+            "web-alice-0--neo4j.snaprovision.com",
+            "web-alice-0--mcp.snaprovision.com",
+        ]
+
+    def test_another_instance_s_name_is_not_mistaken_for_one_of_ours(self, tmp_path):
+        """The prefix is the whole identity, so another instance cannot shadow it."""
+        from lib.provisioner import _http_endpoints
+        conf = "server {\n listen 80;\n server_name other-alice-0--neo4j.localhost;\n}\n"
+        assert _http_endpoints(self._pairs(tmp_path, conf), "web-alice-0") == []
+
+    def test_a_stream_conf_is_not_read_as_http(self, tmp_path):
+        from lib.provisioner import _http_endpoints
+        conf = "server {\n listen 7687 ssl;\n server_name web-alice-0--bolt.snaprovision.com;\n}\n"
+        pairs = self._pairs(tmp_path, conf, name="svc.user-alice.0.stream.conf")
+        assert _http_endpoints(pairs, "web-alice-0") == []
+
+    def test_a_generated_http_conf_is_read(self, tmp_path):
+        """The generated name carries the job token — `nginx.base.<job>.conf`.
+
+        Matching a fixed suffix (`.nginx.conf`) missed every generated conf, so a
+        real deployment that served both extra endpoints recorded neither
+        (measured 2026-10-10). The category is "a conf that is not the stream
+        kind", which is also how the -api picks the renderer.
+        """
+        from lib.provisioner import _http_endpoints
+        conf = "server {\n listen 80;\n server_name web-alice-0--neo4j.snaprovision.com;\n}\n"
+        pairs = self._pairs(tmp_path, conf, name="nginx.base.371.conf")
+        assert _http_endpoints(pairs, "web-alice-0") == [
+            "web-alice-0--neo4j.snaprovision.com"]
+
+    def test_an_absent_rendered_conf_records_nothing(self, tmp_path):
+        from lib.provisioner import _http_endpoints
+        pairs = [("x.nginx.conf", str(tmp_path / "missing.conf"))]
+        assert _http_endpoints(pairs, "web-alice-0") == []
+
+
+class TestTheEndpointsAreRecordedAfterTheRender:
+    """R3-F53 — the recorded endpoints are read from confs that now exist.
+
+    The registry entry is built BEFORE the per-user confs are rendered, so a
+    reader that runs while the entry is assembled reads files that are not there
+    yet and records nothing — measured 2026-10-10 on a live deployment that
+    served two extra http endpoints and recorded none, and on the stream side
+    (R6.1) for the same reason. The lists are therefore recomputed from the
+    rendered confs once they are on disk, which is what this asserts.
+    """
+
+    def test_the_reader_updates_the_entry_from_the_rendered_files(self, tmp_path):
+        import json
+        from lib import provisioner, registry
+
+        reg = tmp_path / "user_registry.yml"
+        reg.write_text(json.dumps([
+            {"user_name": "alice", "service_name": "web", "label": "0",
+             "status": "building", "stream_sub_services": [], "http_endpoints": []},
+        ]))
+        rendered = tmp_path / "generated"
+        rendered.mkdir()
+        (rendered / "web.user-alice.0.nginx.conf").write_text(
+            "server {\n listen 80;\n server_name web-alice-0--neo4j.snaprovision.com;\n}\n")
+        (rendered / "web.user-alice.0.stream.conf").write_text(
+            "server {\n listen 7687 ssl;\n server_name web-alice-0--bolt.localhost;\n}\n")
+        pairs = [
+            ("nginx.base.9.conf", str(rendered / "web.user-alice.0.nginx.conf")),
+            ("web.user-alice.0.stream.conf.j2", str(rendered / "web.user-alice.0.stream.conf")),
+        ]
+        original_load, original_save = registry._load, registry._save
+        monkeypatch_registry = None
+        try:
+            provisioner.registry._load = lambda: json.loads(reg.read_text())
+            provisioner.registry._save = lambda users: reg.write_text(json.dumps(users))
+            provisioner._update_registry_endpoints("alice", "web", "0", pairs, "web-alice-0")
+        finally:
+            provisioner.registry._load = original_load
+            provisioner.registry._save = original_save
+
+        entry = json.loads(reg.read_text())[0]
+        assert entry["http_endpoints"] == ["web-alice-0--neo4j.snaprovision.com"], entry
+        assert entry["stream_sub_services"] == ["web-alice-0--bolt.localhost"], entry
+
+
+class TestTheRecordsTlsSwitch:
+    """The record's toggle is `tls` — renamed from `https` (ruled 2026-10-10).
+
+    Entries written before the rename are read through a fallback kept for ONE
+    round. The read lives in the registry module, which owns the record's shape,
+    so both services carry one rule and removing the fallback later is a one-line
+    change. The gateway has the mirror of this function
+    (`app/services/registry_entry.py`) and the two must agree.
+    """
+
+    def test_the_new_name_is_the_one_that_counts(self):
+        from lib.registry import entry_tls
+        assert entry_tls({"tls": True}) is True
+        assert entry_tls({"tls": False}) is False
+
+    def test_the_old_name_is_still_read_this_round(self):
+        from lib.registry import entry_tls
+        assert entry_tls({"https": True}) is True
+        assert entry_tls({"https": False}) is False
+
+    def test_the_new_name_wins_when_both_are_present(self):
+        from lib.registry import entry_tls
+        assert entry_tls({"tls": False, "https": True}) is False, (
+            "a migrated entry must not be overruled by a stale key")
+
+    def test_anything_unreadable_is_false(self):
+        """Fail-closed: an unreadable flag must never become an accidental TLS."""
+        from lib.registry import entry_tls
+        assert entry_tls({}) is False
+        assert entry_tls(None) is False
+        assert entry_tls({"tls": None}) is False
+
+
+class TestTheAttachmentsAreRepairedWhenTheInternalNginxIsRecreated:
+    """GRILLING G46 / task-doc §4 row 17 — the recovery must be at the trigger.
+
+    The internal nginx's per-user network attachments are IMPERATIVE state:
+    Docker keeps them on the container, and the compose file cannot express them
+    (the per-user networks do not exist when it is written). So a recreate
+    destroys them and every service is unreachable at once.
+
+    Measured 2026-10-11, landing the loopback port policy: a recreate left the
+    container with `subnet_acl_shared` alone and NOTHING repaired it — the
+    gateway's docker-events monitor cannot work (that container mounts no docker
+    socket) and the gateway's periodic reconcile defaults to disabled. Both
+    halves are asserted here: the repair itself, and the trigger that runs it.
+    """
+
+    def test_the_repair_reattaches_every_registry_network(self, monkeypatch):
+        from lib import reconciliation, registry, docker_ops
+        monkeypatch.setattr(registry, "get_all_users", lambda: [
+            {"network_name": "net-a"}, {"network_name": "net-b"},
+            {"network_name": "net-a"},          # duplicate: attached once
+            {"network_name": ""},               # no network: skipped
+        ])
+        calls: list[tuple[str, str]] = []
+        reloads: list[str] = []
+        monkeypatch.setattr(docker_ops, "network_connect",
+                            lambda c, n: calls.append((c, n)))
+        monkeypatch.setattr(docker_ops, "nginx_reload", lambda c: reloads.append(c))
+
+        report = reconciliation.repair_nginx_attachments("nginx-x")
+
+        assert calls == [("nginx-x", "net-a"), ("nginx-x", "net-b")], calls
+        assert reloads == ["nginx-x"], "the repaired routes must be live, not just attached"
+        assert report["total_networks"] == 2 and report["reconnected"] == 2
+
+    def test_a_connect_failure_does_not_stop_the_others(self, monkeypatch):
+        """One unreachable network must not cost the rest their route."""
+        from lib import reconciliation, registry, docker_ops
+        monkeypatch.setattr(registry, "get_all_users", lambda: [
+            {"network_name": "bad"}, {"network_name": "good"},
+        ])
+
+        def _connect(c, n):
+            if n == "bad":
+                raise RuntimeError("no such network")
+
+        monkeypatch.setattr(docker_ops, "network_connect", _connect)
+        monkeypatch.setattr(docker_ops, "nginx_reload", lambda c: None)
+
+        report = reconciliation.repair_nginx_attachments("nginx-x")
+        assert report["reconnected"] == 1, report
+
+    def test_the_watcher_repairs_on_a_start_event(self, monkeypatch):
+        """The trigger: Docker's own `start` event for the internal nginx.
+
+        Driven through the real `watch_for_recreates` with a fake events stream —
+        no docker daemon, and the argv the stream is opened with is asserted, so
+        a filter that stopped matching the container would fail here rather than
+        silently never fire in production.
+        """
+        from lib import reconciliation, registry, docker_ops
+        monkeypatch.setattr(registry, "get_all_users",
+                            lambda: [{"network_name": "net-a"}])
+        calls: list[tuple[str, str]] = []
+        monkeypatch.setattr(docker_ops, "network_connect",
+                            lambda c, n: calls.append((c, n)))
+        monkeypatch.setattr(docker_ops, "nginx_reload", lambda c: None)
+        # The 3 s settle exists so the container's entrypoint finishes; the test
+        # must not pay it.
+        monkeypatch.setattr("time.sleep", lambda _s: None)
+
+        seen: dict = {}
+
+        class _Proc:
+            def __init__(self):
+                self.stdout = iter(["start\n"])
+
+            def terminate(self):
+                seen["terminated"] = True
+
+        import subprocess
+
+        def _popen(cmd, **_kw):
+            seen["cmd"] = cmd
+            return _Proc()
+
+        monkeypatch.setattr(subprocess, "Popen", _popen)
+        reconciliation.watch_for_recreates("nginx-x", _once=True)
+
+        assert calls == [("nginx-x", "net-a")], (
+            "a `start` event must repair the attachments")
+        cmd = seen.get("cmd") or []
+        assert "container=nginx-x" in cmd, cmd
+        assert "event=start" in cmd, cmd
+        # NO `--format`. The event message type has no `.Status` field (it is
+        # `.Action`), so a format string written from the old output shape makes
+        # the CLI exit immediately with `Error parsing format` — with stderr
+        # discarded, the reader then saw a clean end-of-stream and retried
+        # forever. Measured 2026-10-11: the watcher ran for 60 s after a recreate
+        # and repaired nothing. The line content is unused, so the default format
+        # is both sufficient and unbreakable.
+        assert "--format" not in cmd, f"a format string killed this stream once: {cmd}"
+
+
+class TestARenderedConfNeverLeavesAProxyVariableUndefined:
+    """R4-F60 — the renderer must not strip a variable's DEFINITION.
+
+    `strip_v4_scaffold` deletes a bare `set $upstream <target>;` line: a rule
+    written for the v4 ACL scaffold, where that exact line was the scaffold's
+    own. It cannot tell the scaffold's line from a legitimate one, and the
+    generated STREAM conf legitimately used that name — so the definition was
+    removed, `proxy_pass $upstream;` was left dangling, and the internal nginx
+    refused its WHOLE configuration with `unknown "upstream" variable`.
+    Measured live 2026-10-11: the first real deploy that produced a
+    `*.stream.conf` left the stack one reload away from every service being
+    down, not just the stream route.
+
+    The assertion is the INVARIANT rather than a variable name: whatever a
+    template uses in `proxy_pass`, the rendered text must still define it. A
+    name-shaped assertion would pass the next time the same collision is made
+    under a different name.
+    """
+
+    _STREAM = """server {
+    listen              7687 ssl;
+    server_name         graphiti-local-alice-0--neo4j.snaprovision.com;
+    ssl_certificate     {{ ssl_certificate_path }};
+    ssl_certificate_key {{ ssl_certificate_key_path }};
+    allow               172.17.0.0/16;
+    deny                all;
+    resolver            127.0.0.11 valid=30s ipv6=off;
+    set $stream_upstream {{ container_prefix }}neo4j:7687;
+    proxy_pass          $stream_upstream;
+}
+"""
+
+    def test_the_definition_survives_the_render(self, tmp_path):
+        import re
+        from lib import template_engine
+
+        tpl = tmp_path / "x.stream.conf.j2"
+        tpl.write_text(self._STREAM)
+        out = tmp_path / "x.stream.conf"
+        template_engine.render_nginx_conf(
+            str(tpl), str(out), "alice", "graphiti-local", "0", "snaprovision.com", "",
+            https=True,
+            ssl_certificate_path="/srv/ssl/c.pem",
+            ssl_certificate_key_path="/srv/ssl/k.pem",
+        )
+        rendered = out.read_text()
+
+        used = set(re.findall(r"proxy_pass\s+(?:\w+://)?\$([A-Za-z0-9_]+)\s*;", rendered))
+        defined = set(re.findall(r"^\s*set\s+\$([A-Za-z0-9_]+)\s+", rendered, re.MULTILINE))
+        assert used, f"the fixture must exercise a variable proxy_pass: {rendered!r}"
+        assert used <= defined, (
+            "every variable a rendered conf proxies to must still be defined in "
+            f"it — used {sorted(used)}, defined {sorted(defined)}\n{rendered}")
+
+    def test_the_scaffold_rule_still_drops_the_v4_line(self):
+        """The fix must not break the migration the rule exists for."""
+        from lib.template_engine import strip_v4_scaffold
+        v4 = "server {\n    set $upstream myapp-user_alice-0-web:80;\n    proxy_pass $upstream;\n}\n"
+        assert "set $upstream" not in strip_v4_scaffold(v4)
+
+
+class TestTheForwardedHostCarriesThePort:
+    """R4-F63 — `$host` strips the port; the app must be told the URL it was reached at.
+
+    An application that builds an absolute URL from the host it was given — the
+    normal thing to do — produces one naming the scheme's default port when it
+    is handed a portless host. On a deployment whose edge is remapped off 443
+    that is a dead end: measured 2026-10-11 through the card's own `/go/`
+    hand-off, where the app answered `303 … Location: https://<host>/browser/`
+    and the browser got an empty response, while the same redirect at the
+    published port loaded the page.
+
+    The normalisation lives in the renderer, beside the `proxy_pass` rewrite and
+    for the same reason: the renderer owns what the conf becomes, so a template
+    written before this rule is corrected on its next render rather than only in
+    confs generated after it.
+    """
+
+    _TPL = """server {
+    listen 80;
+    server_name {{ hostname }};
+    location / {
+        set $upstream_0000 app:8000;
+        proxy_pass http://$upstream_0000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+"""
+
+    def _render(self, tmp_path, text):
+        from lib import template_engine
+        tpl = tmp_path / "x.nginx.conf.j2"
+        tpl.write_text(text)
+        out = tmp_path / "x.nginx.conf"
+        template_engine.render_nginx_conf(
+            str(tpl), str(out), "alice", "web", "0", "snaprovision.com", "", https=False)
+        return out.read_text()
+
+    def test_the_host_line_keeps_the_port(self, tmp_path):
+        rendered = self._render(tmp_path, self._TPL)
+        assert "proxy_set_header Host $http_host;" in rendered, rendered
+        assert "proxy_set_header Host $host;" not in rendered, (
+            "a conf that tells the application a portless host makes the app "
+            "build absolute URLs on the wrong port")
+        # …and only that line moved: the neighbour is untouched.
+        assert "proxy_set_header X-Real-IP $remote_addr;" in rendered
+
+    def test_an_already_correct_template_is_left_alone(self, tmp_path):
+        rendered = self._render(tmp_path, self._TPL.replace("Host $host;", "Host $http_host;"))
+        assert rendered.count("proxy_set_header Host $http_host;") == 1, rendered
+
+    def test_a_conf_without_the_line_is_untouched(self, tmp_path):
+        """The stream conf has no `proxy_set_header` at all — nothing to normalise."""
+        rendered = self._render(
+            tmp_path,
+            "server {\n    listen 7687 ssl;\n    server_name a.b.c;\n"
+            "    set $stream_upstream neo4j:7687;\n    proxy_pass $stream_upstream;\n}\n")
+        assert "proxy_set_header" not in rendered, rendered

@@ -120,6 +120,37 @@ def _mark_failed(
             registry._save(users)
 
 
+def _update_registry_endpoints(
+    user_name: str, service_name: str, label: str,
+    pairs: list[tuple[str, str]], instance_stem: str,
+) -> None:
+    """Record the endpoints the RENDERED confs serve (R6.1/R6.2).
+
+    Called once the confs are on disk — the entry itself is built earlier, and a
+    reader that runs before the render finds nothing (R3-F53; measured on a live
+    deployment that served two extra endpoints and recorded none).
+    Thread-safe and process-safe: runs under registry.transaction().
+    """
+    stream = _stream_sub_services(pairs)
+    http = _http_endpoints(pairs, instance_stem)
+    with registry.transaction():
+        users = registry._load()
+        matched = False
+        for u in users:
+            if (
+                u.get("user_name") == user_name
+                and u.get("service_name") == service_name
+                and str(u.get("label", "")) == str(label)
+            ):
+                u["stream_sub_services"] = stream
+                u["http_endpoints"] = http
+                matched = True
+                break
+        # Save ONLY on a real match — the same guard as _update_registry_status.
+        if matched:
+            registry._save(users)
+
+
 def _update_registry_status(user_name: str, service_name: str, label: str, status: str) -> None:
     """Update the status field of a registry entry (building → running).
 
@@ -232,6 +263,7 @@ def _materialize_env_examples(recipe_dir: Path) -> None:
 
 
 def _register_render_and_start(
+    nginx_conf_pairs: list[tuple[str, str]] | None = None,
     *,
     user_name: str,
     service_name: str,
@@ -331,19 +363,40 @@ def _register_render_and_start(
         registry._save(users)
 
     # --- Render nginx conf + htpasswd ---
-    if nginx_template and nginx_out:
-        if htpasswd_out:
-            auth.write_htpasswd_file(htpasswd_out, user_name, passwd_hash)
-            # Mark htpasswd as generated
-            Path(htpasswd_out + ".generated").write_text("")
+    # --- Render nginx conf(s) + htpasswd ---
+    # R9.2: the payload may carry several confs (an http one and a stream one).
+    # The PAIRS arrive from the caller, which knows the instance identity and the
+    # category — the stream conf must land as `*.stream.conf` (the pattern the
+    # internal nginx's include matches) and nothing here has to know that rule.
+    _pairs = list(nginx_conf_pairs or [])
+    if nginx_template and nginx_out and not _pairs:
+        _pairs = [(nginx_template, nginx_out)]
+
+    if htpasswd_out and _pairs:
+        auth.write_htpasswd_file(htpasswd_out, user_name, passwd_hash)
+        # Mark htpasswd as generated
+        Path(htpasswd_out + ".generated").write_text("")
+    for _tpl, _out in _pairs:
         template_engine.render_nginx_conf(
-            nginx_template, nginx_out,
+            _tpl, _out,
             user_name, service_name, label,
             domain, htpasswd_out or "",
             https=https,
             ssl_certificate_path=ssl_certificate_path,
             ssl_certificate_key_path=ssl_certificate_key_path,
         )
+
+    # R3-F53 — record the served endpoints from the confs this function JUST
+    # rendered. The entry was built earlier, and reading a rendered conf before
+    # it exists yields NOTHING: measured 2026-10-10, where a live deployment
+    # served `graphiti-local-shared2-1--neo4j.snaprovision.com` and
+    # `…--graph-falkordb.snaprovision.com` and recorded NEITHER, so the card
+    # offered no `/go/` row for an endpoint that existed. `stream_sub_services`
+    # (round 1's R6.1) had the same hole for the same reason.
+    _update_registry_endpoints(
+        user_name, service_name, label, _pairs,
+        f"{service_name}-{user_name}-{label}",
+    )
 
     # --- Mark as building (container not yet started) ---
     _update_registry_status(user_name, service_name, label, "building")
@@ -407,6 +460,81 @@ def _auto_volumes(
     return result
 
 
+def _stream_sub_services(pairs: list[tuple[str, str]]) -> list[str]:
+    """The canonical names in the instance's RENDERED stream conf, if any.
+
+    Read from the rendered file rather than from the artifact: the rendered conf
+    is what the internal nginx actually loads, so a name that appears here is a
+    name that routes. An unreadable or absent file yields an empty list — the
+    card then offers nothing, which is the honest state (R6.1: the surface shows
+    what the deployment created, and nothing else).
+    """
+    import re as _re
+
+    names: list[str] = []
+    for tpl, out in pairs or []:
+        name = str(tpl)
+        if name.endswith(".j2"):
+            name = name[:-3]
+        if not name.endswith(".stream.conf"):
+            continue
+        try:
+            text = Path(out).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for m in _re.finditer(r'^[ \t]*server_name[ \t]+([^;\n]+);', text, _re.MULTILINE):
+            for token in m.group(1).split():
+                token = token.strip()
+                if token and token not in names:
+                    names.append(token)
+    return names
+
+
+def _http_endpoints(pairs: list[tuple[str, str]], instance_stem: str) -> list[str]:
+    """The EXTRA http endpoints the instance's RENDERED http conf serves.
+
+    R6.2: the card lists one `/go/` row per exposed HTTP endpoint, keyed by the
+    sub-service name. Like `_stream_sub_services`, the list is read from the
+    RENDERED conf — a name that appears there is one the internal nginx actually
+    routes — and it records the SAME thing that function records: the whole
+    served name (`<instance host>--<sub_service>.<domain>`), not a port and not a
+    bare label. The card slices the key off it, exactly as it does for the stream
+    side, so the two surfaces read one convention.
+
+    The PRIMARY is deliberately absent: its endpoint is the instance's own URL,
+    which the card already shows, keyed `primary` (R6.2). An unreadable or absent
+    conf yields an empty list, which is the honest state.
+    """
+    import re as _re
+
+    # R1.5's reserved separator — `<instance host>--<sub_service>.<domain>`.
+    prefix = f"{instance_stem}--"
+    found: list[str] = []
+    for tpl, out in pairs or []:
+        name = str(tpl)
+        if name.endswith(".j2"):
+            name = name[:-3]
+        # The http category is "everything that is a conf and is NOT the stream
+        # kind" — the same dispatch the -api's renderer uses. A generated http
+        # conf is named `nginx.base.<job>.conf` (the job token is a collision
+        # guard, not an identity), so matching a fixed suffix like `.nginx.conf`
+        # silently missed every generated one: measured 2026-10-10, where a real
+        # deploy served both extra endpoints and recorded NEITHER, because the
+        # template's name ended `.conf` and nothing else.
+        if not name.endswith(".conf") or name.endswith(".stream.conf"):
+            continue
+        try:
+            text = Path(out).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for m in _re.finditer(r'^[ \t]*server_name[ \t]+([^;\n]+);', text, _re.MULTILINE):
+            for token in m.group(1).split():
+                token = token.strip()
+                if token.startswith(prefix) and token not in found:
+                    found.append(token)
+    return found
+
+
 def register_user(
     *,
     user_name: str,
@@ -425,6 +553,7 @@ def register_user(
     compose_sources: list[str] | None = None,
     nginx_container: str = "subnet-acl-nginx",
     nginx_output_dir: str | Path | None = None,
+    nginx_conf_templates: list[str] | None = None,
     user_data_dir: str | Path | None = None,
     build_args: dict[str, str] | None = None,
     https: bool = False,
@@ -596,10 +725,17 @@ def register_user(
     compose_out = str(output_dir / f"docker-compose.user-{user_name}.{label}.yml")
     nginx_out: str | None = None
     htpasswd_out: str | None = None
+    nginx_out_by_category: list[tuple[str, str]] = []
+
     if nginx_template:
         nginx_out = str(nginx_dir / f"{service_name}.user-{user_name}.{label}.nginx.conf")
         if passwd_hash:
             htpasswd_out = str(nginx_dir / f"{service_name}.user-{user_name}.{label}.htpasswd")
+    for _tpl in (nginx_conf_templates or []):
+        nginx_out_by_category.append((
+            _tpl,
+            str(nginx_dir / template_engine.rendered_conf_name(service_name, user_name, label, _tpl)),
+        ))
 
     # --- Gap 8: auto re-convert old compose templates when subnet pools are
     # enabled. If the template lacks the {% if subnet %} ipam block, the
@@ -642,6 +778,27 @@ def register_user(
         "network_name": template_engine.user_network_name(service_name, user_name, label),
         "compose_template_path": compose_template,
         "nginx_conf_template_path": nginx_template,
+        # R9.2's recording: EVERY conf the deploy carried, template and rendered
+        # path — which is what the delete sweep walks and what the card's
+        # per-sub-service list is keyed by. The singular fields above stay as the
+        # http conf for the readers that predate the list.
+        "nginx_conf_template_paths": [t for t, _o in nginx_out_by_category] or ([nginx_template] if nginx_template else []),
+        "nginx_conf_paths": [o for _t, o in nginx_out_by_category] or ([nginx_out] if nginx_out else []),
+        # R6.1/R9.2: the card must know which SUB-SERVICES this instance exposes a
+        # stream endpoint for, and it decides that from the RECORDED state — never
+        # by re-deriving "TLS is on and a row exists" in the panel. The names come
+        # from the rendered stream conf's own `server_name`s: they are exactly the
+        # names the edge dials and the internal nginx selects on, so the card and
+        # the routing cannot disagree. Names, not ports — the registry stays
+        # ports-free.
+        "stream_sub_services": _stream_sub_services(nginx_out_by_category),
+        # R1.5/R6.2 — and the EXTRA http endpoints it serves, read from the same
+        # rendered confs. The card's URL section is built from these (plus the
+        # primary, keyed `primary`), so the surface cannot offer a link the
+        # deployment does not have.
+        "http_endpoints": _http_endpoints(
+            nginx_out_by_category, f"{service_name}-{user_name}-{label}"
+        ),
         "env_file_path": env_file,
         "env_files": [],  # filled after render (order preserved)
         "profiles": list(profiles or []),
@@ -652,7 +809,10 @@ def register_user(
         "htpasswd_path": htpasswd_out,
         "volumes": volumes,
         "build_args": build_args or {},
-        "https": https,
+        # The record's switch is named `tls` — the same word the deploy request,
+        # the CLI and the template variable use (ruled 2026-10-10; it used to be
+        # stored as `https`, and `registry.entry_tls` reads either for one round).
+        "tls": https,
         "ssl_certificate_path": ssl_certificate_path,
         "ssl_certificate_key_path": ssl_certificate_key_path,
         "hostname": template_engine.service_hostname(service_name, user_name, label, domain),
@@ -700,6 +860,14 @@ def register_user(
     # entry (`if status != "failed": raise ValueError(...)`, above).
     try:
         copied_env = _register_render_and_start(
+            # R3-F52: the PAIRS, not just the http conf. Without this every conf
+            # but the http one is recorded and never rendered — `_pairs` falls
+            # back to `[(nginx_template, nginx_out)]`, so the stream conf's path
+            # reaches the registry while the file never reaches the disk, and
+            # `stream_sub_services` reads an empty set forever. Measured on the
+            # live stack 2026-10-10: `/srv/.../<svc>.user-<user>.<label>.stream.conf`
+            # absent, entry's `stream_sub_services` `[]`.
+            nginx_conf_pairs=nginx_out_by_category,
             user_name=user_name, service_name=service_name, label=label,
             entry=entry, compose_template=compose_template,
             compose_out=compose_out, volumes=volumes,
@@ -881,8 +1049,22 @@ def remove_user(
     # needed for variable substitution during 'up', and a missing env file should
     # never block teardown.
     compose_exists = compose_file and Path(compose_file).exists()
+    # R4-F59 — the PROFILES, or the delete leaves containers behind.
+    #
+    # `docker compose down` acts on the services in the ACTIVE profile set, and a
+    # service gated by `profiles: [x]` is not in the default set. So an instance
+    # deployed with a profile (graphiti-local's `falkordb` — the entry records it
+    # at register time for exactly this reason) kept `…-falkordb` and
+    # `…-graph-falkordb` RUNNING after the card was deleted, while their network
+    # was removed underneath them. Measured 2026-10-11 on `shared2/graphiti-local/2`:
+    # the registry entry went, two of four containers went, and the two profiled
+    # ones stayed `Up`. §10's step 11 expects the stack to be HEALTHY after a
+    # delete, so this is that step failing, not tidiness.
     if compose_exists:
-        docker_ops.compose_down(compose_file, project_name=project_name, remove_volumes=True)
+        docker_ops.compose_down(
+            compose_file, project_name=project_name, remove_volumes=True,
+            profiles=list(entry.get("profiles") or []) or None,
+        )
     elif project_name:
         _log.warning(
             "Compose file %s not found for %s/%s/%s — attempting down by project name %s",
@@ -904,6 +1086,22 @@ def remove_user(
                 Path(str(fpath) + ".generated").unlink(missing_ok=True)
             except OSError:
                 pass
+
+    # R7.1's -api half: EVERY rendered conf the deploy carried goes with the
+    # instance — including a stream conf, whose removal is not tidiness but
+    # safety. Its `set $upstream` names a container that is about to stop
+    # existing, and the internal nginx resolves literal upstreams at
+    # config-parse time: a leftover stream conf makes the NEXT RESTART of that
+    # container fail (`host not found in upstream`), taking every service down
+    # with it. Measured 2026-10-10 while testing the minimal door.
+    for fpath in (entry.get("nginx_conf_paths") or []):
+        if not fpath:
+            continue
+        try:
+            Path(fpath).unlink(missing_ok=True)
+            Path(str(fpath) + ".generated").unlink(missing_ok=True)
+        except OSError:
+            pass
 
     # Full purge (decision #2): a deleted service leaves NOTHING behind —
     # per-user artifacts in the recipe dir + the user_data volume tree.
@@ -1261,7 +1459,7 @@ def remove_password(
             nginx_tpl, nginx_out,
             user_name, service_name, label,
             domain, "",  # no htpasswd -> the render strips auth_basic
-            https=bool(entry.get("https")),
+            https=registry.entry_tls(entry),
             ssl_certificate_path=entry.get("ssl_certificate_path") or "",
             ssl_certificate_key_path=entry.get("ssl_certificate_key_path") or "",
         )

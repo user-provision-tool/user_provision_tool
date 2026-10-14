@@ -5,6 +5,9 @@ Transformations applied
 directive           before                              after
 ---------           ------                              -----
 server_name         server_name example.com;            server_name {{ hostname }};
+server_name         server_name web_hostname--neo4j;    server_name {{ hostname_stem }}--neo4j.{{ domain_name }};
+                    (a name carrying `--` — R1.5's extra HTTP endpoint — keeps its
+                     sub-service instead of collapsing to the instance host)
 auth_basic          auth_basic "My App";                auth_basic "{{ service_name }} - {{ user_name }}";
 auth_basic_user_file auth_basic_user_file /etc/...;     auth_basic_user_file {{ htpasswd_path }};
 proxy_pass          proxy_pass http://web:80;           proxy_pass http://{{ container_prefix }}web:80;
@@ -41,7 +44,7 @@ _HEADER_TPL = """\
 #   remaining literal container names manually.
 #
 # NOTE: ssl_certificate and ssl_certificate_key paths have been replaced with
-#   template variables.  Wrap HTTPS server blocks in {{% if https %}}...{{% endif %}}
+#   template variables.  Wrap HTTPS server blocks in {{% if tls %}}...{{% endif %}}
 #   to conditionally enable TLS.
 #
 """
@@ -69,12 +72,32 @@ def convert_nginx(
         caller should review and adjust container names manually.
     """
 
-    # server_name — replace all name tokens after the keyword
-    text = re.sub(
-        r'([ \t]*server_name[ \t]+)[^\n;]+(;)',
-        r'\1{{ hostname }}\2',
-        text,
-    )
+    # server_name — the PRIMARY's name becomes the instance host; a name carrying
+    # R1.5's reserved separator keeps its sub-service and becomes
+    # `<instance stem>--<sub_service>.<domain>` (one label under the domain, which
+    # is what lets the single wildcard certificate serve it).
+    #
+    # Before this, EVERY token became `{{ hostname }}` — so a block declaring
+    # `<host>--neo4j.<domain>` was flattened back to the instance host at render
+    # time, the endpoint the row declares ceased to exist, and `validate_conf`
+    # (R1.3) could never pass. Measured 2026-10-10; see round 2's F47.
+    def _server_name(match: "re.Match[str]") -> str:
+        head, token, tail = match.group(1), match.group(2), match.group(3)
+        parts: list[str] = []
+        for name in token.split():
+            if "--" in name:
+                # Everything after the separator, minus any domain the model
+                # wrote: a sub-service is a compose service key and carries no dot.
+                sub = name.split("--", 1)[1].split(".")[0].strip()
+                parts.append(
+                    f"{{{{ hostname_stem }}}}--{sub}.{{{{ domain_name }}}}"
+                    if sub else "{{ hostname }}"
+                )
+            else:
+                parts.append("{{ hostname }}")
+        return head + " ".join(parts) + tail
+
+    text = re.sub(r'([ \t]*server_name[ \t]+)([^\n;]+)(;)', _server_name, text)
 
     # auth_basic string
     text = re.sub(
@@ -136,16 +159,16 @@ def convert_nginx(
 
     _has_ssl_listen = bool(re.search(r'listen\s+[^;]*\bssl\b', text))
     if _has_ssl_listen:
-        # Existing HTTPS blocks: wrap them + redirect blocks in {% if https %}.
+        # Existing HTTPS blocks: wrap them + redirect blocks in {% if tls %}.
         parts = _split_server_blocks(text)
         out: list[str] = []
         for p in parts:
             if p["is_server"]:
                 block = p["text"]
                 if re.search(r'listen\s+[^;]*\bssl\b', block):
-                    out.append('\n{% if https %}\n' + block + '\n{% endif %}\n')
+                    out.append('\n{% if tls %}\n' + block + '\n{% endif %}\n')
                 elif re.search(r'return\s+301\s+https://', block):
-                    out.append('\n{% if https %}\n' + block + '\n{% endif %}\n')
+                    out.append('\n{% if tls %}\n' + block + '\n{% endif %}\n')
                 else:
                     out.append(block)
             else:
@@ -174,7 +197,7 @@ def convert_nginx(
                         https_block,
                     )
                     out.append(block)
-                    out.append('\n{% if https %}\n' + https_block + '\n{% endif %}\n')
+                    out.append('\n{% if tls %}\n' + https_block + '\n{% endif %}\n')
                 else:
                     out.append(block)
             else:
@@ -209,7 +232,7 @@ def convert_nginx(
     # --- Inject auth_basic into every server block that lacks it ---
     # Must run AFTER HTTPS block generation so that:
     #  - auto-generated HTTPS blocks (cloned from HTTP) also receive auth_basic
-    #  - existing HTTPS blocks (wrapped in {% if https %}) also receive auth_basic
+    #  - existing HTTPS blocks (wrapped in {% if tls %}) also receive auth_basic
     if not re.search(r'[ \t]*auth_basic\b', text):
         def _inject_auth(m: re.Match) -> str:
             indent = re.match(r'^([ \t]*)', m.group(0)).group(1)
@@ -245,6 +268,72 @@ def convert_nginx(
     # converter ACL-free means templates stay mode-independent and re-conversion
     # of an already-v4 conf is idempotent (no stale scaffolding to strip).
     # ------------------------------------------------------------------
+    return text
+
+
+def convert_stream_conf(
+    text: str,
+    service_name_hint: str = "",
+    compose_service_names: list[str] | None = None,
+) -> str:
+    """The STREAM conf's own conversion (task-doc R9.2 / GRILLING G42.1).
+
+    A stream conf is not an http conf with a different listener, and running it
+    through `convert_nginx` is a measured defect, not a style question:
+
+    * `convert_nginx` wraps TLS blocks in an **ssl guard** (`{% if tls %}`) — but
+      a stream block's TLS listener is STRUCTURAL and the file's existence is the
+      switch, so the block must never be conditional;
+    * it injects **`auth_basic`** — a directive the stream module does not have,
+      which makes the conf fail `nginx -t` for a password-protected instance
+      (the renderer strips those only when the instance has NO service password);
+    * it rewrites **`server_name`** to `{{ hostname }}`, the *instance* host —
+      while a stream block is selected by the **canonical name**, the name the
+      edge dials (R4.4/R5.1).
+
+    What DOES apply is the same substitution set the http path uses for these two
+    things: the certificate paths (the store's real path, mounted at the same
+    path in the internal nginx) and the container-name prefixing. The generated
+    conf names its upstream by the COMPOSE service name (`set $upstream
+    fastapi-app:8100;`), and this rewrites that host to
+    `{{ container_prefix }}<name>` exactly as the http converter rewrites a
+    `proxy_pass` host — one convention, two conf kinds.
+    """
+    # ssl_certificate / ssl_certificate_key → the template variables (identical
+    # to the http path: the path is the deploy's own recorded certificate).
+    text = re.sub(
+        r'([ \t]*ssl_certificate[ \t]+)\S+(;)',
+        r'\1{{ ssl_certificate_path }}\2',
+        text,
+    )
+    text = re.sub(
+        r'([ \t]*ssl_certificate_key[ \t]+)\S+(;)',
+        r'\1{{ ssl_certificate_key_path }}\2',
+        text,
+    )
+
+    # The upstream `set $upstream <host>:<port>;` — the stream conf's equivalent
+    # of a proxy_pass target. Rewritten only when the host IS a compose service
+    # name, like the http path (no heuristics, no prefix stripping).
+    compose_names: set[str] = set()
+    if compose_service_names:
+        compose_names = {n.lower() for n in compose_service_names}
+    if compose_names:
+        def _repl_set(m: re.Match) -> str:
+            host = m.group(2)
+            if host.lower() in compose_names:
+                return f"{m.group(1)}{{{{ container_prefix }}}}{host}{m.group(3)}"
+            return m.group(0)
+
+        text = re.sub(
+            r'(set\s+\$[A-Za-z0-9_]+\s+)([a-zA-Z0-9_-]+)((?::\d+)?\s*;)',
+            _repl_set,
+            text,
+        )
+
+    # Everything else is deliberately untouched: `server_name` stays the
+    # canonical name, `listen … ssl` stays unconditional, `allow/deny` and the
+    # `resolver` stay as written, and no auth_basic is injected.
     return text
 
 

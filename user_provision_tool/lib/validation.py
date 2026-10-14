@@ -18,6 +18,17 @@ def validate_name(value: str, field: str = "name") -> str:
         raise ValidationError(
             f"{field} '{value}' is invalid: only English letters, digits, hyphens, and underscores are allowed."
         )
+    # R1.5: `--` is RESERVED as the instance/sub-service separator. A name that
+    # contains it would make the served name
+    # `<instance host>--<sub_service>.<domain>` unparseable back into its two
+    # halves — and that split is what the card, the gateway's hostname index and
+    # a reader all rely on. Refused here, at validation, so no such name is ever
+    # stored.
+    if "--" in value:
+        raise ValidationError(
+            f"{field} '{value}' is invalid: '--' is reserved as the instance/sub-service "
+            f"separator and must not appear inside a name."
+        )
     return value
 
 

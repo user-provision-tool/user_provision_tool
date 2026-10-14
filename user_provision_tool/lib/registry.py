@@ -187,6 +187,26 @@ def _save(users: list[dict[str, Any]]) -> None:
         pass
 
 
+def entry_tls(entry: dict[str, Any] | None) -> bool:
+    """Is TLS in play for this instance? — the record's ``tls`` switch.
+
+    The field is named **``tls``**, the same word the deploy request, the CLI and
+    the template variable use, so the platform has ONE vocabulary for the switch.
+    It used to be stored as ``https``; entries written before the rename are read
+    through a fallback kept **for one round** (ruled 2026-10-10).
+
+    The read lives HERE, in the module that owns the record's shape, so no caller
+    keeps its own copy of the rule and removing the fallback later is a one-line
+    change. Anything unreadable is ``False``, which is fail-closed: an instance
+    whose flag cannot be read gets no TLS vhost and no stream conf.
+    """
+    if not isinstance(entry, dict):
+        return False
+    if "tls" in entry:
+        return bool(entry.get("tls"))
+    return bool(entry.get("https"))
+
+
 def get_all_users() -> list[dict[str, Any]]:
     return _load()
 

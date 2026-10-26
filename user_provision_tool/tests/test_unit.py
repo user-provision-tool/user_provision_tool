@@ -1584,18 +1584,22 @@ class TestComposeConverter:
         assert "/data/myapp/html" in src_to_key
         assert "/var/lib/myapp/db" in src_to_key
 
-    def test_convert_named_volumes_excluded_from_src_to_key(self):
+    def test_convert_named_volumes_are_bind_keys(self):
+        """G59 (D4 = C) — a non-external top-level volume becomes a bind key."""
         from lib.compose_converter import convert
         _, src_to_key, _, _ = convert(self._sample_data())
-        assert "db_socket" not in src_to_key
+        assert "db_socket" in src_to_key
 
     def test_convert_replaces_networks(self):
         text, _ = self._convert_to_text(self._sample_data())
         assert "{{ network_name }}" in text
 
-    def test_convert_adds_named_volume_prefix(self):
+    def test_convert_turns_named_volumes_into_binds(self):
+        """G59 — the service entry names the per-user path, and the Docker
+        named-volume declaration is dropped (no orphan volume)."""
         text, _ = self._convert_to_text(self._sample_data())
-        assert "{{ container_prefix }}db_socket" in text
+        assert "{{ volumes['db_socket'] }}" in text
+        assert "{{ container_prefix }}db_socket" not in text
 
     def test_convert_preserves_env_vars(self):
         data = self._sample_data()
@@ -5849,17 +5853,22 @@ class TestStreamConfConversion:
         # the two http-only transformations are NOT applied
         assert "{% if tls %}" not in out and "{% if https %}" not in out, "no ssl guard"
         assert "auth_basic" not in out, "the stream module has no auth_basic"
-        assert "example-mcp-alice-3--fastapi-app.snaprovision.com" in out, (
-            "server_name stays the canonical name — it is what the edge dials")
+        assert "server_name         {{ hostname_stem }}--fastapi-app.{{ domain_name }};" in out, (
+            "G56 — server_name is TEMPLATED like the http category's; the -api "
+            "renders the target instance's canonical name")
         # the two that do apply
         assert "ssl_certificate     {{ ssl_certificate_path }};" in out
         assert "ssl_certificate_key {{ ssl_certificate_key_path }};" in out
-        assert "set $stream_upstream {{ container_prefix }}fastapi-app:8100;" in out
+        # G56 follow-up — the legacy variable form is normalized to the STATIC
+        # pass (the variable form evaluates empty on the shipped nginx and
+        # defeats SNI); the set/resolver scaffolding goes with it.
+        import re as _re
+        assert _re.search(r"proxy_pass\s+\{\{ container_prefix \}\}fastapi-app:8100;", out), out
+        assert "$stream_upstream" not in out
+        assert "resolver" not in out
         # and everything structural is left alone
         assert "listen              7687 ssl;" in out
         assert "allow               172.17.0.0/16;" in out
-        assert "resolver            127.0.0.11 valid=30s ipv6=off;" in out
-        assert "proxy_pass          $stream_upstream;" in out
 
     def test_an_unknown_upstream_host_is_left_alone(self):
         from lib.nginx_converter import convert_stream_conf
@@ -5923,7 +5932,9 @@ class TestTheConfSlotList:
         from api import RegisterRequest
         base = {"service_name": "svc", "user_name": "alice", "compose_file_path": "/tmp/c.yml"}
         single = RegisterRequest(**base, nginx_conf_file_path="/tmp/a.conf")
-        listed = RegisterRequest(**base, nginx_conf_file_paths=["/tmp/a.conf", "/tmp/b.stream.conf"])
+        # a stream entry requires TLS (G41)
+        listed = RegisterRequest(**base, tls=True, fullchain="fc.pem", privkey="pk.pem",
+                                 nginx_conf_file_paths=["/tmp/a.conf", "/tmp/b.stream.conf"])
         assert (single.nginx_conf_file_paths or []) == []
         assert listed.nginx_conf_file_paths == ["/tmp/a.conf", "/tmp/b.stream.conf"]
 
@@ -6462,3 +6473,547 @@ class TestTheForwardedHostCarriesThePort:
             "server {\n    listen 7687 ssl;\n    server_name a.b.c;\n"
             "    set $stream_upstream neo4j:7687;\n    proxy_pass $stream_upstream;\n}\n")
         assert "proxy_set_header" not in rendered, rendered
+
+
+class TestPerCategoryConfs:
+    """G55 — the request is a per-category map; legacy shapes are shims."""
+
+    def _req(self, **kw):
+        from api import RegisterRequest
+        base = dict(user_name="u", service_name="s", compose_file_path="docker-compose.yml")
+        base.update(kw)
+        return RegisterRequest(**base)
+
+    def test_the_map_is_accepted(self):
+        r = self._req(tls=True, fullchain="fc.pem", privkey="pk.pem",
+                      nginx_confs={"http": "a.conf", "stream": "b.stream.conf"})
+        assert r.nginx_confs["stream"] == "b.stream.conf"
+
+    def test_legacy_singulars_normalize_by_file_name(self):
+        from api import _requested_conf_maps
+        plain, tpl = _requested_conf_maps(self._req(nginx_conf_file_path="a.conf"))
+        assert plain == {"http": "a.conf"} and tpl == {}
+        # The legacy model still refuses a plain and a template in one request
+        # (its mutual-exclusion rule predates the map); a mixed set uses the map.
+        plain2, tpl2 = _requested_conf_maps(self._req(
+            tls=True, fullchain="fc.pem", privkey="pk.pem",
+            nginx_conf_template_path="b.stream.conf.j2"))
+        assert plain2 == {} and tpl2 == {"stream": "b.stream.conf.j2"}
+
+    def test_a_legacy_list_with_two_entries_of_one_category_is_refused(self):
+        import pytest
+        from fastapi import HTTPException
+        from api import _requested_conf_maps
+        with pytest.raises(HTTPException) as ei:
+            _requested_conf_maps(self._req(nginx_conf_file_paths=["a.conf", "b.conf"]))
+        assert "one file per category" in str(ei.value.detail)
+
+    def test_the_map_and_the_legacy_fields_cannot_be_mixed(self):
+        import pytest
+        from fastapi import HTTPException
+        from api import _requested_conf_maps
+        with pytest.raises(HTTPException):
+            _requested_conf_maps(self._req(
+                nginx_confs={"http": "a.conf"}, nginx_conf_file_path="b.conf"))
+
+    def test_an_unknown_category_is_refused(self):
+        import pytest
+        from fastapi import HTTPException
+        from api import _requested_conf_maps
+        with pytest.raises(HTTPException):
+            _requested_conf_maps(self._req(nginx_confs={"smtp": "a.conf"}))
+
+
+class TestNamedVolumesBecomeBinds:
+    """G59 (D4 = C) — non-external named volumes are per-user bind keys."""
+
+    def _convert(self, data):
+        import yaml
+        from lib.compose_converter import convert
+        out, src_to_key, tokens, _ = convert(data)
+        return out, src_to_key, tokens.detokenize(yaml.safe_dump(out))
+
+    def test_the_service_entry_is_the_user_path_and_the_declaration_is_dropped(self):
+        out, src_to_key, text = self._convert({
+            "services": {"neo4j": {"image": "neo4j", "volumes": ["neo4j_data:/data"]}},
+            "volumes": {"neo4j_data": {}},
+        })
+        assert src_to_key["neo4j_data"] == "neo4j_data"
+        assert "{{ volumes['neo4j_data'] }}" in text
+        assert "volumes" not in out, "the Docker named-volume declaration must be gone"
+
+    def test_external_volumes_stay_named(self):
+        out, src_to_key, text = self._convert({
+            "services": {"app": {"image": "x", "volumes": ["shared:/data"]}},
+            "volumes": {"shared": {"external": True}},
+        })
+        assert "shared" not in src_to_key
+        assert out["volumes"]["shared"] == {"external": True}
+
+
+class TestPreviewGoldenPaths:
+    """G60 (D8) — the -api computes the volume paths; the preview stays pure."""
+
+    def test_paths_are_returned_for_an_identity(self, tmp_path):
+        import api
+        from lib.template_engine import volume_path
+        project = tmp_path / "svc"
+        project.mkdir()
+        (project / "docker-compose.yml").write_text(
+            "services:\n  db:\n    image: neo4j\n    volumes:\n      - neo4j_data:/data\n"
+            "volumes:\n  neo4j_data: {}\n"
+        )
+        res = api._preview_volume_mapping(
+            project, ["docker-compose.yml"], service_name="svc", user_name="bob", label="2"
+        )
+        assert res["volume_keys"] == ["neo4j_data"]
+        assert res["volume_paths"]["neo4j_data"] == volume_path(
+            api.USER_DATA_DIR, "bob", "svc", "2", "neo4j_data"
+        )
+        # the MOUNT TABLE's second column, from the compose
+        assert res["volume_targets"] == {"neo4j_data": "/data"}, res
+        assert not (api.USER_DATA_DIR / "bob" / "svc" / "2").exists(), "the preview creates nothing"
+
+    def test_no_identity_means_no_paths(self, tmp_path):
+        import api
+        project = tmp_path / "svc"
+        project.mkdir()
+        (project / "docker-compose.yml").write_text(
+            "services:\n  db:\n    image: neo4j\n    volumes:\n      - neo4j_data:/data\n"
+            "volumes:\n  neo4j_data: {}\n"
+        )
+        res = api._preview_volume_mapping(project, ["docker-compose.yml"])
+        assert "volume_paths" not in res and res["volume_keys"] == ["neo4j_data"]
+
+
+class TestConfFilter:
+    """G61 (D6) — rendered blocks follow the compose's ACTIVE services."""
+
+    def test_an_inactive_service_block_is_dropped(self):
+        from lib.conf_filter import filter_conf_blocks
+        text = """server {
+    server_name h--graph;
+    set $upstream_0 p-graph:8000;
+    proxy_pass http://$upstream_0;
+}
+server {
+    server_name h--graph-falkordb;
+    set $upstream_1 p-graph-falkordb:8000;
+    proxy_pass http://$upstream_1;
+}
+"""
+        out, dropped = filter_conf_blocks(
+            text,
+            active_services={"graph", "neo4j"},
+            all_services={"graph", "neo4j", "graph-falkordb"},
+            container_prefix="p-",
+        )
+        assert "p-graph:8000" in out
+        assert "p-graph-falkordb:8000" not in out
+        assert dropped == ["h--graph-falkordb"]
+
+    def test_an_unknown_upstream_is_kept(self):
+        from lib.conf_filter import filter_conf_blocks
+        text = "server {\n    server_name h;\n    proxy_pass https://external.example.com;\n}\n"
+        out, dropped = filter_conf_blocks(
+            text, active_services=set(), all_services={"graph"}, container_prefix="p-"
+        )
+        assert out == text and dropped == []
+
+    def test_the_compose_rule_treats_empty_profiles_as_ungated(self, tmp_path):
+        from lib.conf_filter import compose_active_services
+        compose = tmp_path / "c.yml"
+        compose.write_text(
+            "services:\n"
+            "  graph:\n    image: x\n    profiles: ['']\n"
+            "  neo4j:\n    image: y\n"
+            "  falkordb:\n    image: z\n    profiles: [falkordb]\n"
+        )
+        active, all_names = compose_active_services(compose, [])
+        assert active == {"graph", "neo4j"}
+        assert all_names == {"graph", "neo4j", "falkordb"}
+        active2, _ = compose_active_services(compose, ["falkordb"])
+        assert "falkordb" in active2
+
+
+class TestStreamNameTemplating:
+    """G56 (D7) — the stream `server_name` is templated, and unparseable is an
+    -api conversion error (the converter cannot invent the block's identity)."""
+
+    _CONF = """server {
+    listen              7687 ssl;
+    server_name         %s;
+    proxy_pass          example-mcp-alice-3-neo4j:7687;
+}
+"""
+
+    def test_a_non_canonical_name_is_refused(self):
+        import pytest
+        from lib.nginx_converter import convert_stream_conf
+        with pytest.raises(ValueError):
+            convert_stream_conf(self._CONF % "plain.example.com", "svc", ["neo4j"])
+
+    def test_an_already_templated_name_normalizes_idempotently(self):
+        from lib.nginx_converter import convert_stream_conf
+        out = convert_stream_conf(
+            self._CONF % "{{ hostname_stem }}--neo4j.{{ domain_name }}", "svc", ["neo4j"]
+        )
+        assert "{{ hostname_stem }}--neo4j.{{ domain_name }}" in out
+
+
+class TestEndpointRecordingByRenderedCategory:
+    """G55 — endpoints are read from the RENDERED conf, and the category is the
+    rendered name's. The recipe-level stream template's source is
+    `nginx.stream.base.<job>.conf[.j2]`, which does not end `.stream.conf`."""
+
+    def _pair(self, tmp_path):
+        out = tmp_path / "svc.user-u.0.stream.conf"
+        out.write_text(
+            "server {\n"
+            "    server_name svc-u-0--neo4j.example.com;\n"
+            "    proxy_pass svc-u-0-neo4j:7687;\n"
+            "}\n"
+        )
+        return ("/recipe/nginx.stream.base.406.conf.j2", str(out))
+
+    def test_the_stream_template_counts_as_stream(self, tmp_path):
+        from lib.provisioner import _http_endpoints, _stream_sub_services
+        pair = self._pair(tmp_path)
+        assert _stream_sub_services([pair]) == ["svc-u-0--neo4j.example.com"]
+        assert _http_endpoints([pair], "svc-u-0") == []
+
+    def test_a_rendered_nginx_conf_is_http(self, tmp_path):
+        from lib.provisioner import _http_endpoints, _stream_sub_services
+        out = tmp_path / "svc.user-u.0.nginx.conf"
+        out.write_text(
+            "server {\n"
+            "    server_name svc-u-0--neo4j.example.com;\n"
+            "    proxy_pass svc-u-0-neo4j:7474;\n"
+            "}\n"
+        )
+        pair = ("/recipe/nginx.base.406.conf.j2", str(out))
+        assert _http_endpoints([pair], "svc-u-0") == ["svc-u-0--neo4j.example.com"]
+        assert _stream_sub_services([pair]) == []
+
+
+class TestBindAndNamedVolumeOrder:
+    """T5 step 5 — a bind-mount fixture beside named volumes (G59).
+
+    The regression this pins: bind keys come FIRST, named-volume keys after, in
+    first-appearance order; an `external: true` volume stays a named volume and
+    never becomes a bind key; the preview reports both kinds for an identity.
+    """
+
+    _COMPOSE = (
+        "services:\n"
+        "  app:\n"
+        "    image: example\n"
+        "    volumes:\n"
+        "      - ./conf:/conf\n"
+        "      - db_data:/data\n"
+        "      - shared:/shared\n"
+        "volumes:\n"
+        "  db_data: {}\n"
+        "  shared:\n"
+        "    external: true\n"
+    )
+
+    def _project(self, tmp_path):
+        project = tmp_path / "svc"
+        project.mkdir()
+        (project / "docker-compose.yml").write_text(self._COMPOSE)
+        (project / "conf").mkdir()
+        return project
+
+    def test_bind_first_then_named_and_external_untouched(self):
+        import yaml
+        from lib.compose_converter import convert
+        out, src_to_key, tokens, _ = convert(yaml.safe_load(self._COMPOSE))
+        assert list(src_to_key) == ["./conf", "db_data"], src_to_key
+        text = tokens.detokenize(yaml.safe_dump(out))
+        assert "{{ volumes['conf'] }}:/conf" in text
+        assert "{{ volumes['db_data'] }}:/data" in text
+        assert "shared:/shared" in text, "an external volume stays a named volume"
+        assert out["volumes"] == {"shared": {"external": True}}
+
+    def test_the_preview_reports_both_kinds_in_order(self, tmp_path):
+        import api
+        project = self._project(tmp_path)
+        res = api._preview_volume_mapping(
+            project, ["docker-compose.yml"], service_name="svc", user_name="bob", label="2"
+        )
+        assert res["volume_keys"] == ["conf", "db_data"], res
+        assert res["volume_paths"]["conf"].endswith("/bob/svc/2/conf")
+        assert "shared" not in res["volume_paths"]
+        assert res["volume_targets"] == {"conf": "/conf", "db_data": "/data"}, res
+
+
+class TestLegacyStreamUpstreamNormalization:
+    """Found 2026-10-23 — a selected historical stream conf used
+    `set $stream_upstream …; proxy_pass $stream_upstream;` (plus `ssl_preread`)
+    and the internal nginx answered `no host in upstream ""` for every
+    connection: the mint and the card looked healthy while the route was dead.
+    The converter now renders that form into the STATIC pass the generator
+    emits."""
+
+    _LEGACY = """server {
+    listen              7687 ssl;
+    ssl_preread         on;
+    server_name         someone-else-9--neo4j.snaprovision.com;
+    ssl_certificate     /srv/provision_subnet_acl/ssl/snaprovision.com/fullchain.pem;
+    ssl_certificate_key /srv/provision_subnet_acl/ssl/snaprovision.com/privkey.pem;
+    resolver            127.0.0.11 valid=30s ipv6=off;
+    set $stream_upstream neo4j:7687;
+    proxy_pass          $stream_upstream;
+}
+"""
+
+    def test_the_variable_form_becomes_static(self):
+        from lib.nginx_converter import convert_stream_conf
+        out = convert_stream_conf(self._LEGACY, "svc", ["neo4j"])
+        import re as _re
+        assert _re.search(r"proxy_pass\s+\{\{ container_prefix \}\}neo4j:7687;", out), out
+        assert "$stream_upstream" not in out
+        assert "resolver" not in out
+        assert "server_name         {{ hostname_stem }}--neo4j.{{ domain_name }};" in out
+
+    def test_an_unknown_host_is_static_but_not_prefixed(self):
+        from lib.nginx_converter import convert_stream_conf
+        conf = self._LEGACY.replace("neo4j:7687", "external.example.com:6379")
+        out = convert_stream_conf(conf, "svc", ["neo4j"])
+        import re as _re
+        assert _re.search(r"proxy_pass\s+external\.example\.com:6379;", out), out
+        assert "{{ container_prefix }}" not in out
+
+    def test_the_same_variable_name_in_two_blocks_keeps_each_target(self):
+        """The historical conf reuses `$stream_upstream` per block; a conf-wide
+        map collapsed both to the last target (measured this round)."""
+        from lib.nginx_converter import convert_stream_conf
+        two = self._LEGACY + self._LEGACY.replace("neo4j:7687", "falkordb:6379")
+        out = convert_stream_conf(two, "svc", ["neo4j", "falkordb"])
+        import re as _re
+        assert _re.search(r"proxy_pass\s+\{\{ container_prefix \}\}neo4j:7687;", out), out
+        assert _re.search(r"proxy_pass\s+\{\{ container_prefix \}\}falkordb:6379;", out), out
+
+
+class TestActiveVolumesOnTheCard:
+    """G61 follow-up — a volume mounted only by a profile-gated service that was
+    not started must not appear in the card's Volumes section."""
+
+    def _entry(self, tmp_path, profiles):
+        compose = tmp_path / "docker-compose.user-x.2.yml"
+        compose.write_text(
+            "services:\n"
+            "  neo4j:\n"
+            "    image: neo4j\n"
+            "    volumes:\n"
+            "      - /srv/u/2/neo4j_data:/data\n"
+            "  falkordb:\n"
+            "    image: falkordb\n"
+            "    profiles: [falkordb]\n"
+            "    volumes:\n"
+            "      - /srv/u/2/falkordb_data:/data\n"
+        )
+        return {
+            "compose_file_path": str(compose),
+            "profiles": profiles,
+            "volumes": {
+                "neo4j_data": "/srv/u/2/neo4j_data",
+                "falkordb_data": "/srv/u/2/falkordb_data",
+            },
+        }
+
+    def test_no_profile_hides_the_gated_volume(self, tmp_path):
+        import api
+        assert api._active_volumes(self._entry(tmp_path, [])) == {
+            "neo4j_data": "/srv/u/2/neo4j_data"
+        }
+
+    def test_the_active_profile_keeps_it(self, tmp_path):
+        import api
+        assert set(api._active_volumes(self._entry(tmp_path, ["falkordb"]))) == {
+            "neo4j_data", "falkordb_data"
+        }
+
+    def test_an_unreadable_compose_falls_back_to_the_full_map(self, tmp_path):
+        import api
+        entry = {
+            "compose_file_path": str(tmp_path / "missing.yml"),
+            "profiles": [],
+            "volumes": {"a": "/x/a"},
+        }
+        assert api._active_volumes(entry) == {"a": "/x/a"}
+
+
+class TestStreamConfsRequireTLS:
+    """G41 — the stream category is applicable only with TLS. With tls=false a
+    stream conf rendered `ssl_certificate ;`, failing `nginx -t` and silently
+    stopping the reload (measured 2026-10-24)."""
+
+    def _req(self, **kw):
+        from api import RegisterRequest
+        base = dict(user_name="u", service_name="s", compose_file_path="docker-compose.yml")
+        base.update(kw)
+        return RegisterRequest(**base)
+
+    def test_a_stream_map_with_tls_off_is_refused(self):
+        import pytest
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError) as ei:
+            self._req(tls=False, nginx_confs={"http": "a.conf", "stream": "x.stream.conf"})
+        assert "require tls=true" in str(ei.value)
+
+    def test_a_legacy_stream_path_with_tls_off_is_refused(self):
+        import pytest
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError):
+            self._req(tls=False, nginx_conf_file_paths=["a.conf", "x.stream.conf"])
+
+    def test_an_http_only_deploy_with_tls_off_is_accepted(self):
+        r = self._req(tls=False, nginx_confs={"http": "a.conf"})
+        assert r.tls is False
+
+    def test_a_stream_map_with_tls_on_is_accepted(self):
+        r = self._req(tls=True, fullchain="fc.pem", privkey="pk.pem",
+                      nginx_confs={"http": "a.conf", "stream": "x.stream.conf"})
+        assert r.tls is True
+
+
+class TestProfileAwareVolumePreview:
+    """The mount table follows the selected profiles, and the preview merges
+    multiple compose files in one call (both are multi-select in the panel)."""
+
+    _BASE = (
+        "services:\n"
+        "  graph:\n"
+        "    image: g\n"
+        "    profiles: ['']\n"
+        "  neo4j:\n"
+        "    image: n\n"
+        "    volumes:\n"
+        "      - neo4j_data:/data\n"
+        "  falkordb:\n"
+        "    image: f\n"
+        "    profiles: [falkordb]\n"
+        "    volumes:\n"
+        "      - falkordb_data:/data\n"
+        "volumes:\n"
+        "  neo4j_data: {}\n"
+        "  falkordb_data: {}\n"
+    )
+
+    def _project(self, tmp_path):
+        p = tmp_path / "svc"
+        p.mkdir()
+        (p / "docker-compose.yml").write_text(self._BASE)
+        (p / "overlay.yml").write_text(
+            "services:\n  graph:\n    volumes:\n      - ./conf:/conf\n"
+        )
+        return p
+
+    def test_no_profile_hides_the_gated_volume(self, tmp_path):
+        import api
+        res = api._preview_volume_mapping(
+            self._project(tmp_path), ["docker-compose.yml"],
+            service_name="svc", user_name="bob", label="2", profiles=[],
+        )
+        assert res["volume_keys"] == ["neo4j_data"], res
+        assert res["volume_services"] == {"neo4j_data": "neo4j"}
+        assert res["volume_rows"] == [
+            {"key": "neo4j_data", "service": "neo4j", "target": "/data"}
+        ]
+
+    def test_the_active_profile_adds_its_volume(self, tmp_path):
+        import api
+        res = api._preview_volume_mapping(
+            self._project(tmp_path), ["docker-compose.yml"],
+            service_name="svc", user_name="bob", label="2", profiles=["falkordb"],
+        )
+        assert set(res["volume_keys"]) == {"neo4j_data", "falkordb_data"}
+        assert res["volume_services"]["falkordb_data"] == "falkordb"
+
+    def test_multiple_compose_files_merge_in_one_call(self, tmp_path):
+        import api
+        res = api._preview_volume_mapping(
+            self._project(tmp_path), ["docker-compose.yml", "overlay.yml"],
+            service_name="svc", user_name="bob", label="2", profiles=[],
+        )
+        # overlay.yml adds a bind to graph → its key appears alongside neo4j's
+        assert "conf" in res["volume_keys"], res
+        assert res["volume_services"]["conf"] == "graph"
+        assert res["volume_targets"]["conf"] == "/conf"
+
+
+class TestRunCapturesAllOutput:
+    """Found 2026-10-24 — `_run` closed the capture pipes right after
+    `wait()`, discarding output the reader threads had not drained yet. Inside
+    the -api container `docker compose config` was cut at ~1.5 KB, silently
+    dropping services from a multi-file merge."""
+
+    def test_a_large_output_is_not_truncated(self):
+        import sys
+        from lib import docker_ops
+        r = docker_ops._run(
+            [sys.executable, "-c", "import sys; sys.stdout.write('x'*300000)"]
+        )
+        assert len(r.stdout) == 300000
+
+
+class TestComposeProfileSemantics:
+    """Measured with real Docker Compose (2026-10-24):
+
+        no --profile      -> `profiles: [""]` RUNS, no-profiles RUNS, named does not
+        --profile X       -> `profiles: [""]` EXCLUDED, no-profiles RUNS, X runs
+
+    The platform's three active-service computations must follow it."""
+
+    _COMPOSE = (
+        "services:\n"
+        "  a_default:\n    image: x\n    profiles: ['']\n"
+        "  b_always:\n    image: x\n"
+        "  c_gated:\n    image: x\n    profiles: [falkordb]\n"
+    )
+
+    def _compose_file(self, tmp_path):
+        p = tmp_path / "rendered.yml"
+        p.write_text(self._COMPOSE)
+        return p
+
+    def test_conf_filter_none_active(self, tmp_path):
+        from lib.conf_filter import compose_active_services
+        active, _all = compose_active_services(self._compose_file(tmp_path), [])
+        assert active == {"a_default", "b_always"}
+
+    def test_conf_filter_with_a_profile(self, tmp_path):
+        from lib.conf_filter import compose_active_services
+        active, _all = compose_active_services(self._compose_file(tmp_path), ["falkordb"])
+        assert active == {"b_always", "c_gated"}
+
+    def test_preview_services_follow_the_rule(self, tmp_path):
+        import api
+        data = {
+            "services": {
+                "a_default": {"image": "x", "profiles": [""]},
+                "b_always": {"image": "x"},
+                "c_gated": {"image": "x", "profiles": ["falkordb"]},
+            }
+        }
+        assert set(api._active_compose_services(data, [])) == {"a_default", "b_always"}
+        assert set(api._active_compose_services(data, ["falkordb"])) == {"b_always", "c_gated"}
+
+    def test_expected_containers_follow_the_rule(self, tmp_path):
+        import api
+        from lib import template_engine
+        compose = self._compose_file(tmp_path)
+        prefix = template_engine.container_prefix("svc", "bob", "1")
+        base = {
+            "service_name": "svc", "user_name": "bob", "label": "1",
+            "compose_file_path": str(compose),
+            "container_names": [f"{prefix}{n}" for n in ("a_default", "b_always", "c_gated")],
+        }
+        assert set(api._expected_container_names({**base, "profiles": []})) == {
+            f"{prefix}a_default", f"{prefix}b_always"
+        }
+        assert set(api._expected_container_names({**base, "profiles": ["falkordb"]})) == {
+            f"{prefix}b_always", f"{prefix}c_gated"
+        }

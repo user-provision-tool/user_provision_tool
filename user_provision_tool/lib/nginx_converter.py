@@ -312,6 +312,41 @@ def convert_stream_conf(
         text,
     )
 
+    # G56 (D7) — `server_name` is TEMPLATED, exactly like the http category's.
+    # A stream block is selected by the canonical name the edge dials; baking it
+    # verbatim made a conf instance-bound for no reason. The name is rebuilt from
+    # its `<stem>--<sub>.<domain>` shape with the -api's own variables, so a conf
+    # from another deployment can be reused and renders with THIS instance's
+    # names. A token that cannot yield a sub-service is refused: the converter
+    # cannot invent the block's identity.
+    def _rewrite_stream_server_name(m: "re.Match[str]") -> str:
+        head, token, tail = m.group(1), m.group(2), m.group(3)
+        body = token.strip()
+        if "{{" in body:
+            subs = re.findall(r"--([A-Za-z0-9_-]+)\.", body)
+            if len(subs) != 1:
+                raise ValueError(
+                    f"stream server_name {body!r} cannot be parsed into "
+                    "'--<sub_service>.<domain>' — the conf must name one sub-service per block"
+                )
+            return f"{head}{{{{ hostname_stem }}}}--{subs[0]}.{{{{ domain_name }}}}{tail}"
+        names: list[str] = []
+        for name in body.split():
+            parsed = re.match(r"^.*?--([A-Za-z0-9_-]+)\.(.+?)\s*$", name)
+            if not parsed:
+                raise ValueError(
+                    f"stream server_name {name!r} cannot be parsed into "
+                    "'--<sub_service>.<domain>' — the conf must name one sub-service per block"
+                )
+            names.append("{{ hostname_stem }}--%s.{{ domain_name }}" % parsed.group(1))
+        return head + " ".join(names) + tail
+
+    text = re.sub(
+        r"([ \t]*server_name[ \t]+)([^;\n]+)(;)",
+        _rewrite_stream_server_name,
+        text,
+    )
+
     # The upstream `set $upstream <host>:<port>;` — the stream conf's equivalent
     # of a proxy_pass target. Rewritten only when the host IS a compose service
     # name, like the http path (no heuristics, no prefix stripping).
@@ -331,9 +366,83 @@ def convert_stream_conf(
             text,
         )
 
-    # Everything else is deliberately untouched: `server_name` stays the
-    # canonical name, `listen … ssl` stays unconditional, `allow/deny` and the
-    # `resolver` stay as written, and no auth_basic is injected.
+    # ---- Legacy variable upstream → STATIC (G56 follow-up, 2026-10-23) ----
+    # A historical stream conf may carry the old deferred-resolution form:
+    #
+    #   set $stream_upstream <host>:<port>;
+    #   resolver 127.0.0.11 ...;
+    #   proxy_pass $stream_upstream;
+    #
+    # That form DEFEATS the SNI-based choice of virtual server (every SNI lands
+    # on the first block) and, on the shipped internal nginx, can evaluate
+    # empty — measured 2026-10-23: `no host in upstream ""`, every connection
+    # 500 while the card and the mint looked healthy. The current generator
+    # writes a STATIC pass; a selected historical conf is normalized to the
+    # same shape here, so the converter's output is one form.
+    # The mapping MUST be per server block: the historical conf reuses the
+    # same variable name (`$stream_upstream`) in EVERY block with a different
+    # target, so a conf-wide map collapsed both to the last one — measured in
+    # this round, where the neo4j block was rewritten to falkordb and then
+    # correctly dropped by the profile filter, leaving an empty stream conf.
+    def _normalize_block(block: str) -> str:
+        targets = {
+            m.group(1): m.group(2).strip()
+            for m in re.finditer(
+                r"(?m)^[ \t]*set[ \t]+\$([A-Za-z0-9_]+)[ \t]+([^;\n]+);", block
+            )
+        }
+        used: set[str] = set()
+
+        def _static_pass(m: "re.Match[str]") -> str:
+            var = m.group(2)
+            target = targets.get(var)
+            if target is None:
+                return m.group(0)
+            used.add(var)
+            return f"{m.group(1)}proxy_pass {target}{m.group(3)}"
+
+        out = re.sub(
+            r"(?m)^([ \t]*)proxy_pass[ \t]+\$([A-Za-z0-9_]+)[ \t]*(;)",
+            _static_pass,
+            block,
+        )
+        if used:
+            out = re.sub(
+                r"(?m)^[ \t]*set[ \t]+\$([A-Za-z0-9_]+)[ \t]+[^;\n]+;\n?",
+                lambda m: "" if m.group(1) in used else m.group(0),
+                out,
+            )
+            # The resolver is only needed by the variable form.
+            out = re.sub(r"(?m)^[ \t]*resolver[ \t]+[^;\n]+;\n?", "", out)
+        return out
+
+    spans: list[tuple[int, int]] = []
+    for m in re.finditer(r"(?m)^[ \t]*server[ \t]*\{", text):
+        depth = 0
+        i = m.end() - 1
+        while i < len(text):
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    spans.append((m.start(), i + 1))
+                    break
+            i += 1
+    if spans:
+        rebuilt: list[str] = []
+        cursor = 0
+        for start, end in spans:
+            rebuilt.append(text[cursor:start])
+            rebuilt.append(_normalize_block(text[start:end]))
+            cursor = end
+        rebuilt.append(text[cursor:])
+        text = "".join(rebuilt)
+
+    # Everything else is deliberately untouched: `listen … ssl` stays
+    # unconditional, `allow/deny` and the `resolver` stay as written, and no
+    # auth_basic is injected. `server_name` is templated above (G56) — the one
+    # thing that used to stay verbatim, and the reason the conf was not portable.
     return text
 
 

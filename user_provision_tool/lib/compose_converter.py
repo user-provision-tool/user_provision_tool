@@ -149,6 +149,25 @@ def _collect_bind_mounts(services: dict) -> list[str]:
     return seen
 
 
+def _collect_named_volume_mounts(services: dict, top_volumes: dict) -> list[str]:
+    """Ordered, de-duplicated TOP-LEVEL named volumes used as a mount source.
+
+    G59 (D4 = C): a non-external top-level volume is not a Docker volume any
+    more — it becomes a per-user bind key like a host path. Only the names a
+    service actually mounts are useful; an unused declaration is dropped with
+    the rest.
+    """
+    seen: list[str] = []
+    for svc in services.values():
+        if not isinstance(svc, dict):
+            continue
+        for entry in svc.get("volumes", []) or []:
+            src = _volume_source(entry)
+            if src and src in top_volumes and src not in seen:
+                seen.append(src)
+    return seen
+
+
 def _volume_source(entry: Any) -> str | None:
     if isinstance(entry, str):
         parts = entry.split(":")
@@ -340,6 +359,21 @@ def convert(data: dict) -> tuple[dict, dict[str, str], _TokenRegistry, dict[str,
         key = _unique_key(Path(src).name or src, used_keys)
         src_to_key[src] = key
 
+    # 2a. G59 (D4 = C) — a NON-EXTERNAL top-level named volume is a per-user
+    # bind key too, after the bind keys, in first-appearance order. Its service
+    # entry is rewritten to `{{ volumes['<key>'] }}` by the same transform, and
+    # its top-level declaration is dropped in step 5 below: the user_data path is
+    # the mount, and no orphan Docker volume is left behind. External volumes are
+    # declarations of something the platform does not own and stay untouched.
+    _top_volumes = data.get("volumes")
+    _top_volumes = _top_volumes if isinstance(_top_volumes, dict) else {}
+    for src in _collect_named_volume_mounts(services, _top_volumes):
+        cfg = _top_volumes.get(src)
+        if isinstance(cfg, dict) and cfg.get("external"):
+            continue
+        key = _unique_key(src, used_keys)
+        src_to_key[src] = key
+
     # 2b. Collect declared service env_file paths and assign keys
     env_srcs = _collect_env_files(services)
     env_used: set[str] = set()
@@ -364,16 +398,21 @@ def convert(data: dict) -> tuple[dict, dict[str, str], _TokenRegistry, dict[str,
     net_tok = tokens.tok("{{ network_name }}")
     result["networks"] = {net_tok: {"name": net_tok}}
 
-    # 5. Add explicit name to top-level named volumes (skip external ones)
+    # 5. G59 (D4 = C): non-external top-level volumes became bind keys in step
+    # 2a, so their Docker named-volume declarations are dropped here — keeping
+    # one would leave an orphan volume beside a bind that is the real mount.
+    # EXTERNAL volumes are not ours: they stay declared exactly as written.
     top_volumes = result.get("volumes")
     if isinstance(top_volumes, dict) and top_volumes:
-        new_top: dict = {}
-        for vol_name, vol_cfg in top_volumes.items():
-            cfg = dict(vol_cfg) if isinstance(vol_cfg, dict) else {}
-            if not cfg.get("external"):
-                cfg["name"] = tokens.tok(f"{{{{ container_prefix }}}}{vol_name}")
-            new_top[vol_name] = cfg
-        result["volumes"] = new_top
+        new_top: dict = {
+            vol_name: vol_cfg
+            for vol_name, vol_cfg in top_volumes.items()
+            if isinstance(vol_cfg, dict) and vol_cfg.get("external")
+        }
+        if new_top:
+            result["volumes"] = new_top
+        else:
+            result.pop("volumes", None)
 
     return result, src_to_key, tokens, env_to_key
 

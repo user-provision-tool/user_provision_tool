@@ -106,6 +106,14 @@ class RegisterRequest(BaseModel):
     # travel in one deploy, and the CATEGORY comes from the file name — which is
     # why the stream conf's name is load-bearing (`*.stream.conf` is the pattern
     # the internal nginx includes).
+    #
+    # G55 (2026-10-23): the LIST/SINGULAR shapes above are LEGACY. The request
+    # model is now the per-category map below — one source per category, the
+    # category explicit rather than inferred from the input's file name. The
+    # legacy fields are still accepted and normalized (a list with two entries of
+    # one category is a loud 422, never a silent overwrite).
+    nginx_confs: dict[str, str] | None = None
+    nginx_conf_templates: dict[str, str] | None = None
     nginx_conf_template_paths: list[str] | None = None
     nginx_conf_file_paths: list[str] | None = None
     # Repeatable interpolation env files (order preserved, later wins).
@@ -190,6 +198,30 @@ class RegisterRequest(BaseModel):
         tls_on = bool(self.tls if self.tls is not None else self.https)
         object.__setattr__(self, "tls", tls_on)
 
+        # G41 — the stream category is applicable ONLY when TLS is on. A stream
+        # conf carries no certificates of its own: the renderer fills them from
+        # the deploy's recorded TLS paths, and with tls=false that rendered
+        # `ssl_certificate ;`, failing `nginx -t` and (silently) the reload.
+        # Refuse the incoherent combination rather than deploy a dead vhost.
+        _has_stream = bool(
+            (self.nginx_confs or {}).get("stream")
+            or (self.nginx_conf_templates or {}).get("stream")
+        )
+        if not _has_stream:
+            _legacy = list(self.nginx_conf_file_paths or []) + list(
+                self.nginx_conf_template_paths or []
+            )
+            for _one in (
+                [self.nginx_conf_file_path] if self.nginx_conf_file_path else []
+            ) + ([self.nginx_conf_template_path] if self.nginx_conf_template_path else []):
+                _legacy.append(_one)
+            _has_stream = any(_conf_category(p) == "stream" for p in _legacy)
+        if _has_stream and not tls_on:
+            raise ValueError(
+                "stream nginx confs require tls=true — the stream category is "
+                "only applicable with TLS (its blocks carry the instance's certificates)"
+            )
+
         has_certs = bool(self.fullchain) or bool(self.privkey)
         if tls_on:
             # Both certs, or the vhost cannot be rendered (unchanged behaviour).
@@ -207,6 +239,97 @@ class RegisterRequest(BaseModel):
                 "or drop the certificates (they are ignored otherwise)"
             )
         return self
+
+
+# The conf categories (G55). The category — not the input file name — decides
+# the converter and the rendered output suffix (`*.nginx.conf` / `*.stream.conf`
+# / `*.mail.conf`, which is what the internal nginx's includes select on).
+NGINX_CATEGORIES = ("http", "stream", "mail")
+
+
+def _conf_category(path: str) -> str:
+    """The category of a LEGACY conf path, by its file name (G55's shim)."""
+    name = Path(path).name
+    if name.endswith(".j2"):
+        name = name[:-3]
+    if name.endswith(".stream.conf"):
+        return "stream"
+    if name.endswith(".mail.conf"):
+        return "mail"
+    return "http"
+
+
+def _requested_conf_maps(req: "RegisterRequest") -> tuple[dict[str, str], dict[str, str]]:
+    """Normalize the conf fields into ``(plain, templates)`` category maps.
+
+    G55: the map is the new shape; the singular/list fields are legacy shims.
+    A legacy LIST carrying two entries of one category is a loud 422 — the old
+    renderer would have silently overwritten one with the other.
+    """
+    legacy_present = bool(
+        req.nginx_conf_file_path or req.nginx_conf_template_path
+        or req.nginx_conf_file_paths or req.nginx_conf_template_paths
+    )
+    if (req.nginx_confs or req.nginx_conf_templates) and legacy_present:
+        raise HTTPException(
+            422,
+            "nginx_confs/nginx_conf_templates cannot be combined with the legacy "
+            "nginx_conf_file_path(s)/nginx_conf_template_path(s) fields",
+        )
+
+    if req.nginx_confs is not None or req.nginx_conf_templates is not None:
+        plain = dict(req.nginx_confs or {})
+        templates = dict(req.nginx_conf_templates or {})
+        for cat, path in list(plain.items()) + list(templates.items()):
+            if cat not in NGINX_CATEGORIES:
+                raise HTTPException(
+                    422,
+                    f"unknown nginx conf category {cat!r} — expected one of "
+                    f"{', '.join(NGINX_CATEGORIES)}",
+                )
+            if not isinstance(path, str) or not path.strip():
+                raise HTTPException(422, f"nginx conf for category {cat!r} must be a non-empty path")
+        both = set(plain) & set(templates)
+        if both:
+            raise HTTPException(
+                422,
+                f"category {sorted(both)[0]!r} is supplied as both a plain conf and a template — "
+                "one source per category",
+            )
+        return plain, templates
+
+    plain: dict[str, str] = {}
+    templates: dict[str, str] = {}
+    for path in list(req.nginx_conf_file_paths or []) + (
+        [req.nginx_conf_file_path] if req.nginx_conf_file_path else []
+    ):
+        cat = _conf_category(path)
+        if cat in plain:
+            raise HTTPException(
+                422,
+                f"two nginx confs of category {cat!r} ({plain[cat]!r} and {path!r}) — "
+                "one file per category",
+            )
+        plain[cat] = path
+    for path in list(req.nginx_conf_template_paths or []) + (
+        [req.nginx_conf_template_path] if req.nginx_conf_template_path else []
+    ):
+        cat = _conf_category(path)
+        if cat in templates:
+            raise HTTPException(
+                422,
+                f"two nginx conf templates of category {cat!r} "
+                f"({templates[cat]!r} and {path!r}) — one file per category",
+            )
+        templates[cat] = path
+    both = set(plain) & set(templates)
+    if both:
+        raise HTTPException(
+            422,
+            f"category {sorted(both)[0]!r} is supplied as both a plain conf and a template — "
+            "one source per category",
+        )
+    return plain, templates
 
 
 class RebuildRequest(BaseModel):
@@ -463,16 +586,16 @@ def register_user(
     compose_file_path      = _resolve(req.compose_file_path)
     compose_file_paths     = [_resolve(p) for p in (req.compose_file_paths or [])]
     compose_template_path  = _resolve(req.compose_template_path)
-    nginx_conf_file_path   = _resolve(req.nginx_conf_file_path)
-    nginx_conf_template_path = _resolve(req.nginx_conf_template_path)
-    # The conf slot as a LIST, whatever shape the caller used: a single field is
-    # a one-element list, so everything downstream has one code path (R9.2).
-    nginx_conf_files: list[str] = [
-        _resolve(p) for p in (req.nginx_conf_file_paths or [])
-    ] or ([nginx_conf_file_path] if nginx_conf_file_path else [])
-    nginx_conf_templates: list[str] = [
-        _resolve(p) for p in (req.nginx_conf_template_paths or [])
-    ] or ([nginx_conf_template_path] if nginx_conf_template_path else [])
+    # G55 — one source per category. The legacy singular/list fields are
+    # normalized here (and a duplicate category is refused), so everything
+    # downstream has one shape: {category: path}.
+    _plain_by_cat, _tpl_by_cat = _requested_conf_maps(req)
+    nginx_conf_files_by_cat: dict[str, str] = {
+        cat: _resolve(p) for cat, p in _plain_by_cat.items()
+    }
+    nginx_conf_templates_by_cat: dict[str, str] = {
+        cat: _resolve(p) for cat, p in _tpl_by_cat.items()
+    }
     env_file_path          = _resolve(req.env_file_path)
     env_files_resolved     = [_resolve(p) for p in (req.env_files or [])]
 
@@ -543,18 +666,17 @@ def register_user(
     except Exception:
         pass
 
-    # Each conf is CONVERTED BY CATEGORY — the category being its file name
-    # (R9.2): an http conf takes the http substitutions, a stream conf takes the
-    # stream's own (no auth_basic, no ssl guard, the canonical name kept — G42.1).
-    # The names are the contract: `*.stream.conf` is what the internal nginx's
-    # include matches, so it is required, not cosmetic.
-    nginx_templates: list[str] = []
-    for _path in nginx_conf_files:
+    # Each conf is CONVERTED BY CATEGORY (G55): an http/mail conf takes the http
+    # substitutions, a stream conf takes the stream's own (no auth_basic, no ssl
+    # guard, a templated `server_name` — G56). The category, not the input file
+    # name, decides both the converter and the rendered output suffix.
+    converted_by_cat: dict[str, str] = {}
+    for _cat, _path in nginx_conf_files_by_cat.items():
         src = Path(_path)
         if not src.exists():
             raise HTTPException(404, f"nginx conf not found: {_path}")
         template_out = str(src.parent / f"{src.name}.j2")
-        if src.name.endswith(".stream.conf"):
+        if _cat == "stream":
             from lib.nginx_converter import convert_stream_conf
             try:
                 Path(template_out).write_text(
@@ -578,13 +700,19 @@ def register_user(
                 )
             except Exception as e:
                 raise HTTPException(422, f"could not convert nginx conf file: {e}")
-        nginx_templates.append(template_out)
-    for _tpl in nginx_conf_templates:
+        converted_by_cat[_cat] = template_out
+    for _cat, _tpl in nginx_conf_templates_by_cat.items():
         if not Path(_tpl).exists():
-            raise HTTPException(404, f"nginx_conf_template_path not found: {_tpl}")
-        nginx_templates.append(_tpl)
+            raise HTTPException(404, f"nginx conf template not found: {_tpl} ({_cat})")
+        converted_by_cat[_cat] = _tpl
 
-    nginx_template: str | None = nginx_templates[0] if nginx_templates else None
+    nginx_templates_by_cat: dict[str, str] = {
+        cat: converted_by_cat[cat] for cat in NGINX_CATEGORIES if cat in converted_by_cat
+    }
+    nginx_templates: list[str] = list(nginx_templates_by_cat.values())
+    nginx_template: str | None = (
+        nginx_templates_by_cat.get("http") or (nginx_templates[0] if nginx_templates else None)
+    )
 
     # --- Build kwargs for provisioner call ---
     prov_kwargs = dict(
@@ -599,6 +727,7 @@ def register_user(
         passwd=req.passwd,
         nginx_template=nginx_template,
         nginx_conf_templates=list(nginx_templates),
+        nginx_conf_templates_by_category=nginx_templates_by_cat,
         domain=req.domain,
         env_file=env_file_path,
         env_files=env_files_resolved or None,
@@ -1291,7 +1420,118 @@ def service_url_base(
 # (design §Implementation notes L284-286)
 # ---------------------------------------------------------------------------
 
-def _preview_volume_mapping(project_dir: Path, compose_files: list[str]) -> dict[str, Any]:
+def _preview_volume_paths(
+    service_name: str, user_name: str, label: str, keys: list[str]
+) -> dict[str, dict[str, str]]:
+    """The golden ``volume_paths`` for an identity, or nothing without one (G60).
+
+    "Before an identity exists it gets the keys only" — no user/label means no
+    path, not a guessed one.
+    """
+    if not (service_name and user_name and label):
+        return {}
+    return {
+        "volume_paths": {
+            key: template_engine.volume_path(
+                USER_DATA_DIR, user_name, service_name, str(label), key
+            )
+            for key in keys
+        }
+    }
+
+
+def _active_compose_services(data: dict, profiles: list[str] | None) -> dict[str, Any]:
+    """The compose rule: no non-empty profiles, or one active; `""` ungated."""
+    services = (data or {}).get("services") or {}
+    if not isinstance(services, dict):
+        return {}
+    active = {str(p) for p in (profiles or []) if p}
+    out: dict[str, Any] = {}
+    for name, svc in services.items():
+        if not isinstance(svc, dict):
+            out[name] = svc
+            continue
+        profs = [str(p) for p in (svc.get("profiles") or [])]
+        # Compose's REAL rule (measured 2026-10-24): `profiles: [""]` is the
+        # DEFAULT-STACK marker — it runs only with NO active profile, and is
+        # excluded as soon as one is. No key at all → always runs.
+        if not profs:
+            out[name] = svc
+        elif active:
+            if any(p in active for p in profs if p):
+                out[name] = svc
+        elif "" in profs:
+            out[name] = svc
+    return out
+
+
+def _volume_rows(
+    data: dict, src_to_key: dict[str, str], profiles: list[str] | None
+) -> list[dict[str, str]]:
+    """The mount rows of the ACTIVE services: ``{key, service, target}``.
+
+    The profile filter lives here because the preview is the panel's only source
+    of the table: showing `falkordb_data` on a no-profile deploy was wrong.
+    """
+    rows: list[dict[str, str]] = []
+    for svc_name, svc in _active_compose_services(data, profiles).items():
+        if not isinstance(svc, dict):
+            continue
+        for v in svc.get("volumes") or []:
+            if isinstance(v, str) and ":" in v:
+                src, rest = v.split(":", 1)
+                target = rest.split(":", 1)[0]
+            elif isinstance(v, dict):
+                src = v.get("source")
+                target = v.get("target")
+            else:
+                continue
+            key = src_to_key.get(src)
+            if key and target:
+                rows.append({"key": key, "service": str(svc_name), "target": target})
+    return rows
+
+
+def _volume_targets(data: dict, src_to_key: dict[str, str]) -> dict[str, str]:
+    """``{volume key: container target}`` from the compose, first appearance.
+
+    The panel shows a real MOUNT TABLE (host path → container path); the target
+    is a fact of the compose and the -api remains its only source. A key used
+    by several services/targets keeps the first target (the panel row is one
+    per key; a duplicated target is a compose the operator wrote, not an
+    override the panel can express).
+    """
+    out: dict[str, str] = {}
+    services = (data or {}).get("services") or {}
+    if not isinstance(services, dict):
+        return out
+    for svc in services.values():
+        if not isinstance(svc, dict):
+            continue
+        for v in svc.get("volumes") or []:
+            if isinstance(v, str) and ":" in v:
+                src, rest = v.split(":", 1)
+                target = rest.split(":", 1)[0]
+            elif isinstance(v, dict):
+                src = v.get("source")
+                target = v.get("target")
+            else:
+                continue
+            key = src_to_key.get(src)
+            if key and target and key not in out:
+                out[key] = target
+    return out
+
+
+def _preview_volume_mapping(
+    project_dir: Path,
+    compose_files: list[str],
+    *,
+    service_name: str = "",
+    user_name: str = "",
+    label: str = "",
+    profiles: list[str] | None = None,
+) -> dict[str, Any]:
     """Run the converter in-call on compose file(s) and return the src→key map.
 
     Pure preview — NO files are written and no templates are produced.  This
@@ -1312,7 +1552,13 @@ def _preview_volume_mapping(project_dir: Path, compose_files: list[str]) -> dict
     Returns
     -------
     dict with ``compose_files`` (resolved list), ``src_to_key``
-    (source path → volume key), ``volume_keys`` (ordered keys, first-appearance).
+    (source path → volume key), ``volume_keys`` (ordered keys, first-appearance)
+    and — when an identity is supplied — ``volume_paths`` (key → the golden
+    per-user host path).
+
+    G60 (D8): the -api is the ONLY source of the volume paths. The formula is the
+    pure helper in ``template_engine.volume_path``, shared with the provisioner
+    that creates the directories; this preview still creates nothing.
     """
     import re as _re
     import yaml as _yaml
@@ -1369,6 +1615,12 @@ def _preview_volume_mapping(project_dir: Path, compose_files: list[str]) -> dict
             "compose_files": templates,
             "src_to_key": {k: k for k in seen},
             "volume_keys": seen,
+            # A template-only recipe has no parsed compose to read targets or
+            # services from.
+            "volume_targets": {},
+            "volume_services": {},
+            "volume_rows": [],
+            **_preview_volume_paths(service_name, user_name, label, seen),
         }
 
     if not sources:
@@ -1389,7 +1641,27 @@ def _preview_volume_mapping(project_dir: Path, compose_files: list[str]) -> dict
         _transformed, src_to_key, _tokens, _env_to_key = _convert(merged)
 
     _add(src_to_key)
-    return {"compose_files": sources, "src_to_key": src_to_key, "volume_keys": used}
+    _data = data if len(sources) == 1 else merged
+    rows = _volume_rows(_data, src_to_key, profiles)
+    active_keys = []
+    for r in rows:
+        if r["key"] not in active_keys:
+            active_keys.append(r["key"])
+    services: dict[str, str] = {}
+    targets: dict[str, str] = {}
+    for r in rows:
+        services.setdefault(r["key"], r["service"])
+        targets.setdefault(r["key"], r["target"])
+    return {
+        "compose_files": sources,
+        "src_to_key": src_to_key,
+        # Only the ACTIVE services' volumes: the selected profiles decide.
+        "volume_keys": [k for k in used if k in active_keys],
+        "volume_targets": {k: targets[k] for k in active_keys},
+        "volume_services": {k: services[k] for k in active_keys},
+        "volume_rows": rows,
+        **_preview_volume_paths(service_name, user_name, label, active_keys),
+    }
 
 
 @app.get("/services/{service_name}/compose/preview")
@@ -1397,6 +1669,9 @@ def compose_preview(
     service_name: str,
     compose_files: list[str] = Query(default=[], description="Recipe-relative compose file paths (ordered)"),
     recipe_path: str = Query("", description="Recipe subdirectory path"),
+    user_name: str = Query("", description="Target user, for the golden volume paths"),
+    label: str = Query("", description="Target label, for the golden volume paths"),
+    profiles: list[str] = Query(default=[], description="Active compose profiles"),
 ) -> dict[str, Any]:
     """Lightweight convert/preview: converter in-call src→key mapping.
 
@@ -1421,7 +1696,14 @@ def compose_preview(
             if recipe_path
             else f"Service '{service_name}' not found",
         )
-    return _preview_volume_mapping(project_dir, compose_files)
+    return _preview_volume_mapping(
+        project_dir,
+        compose_files,
+        service_name=service_name,
+        user_name=user_name,
+        label=label,
+        profiles=profiles,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1599,13 +1881,20 @@ def _expected_container_names(entry: dict) -> list[str]:
     if compose_file and Path(compose_file).exists():
         data = _compose_services(compose_file) or {}
         services = data.get("services", {}) or {}
-        active_svcs = {
-            name
-            for name, svc in services.items()
-            if not isinstance(svc, dict)
-            or not [p for p in (svc.get("profiles") or []) if p != ""]
-            or any(p in active_profiles for p in (svc.get("profiles") or []))
-        }
+        # Compose's REAL rule (measured 2026-10-24):
+        #   no profiles key → always runs; `profiles: [""]` → runs only with NO
+        #   active profile; a named profile → runs only when active.
+        def _is_active(svc: Any) -> bool:
+            if not isinstance(svc, dict):
+                return True
+            profs = [str(p) for p in (svc.get("profiles") or [])]
+            if not profs:
+                return True
+            if active_profiles:
+                return any(p in active_profiles for p in profs if p)
+            return "" in profs
+
+        active_svcs = {name for name, svc in services.items() if _is_active(svc)}
 
     stored = entry.get("container_names")
     if stored:
@@ -1691,6 +1980,53 @@ def _task_available(task_id: str) -> bool:
         return False
 
 
+def _active_volume_keys(entry: dict[str, Any]) -> set[str] | None:
+    """The volume keys the ACTIVE compose services actually mount.
+
+    ``None`` when the rendered compose cannot be read (callers then show the
+    full recorded map rather than hiding something on a guess). G61's rule for
+    containers applies to volumes too: a deploy with no active profile must not
+    show a ``falkordb_data`` row for a service that was never started.
+    """
+    compose_file = entry.get("compose_file_path", "")
+    if not compose_file or not Path(compose_file).exists():
+        return None
+    data = _compose_services(compose_file) or {}
+    services = data.get("services", {}) or {}
+    if not isinstance(services, dict):
+        return None
+    profiles = set(entry.get("profiles") or [])
+    volumes = entry.get("volumes") or {}
+    path_to_key = {str(v): k for k, v in volumes.items()}
+    keys: set[str] = set()
+    for name, svc in services.items():
+        if not isinstance(svc, dict):
+            continue
+        svc_profiles = [p for p in (svc.get("profiles") or []) if p]
+        if svc_profiles and not any(p in profiles for p in svc_profiles):
+            continue
+        for v in svc.get("volumes") or []:
+            if isinstance(v, str) and ":" in v:
+                src = v.split(":", 1)[0]
+            elif isinstance(v, dict):
+                src = v.get("source")
+            else:
+                continue
+            key = path_to_key.get(str(src))
+            if key:
+                keys.add(key)
+    return keys
+
+
+def _active_volumes(entry: dict[str, Any]) -> dict[str, str]:
+    """The card's Volumes section: only the active services' mounts."""
+    volumes = dict(entry.get("volumes") or {})
+    keys = _active_volume_keys(entry)
+    if keys is None:
+        return volumes
+    return {k: v for k, v in volumes.items() if k in keys}
+
+
 def _status_for_user(user_name: str, running: dict[str, str]) -> dict[str, Any]:
     entries = registry.get_user(user_name)
     healthy_services, unhealthy_services, missing_services = [], [], []
@@ -1766,7 +2102,9 @@ def _status_for_user(user_name: str, running: dict[str, str]) -> dict[str, Any]:
             "healthy_containers": healthy,
             "unhealthy_containers": unhealthy,
             "missing_containers": missing,
-            "volumes": entry.get("volumes", {}),
+            # G61 — a volume mounted only by an inactive, profile-gated service
+            # is not part of this deployment; do not show it on the card.
+            "volumes": _active_volumes(entry),
             "subnet": entry.get("subnet", ""),
             # The task this instance came from, whether its log still exists, and
             # whether its record still resolves — all three facts live here

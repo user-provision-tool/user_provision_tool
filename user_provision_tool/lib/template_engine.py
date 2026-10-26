@@ -549,17 +549,26 @@ def _strip_location_blocks(content: str, prefix: str) -> str:
     return "\n".join(out)
 
 
-def rendered_conf_name(service_name: str, user_name: str, label: str, template_path: str) -> str:
+def rendered_conf_name(
+    service_name: str,
+    user_name: str,
+    label: str,
+    template_path: str,
+    *,
+    category: str | None = None,
+) -> str:
     """The rendered file name for one conf template — BY CATEGORY (task-doc R9.2).
 
-    The category is the FILE NAME, which is why the name is load-bearing rather
-    than cosmetic: the internal nginx's `stream` block includes
-    `*.stream.conf`, so a stream conf that lands under any other name simply has
-    no route. The http conf keeps today's `*.nginx.conf` (R1.1's rename to
-    `*.http.conf` and its one-off sweep are that requirement's own work), and a
-    mail conf would land as `*.mail.conf` — the third category the artifact's
-    kinds can produce.
+    G55: the category is EXPLICIT when the caller has it (the per-category
+    request map). It is still load-bearing rather than cosmetic: the internal
+    nginx includes `*.nginx.conf` in `http{}`, `*.stream.conf` in `stream{}` and
+    `*.mail.conf` for mail, so a stream conf that lands under any other name
+    simply has no route. The file-name fallback remains for callers that only
+    have a legacy path.
     """
+    if category in ("http", "stream", "mail"):
+        ext = "nginx.conf" if category == "http" else f"{category}.conf"
+        return f"{service_name}.user-{user_name}.{label}.{ext}"
     name = Path(template_path).name
     if name.endswith(".j2"):
         name = name[:-3]
@@ -570,6 +579,22 @@ def rendered_conf_name(service_name: str, user_name: str, label: str, template_p
     else:
         ext = "nginx.conf"
     return f"{service_name}.user-{user_name}.{label}.{ext}"
+
+
+def volume_path(
+    user_data_dir: str | Path,
+    user_name: str,
+    service_name: str,
+    label: str,
+    key: str,
+) -> str:
+    """The golden per-user host path of one volume key — ONE formula (G60).
+
+    Used by the provisioner (which creates the directory) and by the compose
+    preview (which reports it). Keeping it here, pure and side-effect free, is
+    what stops the gateway/dashboard from re-deriving a path that can drift.
+    """
+    return str(Path(user_data_dir) / user_name / service_name / str(label) / key)
 
 
 def render_nginx_conf(
@@ -583,7 +608,8 @@ def render_nginx_conf(
     https: bool = False,
     ssl_certificate_path: str = "",
     ssl_certificate_key_path: str = "",
-) -> None:
+    write: bool = True,
+) -> str:
     """Render a nginx conf template and write the output file (v5 simple form).
 
     When *https* is True, the template can reference:
@@ -711,9 +737,14 @@ def render_nginx_conf(
         flags=re.MULTILINE,
     )
 
-    with open(output_path, "w") as f:
-        f.write(rendered)
-    # Mark rendered nginx conf as generated
-    Path(str(output_path) + ".generated").write_text("")
+    # G61 — the caller may need the rendered TEXT before it is written (the
+    # profile filter rewrites blocks). Returning it always, and writing only
+    # when asked, keeps one renderer and one filter order.
+    if write:
+        with open(output_path, "w") as f:
+            f.write(rendered)
+        # Mark rendered nginx conf as generated
+        Path(str(output_path) + ".generated").write_text("")
+    return rendered
 
 

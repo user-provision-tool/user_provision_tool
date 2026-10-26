@@ -11,7 +11,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from . import auth, docker_ops, registry, subnet_manager, template_engine
+from . import auth, conf_filter, docker_ops, registry, subnet_manager, template_engine
 from .compose_converter import ensure_subnet_ipam_block, get_compose_service_names
 
 # Registry writes are serialised by lib.registry.transaction() — Tier 1
@@ -263,7 +263,7 @@ def _materialize_env_examples(recipe_dir: Path) -> None:
 
 
 def _register_render_and_start(
-    nginx_conf_pairs: list[tuple[str, str]] | None = None,
+    nginx_conf_pairs: dict[str, tuple[str, str]] | list[tuple[str, str]] | None = None,
     *,
     user_name: str,
     service_name: str,
@@ -368,7 +368,11 @@ def _register_render_and_start(
     # The PAIRS arrive from the caller, which knows the instance identity and the
     # category — the stream conf must land as `*.stream.conf` (the pattern the
     # internal nginx's include matches) and nothing here has to know that rule.
-    _pairs = list(nginx_conf_pairs or [])
+    _pairs = (
+        list(nginx_conf_pairs.values())
+        if isinstance(nginx_conf_pairs, dict)
+        else list(nginx_conf_pairs or [])
+    )
     if nginx_template and nginx_out and not _pairs:
         _pairs = [(nginx_template, nginx_out)]
 
@@ -376,15 +380,32 @@ def _register_render_and_start(
         auth.write_htpasswd_file(htpasswd_out, user_name, passwd_hash)
         # Mark htpasswd as generated
         Path(htpasswd_out + ".generated").write_text("")
+    # G61 (D6) — the confs follow the compose's ACTIVE services. Each rendered
+    # block is resolved to the compose service it proxies to; a block whose
+    # service cannot run under the deployment's profiles is dropped BEFORE the
+    # file is written, so the recorded endpoints (read from these files below)
+    # list exactly what is served. Applies to a selected conf and a generated
+    # one, http and stream alike — there is no gateway-side profile logic.
+    _active = conf_filter.compose_active_services(compose_out, profiles)
     for _tpl, _out in _pairs:
-        template_engine.render_nginx_conf(
+        text = template_engine.render_nginx_conf(
             _tpl, _out,
             user_name, service_name, label,
             domain, htpasswd_out or "",
             https=https,
             ssl_certificate_path=ssl_certificate_path,
             ssl_certificate_key_path=ssl_certificate_key_path,
+            write=False,
         )
+        if _active is not None:
+            text, _dropped = conf_filter.filter_conf_blocks(
+                text,
+                active_services=_active[0],
+                all_services=_active[1],
+                container_prefix=prefix,
+            )
+        Path(_out).write_text(text, encoding="utf-8")
+        Path(str(_out) + ".generated").write_text("")
 
     # R3-F53 — record the served endpoints from the confs this function JUST
     # rendered. The entry was built earlier, and reading a rendered conf before
@@ -456,7 +477,9 @@ def _auto_volumes(
             _copy_bind_source_if_empty(vol_dir, declared_src, template_dir)
         if not vol_dir.exists():
             vol_dir.mkdir(parents=True, exist_ok=True)
-        result[key] = str(vol_dir)
+        result[key] = template_engine.volume_path(
+            user_data_dir, user_name, service_name, label, key
+        )
     return result
 
 
@@ -473,9 +496,11 @@ def _stream_sub_services(pairs: list[tuple[str, str]]) -> list[str]:
 
     names: list[str] = []
     for tpl, out in pairs or []:
-        name = str(tpl)
-        if name.endswith(".j2"):
-            name = name[:-3]
+        # G55/G56 — the category of a pair is the RENDERED file's, not the
+        # source's: the stream source is now a recipe-level template
+        # (`nginx.stream.base.<job>.conf[.j2]`), whose name does not carry the
+        # `.stream.conf` suffix. The rendered name always does.
+        name = str(out)
         if not name.endswith(".stream.conf"):
             continue
         try:
@@ -511,17 +536,12 @@ def _http_endpoints(pairs: list[tuple[str, str]], instance_stem: str) -> list[st
     prefix = f"{instance_stem}--"
     found: list[str] = []
     for tpl, out in pairs or []:
-        name = str(tpl)
-        if name.endswith(".j2"):
-            name = name[:-3]
-        # The http category is "everything that is a conf and is NOT the stream
-        # kind" — the same dispatch the -api's renderer uses. A generated http
-        # conf is named `nginx.base.<job>.conf` (the job token is a collision
-        # guard, not an identity), so matching a fixed suffix like `.nginx.conf`
-        # silently missed every generated one: measured 2026-10-10, where a real
-        # deploy served both extra endpoints and recorded NEITHER, because the
-        # template's name ended `.conf` and nothing else.
-        if not name.endswith(".conf") or name.endswith(".stream.conf"):
+        # G55 — the RENDERED name carries the category (`*.nginx.conf`,
+        # `*.stream.conf`, `*.mail.conf`); the source may be a recipe-level
+        # template whose name does not. Classifying by the source put the stream
+        # conf in the http bucket.
+        name = str(out)
+        if not name.endswith(".conf") or name.endswith(".stream.conf") or name.endswith(".mail.conf"):
             continue
         try:
             text = Path(out).read_text(encoding="utf-8", errors="replace")
@@ -554,6 +574,7 @@ def register_user(
     nginx_container: str = "subnet-acl-nginx",
     nginx_output_dir: str | Path | None = None,
     nginx_conf_templates: list[str] | None = None,
+    nginx_conf_templates_by_category: dict[str, str] | None = None,
     user_data_dir: str | Path | None = None,
     build_args: dict[str, str] | None = None,
     https: bool = False,
@@ -725,17 +746,43 @@ def register_user(
     compose_out = str(output_dir / f"docker-compose.user-{user_name}.{label}.yml")
     nginx_out: str | None = None
     htpasswd_out: str | None = None
-    nginx_out_by_category: list[tuple[str, str]] = []
+    # G55 — ONE rendered file per category, and the category (not the input file
+    # name) drives the output suffix the internal nginx includes on.
+    nginx_out_by_category: dict[str, tuple[str, str]] = {}
 
     if nginx_template:
         nginx_out = str(nginx_dir / f"{service_name}.user-{user_name}.{label}.nginx.conf")
         if passwd_hash:
             htpasswd_out = str(nginx_dir / f"{service_name}.user-{user_name}.{label}.htpasswd")
-    for _tpl in (nginx_conf_templates or []):
-        nginx_out_by_category.append((
-            _tpl,
-            str(nginx_dir / template_engine.rendered_conf_name(service_name, user_name, label, _tpl)),
-        ))
+    if nginx_conf_templates_by_category:
+        for _cat, _tpl in nginx_conf_templates_by_category.items():
+            nginx_out_by_category[_cat] = (
+                _tpl,
+                str(nginx_dir / template_engine.rendered_conf_name(
+                    service_name, user_name, label, _tpl, category=_cat
+                )),
+            )
+    else:
+        for _tpl in (nginx_conf_templates or []):
+            _name = Path(_tpl).name
+            if _name.endswith(".j2"):
+                _name = _name[:-3]
+            _cat = (
+                "stream" if _name.endswith(".stream.conf")
+                else "mail" if _name.endswith(".mail.conf")
+                else "http"
+            )
+            if _cat in nginx_out_by_category:
+                # One file per category: never overwrite silently.
+                raise ValueError(
+                    f"two nginx confs of category {_cat!r} — one file per category"
+                )
+            nginx_out_by_category[_cat] = (
+                _tpl,
+                str(nginx_dir / template_engine.rendered_conf_name(
+                    service_name, user_name, label, _tpl, category=_cat
+                )),
+            )
 
     # --- Gap 8: auto re-convert old compose templates when subnet pools are
     # enabled. If the template lacks the {% if subnet %} ipam block, the
@@ -782,8 +829,17 @@ def register_user(
         # path — which is what the delete sweep walks and what the card's
         # per-sub-service list is keyed by. The singular fields above stay as the
         # http conf for the readers that predate the list.
-        "nginx_conf_template_paths": [t for t, _o in nginx_out_by_category] or ([nginx_template] if nginx_template else []),
-        "nginx_conf_paths": [o for _t, o in nginx_out_by_category] or ([nginx_out] if nginx_out else []),
+        "nginx_conf_template_paths": [t for t, _o in nginx_out_by_category.values()] or ([nginx_template] if nginx_template else []),
+        "nginx_conf_paths": [o for _t, o in nginx_out_by_category.values()] or ([nginx_out] if nginx_out else []),
+        # G55 — the per-category record. The lists above stay for readers that
+        # predate the map; these two are the authority for "one file per
+        # category" and for the stream mint's rendered-conf lookup.
+        "nginx_conf_template_paths_by_category": {
+            cat: t for cat, (t, _o) in nginx_out_by_category.items()
+        },
+        "nginx_conf_paths_by_category": {
+            cat: o for cat, (_t, o) in nginx_out_by_category.items()
+        },
         # R6.1/R9.2: the card must know which SUB-SERVICES this instance exposes a
         # stream endpoint for, and it decides that from the RECORDED state — never
         # by re-deriving "TLS is on and a row exists" in the panel. The names come
@@ -791,13 +847,13 @@ def register_user(
         # names the edge dials and the internal nginx selects on, so the card and
         # the routing cannot disagree. Names, not ports — the registry stays
         # ports-free.
-        "stream_sub_services": _stream_sub_services(nginx_out_by_category),
+        "stream_sub_services": _stream_sub_services(list(nginx_out_by_category.values())),
         # R1.5/R6.2 — and the EXTRA http endpoints it serves, read from the same
         # rendered confs. The card's URL section is built from these (plus the
         # primary, keyed `primary`), so the surface cannot offer a link the
         # deployment does not have.
         "http_endpoints": _http_endpoints(
-            nginx_out_by_category, f"{service_name}-{user_name}-{label}"
+            list(nginx_out_by_category.values()), f"{service_name}-{user_name}-{label}"
         ),
         "env_file_path": env_file,
         "env_files": [],  # filled after render (order preserved)

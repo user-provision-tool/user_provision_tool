@@ -201,11 +201,20 @@ def _run(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
                 target=_terminate_on_cancel, args=(proc, _cancel_event), daemon=True
             ).start()
         proc.wait()
-        # Close write ends so reader threads see EOF and exit
-        proc.stdout.close()  # type: ignore[union-attr]
-        proc.stderr.close()  # type: ignore[union-attr]
-        t_out.join()
-        t_err.join()
+        # DRAIN FIRST, close second. `wait()` returns when the process exits,
+        # not when the reader threads have consumed the pipe: closing the read
+        # ends here discarded whatever was still buffered. Measured 2026-10-24
+        # inside the -api container: `docker compose config` output was cut at
+        # ~1.5 KB, the merged compose silently lost services, and a multi-file
+        # compose preview returned no volumes. The child's exit closes the
+        # write ends, so the readers see EOF on their own.
+        t_out.join(timeout=15)
+        t_err.join(timeout=15)
+        try:
+            proc.stdout.close()  # type: ignore[union-attr]
+            proc.stderr.close()  # type: ignore[union-attr]
+        except OSError:
+            pass
 
     stdout = "".join(stdout_lines)
     stderr = "".join(stderr_lines)

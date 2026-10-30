@@ -16,13 +16,13 @@
 
 server {
     listen 80;
-    server_name {{ hostname }};
+    server_name {{ hostname_stem }}--web.{{ domain_name }};
     return 301 https://$host$request_uri;
 }
 
 server {
     listen 443 ssl;
-    server_name {{ hostname }};
+    server_name {{ hostname_stem }}--web.{{ domain_name }};
 
     ssl_certificate     {{ ssl_certificate_path }};
     ssl_certificate_key {{ ssl_certificate_key_path }};
@@ -44,7 +44,7 @@ server {
 
 server {
     listen 80;
-    server_name {{ hostname }};
+    server_name {{ hostname_stem }}--web.{{ domain_name }};
 
     auth_basic "{{ service_name }} - {{ user_name }}";
     auth_basic_user_file {{ htpasswd_path }};

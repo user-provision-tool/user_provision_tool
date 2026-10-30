@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import docker_ops, registry
+from . import docker_ops, registry, stream_access
 
 _log = logging.getLogger(__name__)
 
@@ -109,7 +109,7 @@ def regenerate_nginx_confs() -> dict[str, Any]:
         if hostname and "." in hostname:
             domain = hostname.split(".", 1)[1]
         try:
-            template_engine.render_nginx_conf(
+            text = template_engine.render_nginx_conf(
                 nginx_tpl,
                 nginx_out,
                 user_name,
@@ -120,7 +120,16 @@ def regenerate_nginx_confs() -> dict[str, Any]:
                 https=registry.entry_tls(entry),
                 ssl_certificate_path=entry.get("ssl_certificate_path") or "",
                 ssl_certificate_key_path=entry.get("ssl_certificate_key_path") or "",
+                write=False,
             )
+            # R14 — a legacy template still renders its bare primary block. The
+            # instance host must not become a route again on the next boot, so
+            # regeneration drops every block without `--<sub_service>` before it
+            # is written. New templates are unchanged.
+            from .nginx_converter import strip_unserved_http_blocks
+            text = strip_unserved_http_blocks(text)
+            Path(nginx_out).write_text(text, encoding="utf-8")
+            Path(str(nginx_out) + ".generated").write_text("")
             regenerated += 1
         except Exception as exc:
             errors.append({
@@ -248,6 +257,35 @@ def recover_on_startup(
     except Exception:
         _log.exception("nginx conf regeneration failed during startup recovery")
 
+    # R14 migration: rendered confs from before the primary removal still serve
+    # the instance host (a bare `server_name` with no `--<sub_service>`). Strip
+    # those blocks once, before the reload below, so the old host stops routing.
+    # The render-time guard already covers a re-render; this catches confs whose
+    # entry has no template to re-render from.
+    try:
+        from .nginx_converter import migrate_rendered_http_confs
+        migrated_http = migrate_rendered_http_confs(_generated_dir())
+        if migrated_http:
+            _log.info(
+                "nginx recovery: stripped bare primary block from %d http conf(s)",
+                len(migrated_http),
+            )
+    except Exception:
+        _log.exception("http primary-block migration failed during startup recovery")
+
+    # Central stream policy migration: confs rendered by the previous design
+    # carry a per-server allow/deny, which would override the stream-context
+    # list. Strip them before the reload below.
+    try:
+        migrated = stream_access.migrate_rendered_stream_confs()
+        if migrated:
+            _log.info(
+                "nginx recovery: stripped per-server stream policy from %d conf(s)",
+                len(migrated),
+            )
+    except Exception:
+        _log.exception("stream policy migration failed during startup recovery")
+
     # --- Sweep transient statuses BEFORE the zombie scan (doc §4c, GRILLING G11) ---
     # Tasks live inside the -api process, so at boot any entry still in a
     # transient status is by definition stale — nothing is working on it.
@@ -319,7 +357,7 @@ def recover_on_startup(
             _log.warning("Failed to connect %s to network %s", nginx_container, net)
 
     try:
-        docker_ops.nginx_reload(nginx_container)
+        stream_access.refresh_and_reload(nginx_container)
         nginx_reloaded = True
     except Exception:
         _log.warning("Failed to reload %s", nginx_container)
@@ -446,7 +484,7 @@ def run_reconciliation(
 
     # --- Reload nginx ---
     try:
-        docker_ops.nginx_reload(nginx_container)
+        stream_access.refresh_and_reload(nginx_container)
         nginx_reloaded = True
     except Exception:
         nginx_reloaded = False
@@ -523,7 +561,7 @@ def repair_nginx_attachments(nginx_container: str = "subnet-acl-nginx") -> dict[
 
     reloaded = True
     try:
-        docker_ops.nginx_reload(nginx_container)
+        stream_access.refresh_and_reload(nginx_container)
     except Exception:
         reloaded = False
 

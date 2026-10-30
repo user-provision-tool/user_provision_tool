@@ -412,6 +412,76 @@ def nginx_restart(container: str) -> None:
     _run(["docker", "restart", container], check=False)
 
 
+class NetworkSubnetError(RuntimeError):
+    """The platform network's IPv4 subnet cannot be determined.
+
+    Raised when ``SHARED_NETWORK`` is unset, the named network does not exist,
+    or it does not carry exactly one IPv4 IPAM subnet. A stream registration
+    fails closed on this; an HTTP one never asks.
+    """
+
+
+def shared_network_subnet(network: str | None = None) -> str:
+    """The single IPv4 subnet of the network named by ``SHARED_NETWORK``.
+
+    ``nginx``'s ``allow`` takes an address and prefix, not a network name, so
+    this one lookup is the translation. The name comes from the environment
+    (the stack's compose sets it); no name or CIDR is hardcoded here. Only the
+    named network is inspected — never this container's own attachments and
+    never another stack.
+    """
+    import ipaddress
+    import json
+
+    name = (network if network is not None else os.environ.get("SHARED_NETWORK", "")).strip()
+    if not name:
+        raise NetworkSubnetError(
+            "SHARED_NETWORK is not set — the platform network whose subnet the "
+            "stream policy allows cannot be determined"
+        )
+    try:
+        result = subprocess.run(
+            ["docker", "network", "inspect", name],
+            text=True, capture_output=True, timeout=DOCKER_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise NetworkSubnetError(f"docker network inspect {name!r} failed: {exc}") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip().splitlines()
+        raise NetworkSubnetError(
+            f"docker network inspect {name!r} failed: "
+            + (detail[-1] if detail else f"exit {result.returncode}")
+        )
+    try:
+        data = json.loads(result.stdout)
+    except ValueError as exc:
+        raise NetworkSubnetError(
+            f"docker network inspect {name!r} returned unreadable JSON: {exc}"
+        ) from exc
+
+    subnets: list[str] = []
+    for net in (data if isinstance(data, list) else [data]):
+        for cfg in ((net.get("IPAM") or {}).get("Config") or []):
+            subnet = cfg.get("Subnet")
+            if not subnet:
+                continue
+            if ":" in subnet:          # IPv6 — nginx's allow would need a prefix
+                continue               # length nginx cannot express here
+            subnets.append(subnet)
+    if len(subnets) != 1:
+        raise NetworkSubnetError(
+            f"network {name!r} carries {len(subnets)} IPv4 subnet(s) "
+            f"({subnets or 'none'}) — exactly one is required, so the policy "
+            "cannot be guessed"
+        )
+    try:
+        return str(ipaddress.ip_network(subnets[0], strict=False))
+    except ValueError as exc:
+        raise NetworkSubnetError(
+            f"network {name!r} has an invalid IPv4 subnet {subnets[0]!r}: {exc}"
+        ) from exc
+
+
 def docker_info() -> dict[str, Any]:
     """Return docker system info including container counts."""
     result = subprocess.run(

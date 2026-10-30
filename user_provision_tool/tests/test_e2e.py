@@ -206,7 +206,7 @@ class TestE2ERegistration:
         nginx_path = Path(registered_alice["nginx_conf_path"])
         assert nginx_path.exists()
         content = nginx_path.read_text()
-        assert "server_name myapp-alice-0.example.com;" in content
+        assert "server_name myapp-alice-0--web.example.com;" in content
         assert "auth_basic_user_file" in content
         # Verify proxy_pass was rendered with the correct container_prefix
         assert "proxy_pass" in content
@@ -1022,7 +1022,7 @@ class TestE2EConverterIntegration:
         nginx_path = Path(entry["nginx_conf_path"])
         assert nginx_path.exists()
         content = nginx_path.read_text()
-        assert "server_name myapp-alice-0.example.com;" in content
+        assert "server_name myapp-alice-0--web.example.com;" in content
 
     def test_fc_and_tc_are_mutually_exclusive(self, tmp_path, mock_docker, monkeypatch):
         """Passing both -fc and -tc must fail with non-zero exit."""

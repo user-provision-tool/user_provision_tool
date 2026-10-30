@@ -597,6 +597,30 @@ def volume_path(
     return str(Path(user_data_dir) / user_name / service_name / str(label) / key)
 
 
+def is_stream_conf_path(path: str | Path) -> bool:
+    """Is this template/rendered file a STREAM conf?
+
+    The category survives in the name: generated templates are
+    `nginx.stream.base.<token>.conf` and rendered confs end `.stream.conf`.
+    """
+    name = Path(path).name
+    return (
+        ".stream." in name
+        or name.endswith(".stream.conf")
+        or name.endswith(".stream.conf.j2")
+    )
+
+
+def is_mail_conf_path(path: str | Path) -> bool:
+    """Is this template/rendered file a MAIL conf? Mail is outside the policy rules."""
+    name = Path(path).name
+    return (
+        ".mail." in name
+        or name.endswith(".mail.conf")
+        or name.endswith(".mail.conf.j2")
+    )
+
+
 def render_nginx_conf(
     template_path: str,
     output_path: str,
@@ -609,6 +633,7 @@ def render_nginx_conf(
     ssl_certificate_path: str = "",
     ssl_certificate_key_path: str = "",
     write: bool = True,
+    stream_allow_subnet: str = "",
 ) -> str:
     """Render a nginx conf template and write the output file (v5 simple form).
 
@@ -626,6 +651,14 @@ def render_nginx_conf(
     (decision 8) so nginx defers upstream resolution to request time. NO ACL
     scaffolding is ever injected (the gate lives at the edge). Independent of
     ``ENABLE_ACL`` / ``PORTAL_MODE``.
+
+    STREAM policy is no longer per conf. The platform owns ONE stream-context
+    list (`stream-access.conf` + a static `deny all;`, written by
+    ``lib.stream_access`` immediately before each nginx reload), so a stream
+    render REMOVES any top-level `allow`/`deny` it finds — including the
+    placeholder pair older templates still carry. ``stream_allow_subnet`` is
+    accepted as a deprecated compatibility value for such a template; it is
+    never resolved here.
     """
     env, tpl_name = _make_env(template_path)
     prefix = container_prefix(service_name, user_name, label)
@@ -658,8 +691,25 @@ def render_nginx_conf(
         "https": https,
         "ssl_certificate_path": ssl_certificate_path,
         "ssl_certificate_key_path": ssl_certificate_key_path,
+        # Deprecated compatibility key: an older stream template may still
+        # contain `allow {{ stream_allow_subnet }};`. It renders empty and the
+        # whole policy line is removed below; no value is resolved here.
+        "stream_allow_subnet": stream_allow_subnet,
     }
     rendered = env.get_template(tpl_name).render(**ctx)
+
+    if is_stream_conf_path(template_path):
+        # Defence in depth (and the migration path): per-server AND file-level
+        # policy must not override the central stream-context list.
+        from .nginx_converter import remove_stream_policy
+
+        rendered = remove_stream_policy(rendered)
+    elif not is_mail_conf_path(template_path):
+        # HTTP policy is not part of the platform behaviour. A template that
+        # bypassed conversion still cannot serve an operator rule.
+        from .nginx_converter import remove_http_policy
+
+        rendered = remove_http_policy(rendered)
 
     # --- auth_basic lives at server level (v5 §5). Empty htpasswd → open. ---
     if not htpasswd_path:

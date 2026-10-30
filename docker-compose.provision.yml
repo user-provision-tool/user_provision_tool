@@ -22,6 +22,12 @@ services:
       - SOURCE_PROJECTS_DIR=${PROVISION_DIR:-/srv/provision_subnet_acl}/source_projects
       - REGISTRY_FILE=${PROVISION_DIR:-/srv/provision_subnet_acl}/generated/user_registry.yml
       - NGINX_CONTAINER=subnet-acl-nginx
+      # The network whose IPv4 subnet a stream block's `allow` rule names. It is
+      # the same network this compose already attaches the -api to; the value is
+      # resolved at render time with `docker network inspect`, never hardcoded in
+      # the application. Required for a stream registration (fail-closed); an
+      # HTTP one proceeds without it.
+      - SHARED_NETWORK=${SHARED_NETWORK:-subnet_acl_shared}
       # Per-stack namespace for instance networks, container names and named volumes.
       # Networks/containers/volumes are global to the Docker daemon, so without this two
       # stacks on one host derive the same names for the same (service, user, label) and the
@@ -97,4 +103,4 @@ services:
 networks:
   subnet_acl_shared:
     external: true
-    name: subnet_acl_shared
+    name: ${SHARED_NETWORK:-subnet_acl_shared}

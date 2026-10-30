@@ -22,6 +22,7 @@ Environment variables:
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 import os
@@ -36,7 +37,7 @@ from pydantic import BaseModel, Field, field_validator
 # Make lib/ importable when the file sits at the project root
 sys.path.insert(0, str(Path(__file__).parent))
 
-from lib import docker_ops, provisioner, reconciliation, registry, subnet_manager, template_engine, validation
+from lib import docker_ops, provisioner, reconciliation, registry, stream_access, subnet_manager, template_engine, validation
 from lib.compose_converter import compose_file_to_template, get_compose_service_names
 from lib.nginx_converter import nginx_file_to_template
 from lib.task_manager import Task, TaskCapacityError, task_manager
@@ -367,6 +368,13 @@ async def lifespan(app: FastAPI):
         )
     except Exception:
         _log.exception("Startup recovery failed")
+    # Fail-closed policy refresh even when recovery failed: write the file from
+    # the current network and reload only if the content changed. With no file
+    # the stream context's static `deny all;` already applies.
+    try:
+        stream_access.refresh_and_reload(NGINX_CONTAINER, only_if_changed=True)
+    except Exception:
+        _log.exception("Startup stream-policy refresh failed")
     # The recovery above runs when THIS process starts; it cannot run when the
     # INTERNAL NGINX is recreated underneath it — and a recreate is what destroys
     # the per-user attachments in the first place (GRILLING G46; measured
@@ -385,6 +393,15 @@ async def lifespan(app: FastAPI):
     # an INFO line goes nowhere and a watcher that failed to start would be
     # indistinguishable from one that is quietly working.
     print(f"[provision-api] nginx recreate watcher started "
+          f"(container={NGINX_CONTAINER})", flush=True)
+    # R12 — an INSTANCE container started/recreated outside the -api changes the
+    # address a static stream upstream resolves to, with no reload.  This second
+    # watcher observes those events (filtered to registered instance containers)
+    # and reloads after the endpoint is current.  It is the out-of-band
+    # complement of R16's reloads, which stay.
+    from lib import instance_events as _instance_events
+    _instance_events.start_watcher(NGINX_CONTAINER)
+    print(f"[provision-api] instance-container watcher started "
           f"(container={NGINX_CONTAINER})", flush=True)
     yield
 
@@ -530,8 +547,8 @@ def network_connect_ep(network: str, container: str) -> dict[str, Any]:
 
 @app.post("/docker/nginx/reload")
 def nginx_reload_ep(container: str = "subnet-acl-nginx") -> dict[str, Any]:
-    docker_ops.nginx_reload(container)
-    return {"reloaded": True}
+    result = stream_access.refresh_and_reload(container)
+    return {"reloaded": True, **result}
 
 
 @app.post("/docker/nginx/env")
@@ -694,6 +711,13 @@ def register_user(
             if _compose_svc_names:
                 _validate_nginx_proxy_targets(src, _compose_svc_names)
             try:
+                # R14 — a NEW selection naming the instance host (or any name
+                # without `--<sub_service>`) is refused before anything is
+                # written; every HTTP endpoint is an equal `--<sub>` route.
+                from lib.nginx_converter import reject_bare_http_server_names
+                reject_bare_http_server_names(
+                    src.read_text(encoding="utf-8", errors="replace")
+                )
                 nginx_file_to_template(
                     str(src), template_out, req.service_name,
                     compose_service_names=_compose_svc_names or None,
@@ -704,6 +728,41 @@ def register_user(
     for _cat, _tpl in nginx_conf_templates_by_cat.items():
         if not Path(_tpl).exists():
             raise HTTPException(404, f"nginx conf template not found: {_tpl} ({_cat})")
+        # A SELECTED `.j2` is normalized with the same certificate and policy
+        # rules as a converted plain conf (R5/R8/R11) — the operator is not
+        # asked to know the platform's certificate store or its network. The
+        # source file is never rewritten: a changed copy is written beside it.
+        from lib.nginx_converter import (
+            normalize_http_template, normalize_stream_template,
+            reject_bare_http_server_names,
+        )
+        _src = Path(_tpl)
+        _text = _src.read_text(encoding="utf-8", errors="replace")
+        if _cat == "stream":
+            _normalize = normalize_stream_template
+        elif _cat == "http":
+            _normalize = normalize_http_template
+        else:
+            # Mail is outside this feature's scope; its template is used as-is.
+            converted_by_cat[_cat] = _tpl
+            continue
+        try:
+            # R14 — the same refusal for a selected `.j2`: a template that still
+            # names the instance host (or any bare name) is not a valid new
+            # selection. A legacy normalized copy is not rewritten here.
+            if _cat == "http":
+                reject_bare_http_server_names(_text)
+            _norm = _normalize(_text)
+        except ValueError as e:
+            raise HTTPException(422, f"could not normalize {_cat} template {_tpl}: {e}")
+        if _norm != _text:
+            _out = _src.parent / f"{_src.stem}.normalized{_src.suffix}"
+            try:
+                _out.write_text(_norm, encoding="utf-8")
+                Path(str(_out) + ".generated").write_text("")
+            except OSError as e:
+                raise HTTPException(500, f"could not write normalized template: {e}")
+            _tpl = str(_out)
         converted_by_cat[_cat] = _tpl
 
     nginx_templates_by_cat: dict[str, str] = {
@@ -713,6 +772,16 @@ def register_user(
     nginx_template: str | None = (
         nginx_templates_by_cat.get("http") or (nginx_templates[0] if nginx_templates else None)
     )
+
+    # R10 — a STREAM registration fails closed when the platform network cannot
+    # be resolved: its conf would carry `allow {{ stream_allow_subnet }}`, and an
+    # unfillable value is an unscoped or unloadable door, never a default. An
+    # HTTP registration never asks and proceeds.
+    if "stream" in nginx_templates_by_cat:
+        try:
+            docker_ops.shared_network_subnet()
+        except Exception as e:  # noqa: BLE001 — every cause refuses the same way
+            raise HTTPException(422, f"stream registration refused: {e}")
 
     # --- Build kwargs for provisioner call ---
     prov_kwargs = dict(
@@ -824,6 +893,7 @@ def rebuild_user(
         label=label,
         no_cache=req.no_cache,
         build_args=req.build_args,
+        nginx_container=NGINX_CONTAINER,
     )
 
     if sync:
@@ -865,6 +935,7 @@ def start_user_service(
             user_name=user_name,
             service_name=service_name,
             label=label,
+            nginx_container=NGINX_CONTAINER,
         )
     except KeyError as e:
         raise HTTPException(404, str(e))
@@ -885,10 +956,11 @@ def stop_user_service(
 ) -> dict[str, Any]:
     """Stop a user's service containers (docker compose stop)."""
     try:
-        provisioner.stop_service(
+        result = provisioner.stop_service(
             user_name=user_name,
             service_name=service_name,
             label=label,
+            nginx_container=NGINX_CONTAINER,
         )
     except KeyError as e:
         raise HTTPException(404, str(e))
@@ -896,7 +968,57 @@ def stop_user_service(
         raise HTTPException(404, str(e))
     except RuntimeError as e:
         raise HTTPException(500, str(e))
-    return {"message": "Service stopped.", "status": "down"}
+    return {"message": "Service stopped.", "status": "down", **(result or {})}
+
+
+@app.post("/users/{user_name}/stop")
+def stop_all_user_services(user_name: str) -> dict[str, Any]:
+    """Stop every service of one username; keep registry/files/containers.
+
+    Account deletion (G78) calls this BEFORE touching the account. It is
+    deliberately a **200 with per-service results** even when some stops fail:
+    the caller must abort on ``ok: false`` and report which services failed,
+    not lose that list in a generic HTTP error. Every entry is attempted; a
+    failure does not skip the rest, and an already-stopped service stays
+    stopped (``stop_service`` is idempotent).
+    """
+    entries = registry.get_user(user_name)
+    results: list[dict[str, Any]] = []
+    for entry in entries:
+        service_name = str(entry.get("service_name", ""))
+        label = str(entry.get("label", ""))
+        try:
+            detail = provisioner.stop_service(
+                user_name=user_name,
+                service_name=service_name,
+                label=label,
+                nginx_container=NGINX_CONTAINER,
+            )
+            results.append({
+                "service_name": service_name,
+                "label": label,
+                "ok": True,
+                "detail": detail or {},
+            })
+        except Exception as exc:  # noqa: BLE001 — report every failure, keep going
+            results.append({
+                "service_name": service_name,
+                "label": label,
+                "ok": False,
+                "error": str(exc),
+            })
+
+    failed = [r for r in results if not r["ok"]]
+    return {
+        "user_name": user_name,
+        "ok": not failed,
+        "results": results,
+        "failed_services": [
+            {"service_name": r["service_name"], "label": r["label"],
+             "error": r["error"]}
+            for r in failed
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1404,15 +1526,26 @@ def service_url_base(
     domain: str = Query("localhost"),
     scheme: str = Query("http"),
 ) -> dict[str, str]:
-    """Return the hostname (and scheme echo) a deployed instance will be served on.
+    """Return the instance IDENTITY host and the canonical endpoint pattern.
 
-    This is the SAME hostname the deploy path writes into the per-user nginx
-    ``server_name`` (via :func:`template_engine.service_hostname`), so a caller
-    can assemble a URL BEFORE the service exists that matches what the deploy
-    will produce — consistency by shared code, not by replaying a saved string.
+    R14 — the returned ``hostname`` is the instance's identity (registry key,
+    container prefix, canonical-name stem); it is **not a route**.  Every HTTP
+    endpoint is ``<hostname_stem>--<sub_service>.<domain>``, so callers that
+    need a reachable name use ``served_name_pattern`` (or the serving-ports
+    artifact's own rows), never the bare host.
+
+    The identity is still what the deploy path uses as the stem
+    (:func:`template_engine.service_hostname`), so the two cannot drift.
     """
     host = template_engine.service_hostname(service_name, user_name, label, domain)
-    return {"hostname": host, "scheme": scheme, "domain": domain}
+    stem = f"{service_name}-{user_name}-{label}"
+    return {
+        "hostname": host,
+        "hostname_stem": stem,
+        "served_name_pattern": f"{stem}--<sub_service>.{domain}",
+        "scheme": scheme,
+        "domain": domain,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1914,6 +2047,37 @@ def _expected_container_names(entry: dict) -> list[str]:
     return []
 
 
+def _has_auth(entry: dict[str, Any]) -> bool:
+    """Whether the instance's rendered HTTP conf actually carries auth_basic.
+
+    The card's public/unguarded warning must describe the CONFIG, not merely
+    whether a plaintext password happens to still be recorded. A lost
+    ``passwd_plain`` does not remove a rendered ``auth_basic`` directive, and a
+    passwd-less deployment has none. Read the rendered conf first and fall back
+    to the recorded credential only when the file is unavailable.
+    """
+    paths: list[str] = []
+    for key in ("nginx_conf_path",):
+        v = entry.get(key)
+        if isinstance(v, str) and v:
+            paths.append(v)
+    for v in (entry.get("nginx_conf_paths") or []):
+        if isinstance(v, str) and v:
+            paths.append(v)
+    read_any = False
+    for p in paths:
+        try:
+            text = Path(p).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        read_any = True
+        if re.search(r'^[ \t]*auth_basic[ \t]+', text, re.MULTILINE):
+            return True
+    if read_any:
+        return False
+    return bool(entry.get("passwd_plain"))
+
+
 def _recipe_path_for_entry(entry: dict[str, Any]) -> str:
     """Recipe subdirectory of one instance, relative to its project dir.
 
@@ -2040,16 +2204,21 @@ def _status_for_user(user_name: str, running: dict[str, str]) -> dict[str, Any]:
         unhealthy: dict[str, str] = {}
         missing: dict[str, str] = {}
 
+        # R13/T5 — `Exited (0)` is a completed ONE-SHOT init when something else
+        # of the instance is still up; when NOTHING is up, those same containers
+        # are a STOPPED instance. Treating every Exited(0) as healthy made a
+        # stopped instance read as running: the card kept offering "Stop" and
+        # never "Start", and the stream probe had no way back through the UI.
+        _any_up = any("up" in str(running.get(c, "")).lower() for c in expected_names)
         for cname in expected_names:
             if cname in running:
                 status = running[cname]
                 if "unhealthy" in status.lower():
                     unhealthy[cname] = status
-                elif (
-                    "up" in status.lower()
-                    or "healthy" in status.lower()
-                    or "exited (0)" in status.lower()  # one-shot completed successfully
-                ):
+                elif "up" in status.lower() or "healthy" in status.lower():
+                    healthy[cname] = status
+                elif "exited (0)" in status.lower() and _any_up:
+                    # one-shot completed successfully beside a running service
                     healthy[cname] = status
                 else:
                     unhealthy[cname] = status
@@ -2083,6 +2252,13 @@ def _status_for_user(user_name: str, running: dict[str, str]) -> dict[str, Any]:
             # the service URL — and each extra endpoint — pointed at a host that
             # does not exist.
             "hostname": entry.get("hostname") or "",
+            # The public card's unguarded warning and the gateway's public URL
+            # annotation both read these recorded facts. `has_auth` is true
+            # only when the deploy recorded a plaintext Basic credential, which
+            # is exactly the condition under which the rendered conf carries
+            # auth_basic.
+            "has_auth": _has_auth(entry),
+            "tls": bool(entry.get("tls") if "tls" in entry else entry.get("https")),
             "stream_sub_services": entry.get("stream_sub_services") or [],
             # R1.5/R6.2 — the EXTRA http endpoints the instance serves
             # (`<instance host>--<sub_service>.<domain>`), read from the rendered
@@ -2272,6 +2448,12 @@ def _compute_service_stats() -> dict[str, Any]:
             unhealthy += 1
             continue
 
+        # R13/T5 — the same rule as `_status_for_user`: Exited(0) is a completed
+        # init only beside a running service; an instance with nothing up is
+        # DOWN, not healthy.
+        _any_up = any(
+            "up" in str(all_containers.get(c, "")).lower() for c in expected_names
+        )
         all_ok = True
         for cname in expected_names:
             status = all_containers.get(cname)
@@ -2288,7 +2470,9 @@ def _compute_service_stats() -> dict[str, Any]:
             # A completed one-shot init (Exited (0)) counts as healthy — only
             # genuinely stopped/errored states make the service unhealthy
             # (feature 10; mirrors _status_for_user).
-            if ("up" not in status_lower) and ("exited (0)" not in status_lower):
+            if ("up" not in status_lower) and not (
+                "exited (0)" in status_lower and _any_up
+            ):
                 all_ok = False
                 break
 

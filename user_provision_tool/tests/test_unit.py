@@ -242,7 +242,7 @@ class TestTemplateEngine:
             domain_name="example.com", htpasswd_path=htpasswd,
         )
         content = Path(out).read_text()
-        assert "server_name myapp-alice-0.example.com;" in content
+        assert "server_name myapp-alice-0--web.example.com;" in content
         assert f"auth_basic_user_file {htpasswd};" in content
         # proxy_pass now uses variable-based resolution:
         #   set $upstream_XXXX myapp-user_alice-0-web:80;
@@ -259,7 +259,7 @@ class TestTemplateEngine:
             domain_name="example.com", htpasswd_path="",
         )
         content = Path(out).read_text()
-        assert "server_name myapp-alice-0.example.com;" in content
+        assert "server_name myapp-alice-0--web.example.com;" in content
         assert "auth_basic" not in content
         assert "proxy_pass" in content
 
@@ -271,7 +271,7 @@ class TestTemplateEngine:
             domain_name="test.local", htpasswd_path="/tmp/test.htpasswd",
         )
         content = Path(out).read_text()
-        assert "server_name svc-testuser-3.test.local;" in content
+        assert "server_name svc-testuser-3--web.test.local;" in content
 
     def test_render_nginx_conf_acl_on_simple_conf_no_scaffold(self, tmp_path, monkeypatch):
         """v5 (decision 1/6): ENABLE_ACL no longer touches the per-service conf.
@@ -448,7 +448,7 @@ class TestTemplateEngine:
         assert "ssl_certificate     /provision/ssl/example.com/fullchain.pem;" in content
         assert "ssl_certificate_key /provision/ssl/example.com/privkey.pem;" in content
         assert "return 301 https://$host$request_uri;" in content
-        assert "server_name myapp-alice-0.example.com;" in content
+        assert "server_name myapp-alice-0--web.example.com;" in content
 
     def test_render_nginx_conf_https_disabled_no_ssl_blocks(self, tmp_path):
         """When https=False (default), no SSL blocks appear in output."""
@@ -465,7 +465,7 @@ class TestTemplateEngine:
         assert "ssl_certificate_key" not in content
         assert "return 301 https://" not in content
         assert "listen 80;" in content
-        assert "server_name myapp-alice-0.example.com;" in content
+        assert "server_name myapp-alice-0--web.example.com;" in content
 
     def test_render_nginx_conf_https_empty_ssl_paths_allowed(self, tmp_path):
         """When https=False, empty ssl paths are provided but templated away."""
@@ -2594,16 +2594,22 @@ class TestProvisionerEnvFile:
         """Mock docker / nginx calls, redirect registry to temp file."""
         # Mock docker ops subprocess so no real Docker calls happen
         self.calls: list[list[str]] = []
+        self.events: list[str] = []
 
         def fake_run(args, check=True):
             self.calls.append(list(args))
+            if "up" in args:
+                self.events.append("up")
             import subprocess as sp
             return sp.CompletedProcess(args, 0, stdout="", stderr="")
 
         monkeypatch.setattr(docker_ops, "_run", fake_run)
-        # Mock network connect / nginx reload (no-op)
+        # Mock network connect / nginx reload
         monkeypatch.setattr(docker_ops, "network_connect", lambda *a, **kw: None)
-        monkeypatch.setattr(docker_ops, "nginx_reload", lambda *a: None)
+        monkeypatch.setattr(
+            docker_ops, "nginx_reload",
+            lambda *a, **kw: self.events.append("reload"),
+        )
 
         # Redirect registry to temp file
         self.reg_path = tmp_path / "user_registry.yml"
@@ -2701,7 +2707,10 @@ class TestProvisionerEnvFile:
         else:
             pytest.fail(f"--env-file not found in compose_up: {up_cmd}")
 
-    def test_register_renders_EVERY_conf_it_carries(self):
+    def test_register_renders_EVERY_conf_it_carries(self, monkeypatch):
+        from lib import docker_ops
+        monkeypatch.setattr(docker_ops, "shared_network_subnet",
+                            lambda *a, **k: "172.17.0.0/16")
         """R4-F52 — the stream conf a deploy carries is RENDERED, not just recorded.
 
         `register_user` built the pair list (`nginx_out_by_category`) and recorded
@@ -2778,6 +2787,55 @@ class TestProvisionerEnvFile:
                     assert "prod.env" not in env_path, (
                         f"Rebuild --env-file should NOT use original, got: {env_path}"
                     )
+
+    def test_rebuild_reloads_nginx_after_up(self):
+        """A rebuild recreates containers; nginx must re-resolve after `up`.
+
+        The stream conf's upstream is static, so nginx caches the container IP
+        at config load. A recreate may change that IP; without this reload the
+        route keeps dialling the old address.
+        """
+        provisioner.register_user(
+            user_name="rebuildreload",
+            service_name="myapp",
+            label="0",
+            compose_template=COMPOSE_TEMPLATE,
+            output_dir=self.tmp_path,
+            user_data_dir=self.user_data_dir,
+        )
+        self.events.clear()
+
+        provisioner.rebuild_user(
+            user_name="rebuildreload",
+            service_name="myapp",
+            label="0",
+        )
+
+        assert "up" in self.events and "reload" in self.events, self.events
+        assert self.events.index("up") < self.events.index("reload"), (
+            f"the reload must follow `compose up`, got {self.events}")
+
+    def test_start_service_reloads_nginx_after_up(self):
+        """`start_service` can recreate containers; same reload rule."""
+        provisioner.register_user(
+            user_name="startreload",
+            service_name="myapp",
+            label="0",
+            compose_template=COMPOSE_TEMPLATE,
+            output_dir=self.tmp_path,
+            user_data_dir=self.user_data_dir,
+        )
+        self.events.clear()
+
+        provisioner.start_service(
+            user_name="startreload",
+            service_name="myapp",
+            label="0",
+        )
+
+        assert "up" in self.events and "reload" in self.events, self.events
+        assert self.events.index("up") < self.events.index("reload"), (
+            f"the reload must follow `compose up`, got {self.events}")
 
     # ── HTTPS (TLS) support ────────────────────────────────────
 
@@ -3163,6 +3221,41 @@ class TestProvisionerEnvFile:
             "the re-rendered conf must have no auth_basic"
         )
 
+    def test_remove_password_keeps_state_when_the_reload_fails(self, monkeypatch):
+        """The conf/registry/htpasswd must not half-apply on a reload failure."""
+        provisioner.register_user(
+            user_name="pwfail",
+            service_name="myapp",
+            label="0",
+            compose_template=COMPOSE_TEMPLATE,
+            nginx_template=NGINX_TEMPLATE,
+            output_dir=self.tmp_path,
+            nginx_output_dir=self.tmp_path,
+            user_data_dir=self.user_data_dir,
+            passwd="oldpass",
+        )
+        entry = registry.get_user_service("pwfail", "myapp", "0")
+        htpasswd_path = entry["htpasswd_path"]
+        conf_path = Path(entry["nginx_conf_path"])
+        before = conf_path.read_text()
+        assert "auth_basic" in before
+
+        def _boom(*a, **k):
+            raise RuntimeError("reload failed")
+
+        monkeypatch.setattr(provisioner.stream_access, "refresh_and_reload", _boom)
+        with pytest.raises(RuntimeError, match="reload failed"):
+            provisioner.remove_password(
+                user_name="pwfail", service_name="myapp", label="0",
+            )
+
+        after = registry.get_user_service("pwfail", "myapp", "0")
+        assert after.get("passwd_plain") == "oldpass"
+        assert after.get("htpasswd_path"), "the htpasswd reference must survive"
+        assert Path(htpasswd_path).exists(), "the secret file must survive"
+        assert conf_path.read_text() == before, (
+            "the re-rendered conf must be rolled back to what nginx is still serving")
+
     # ── remove_user orphan network cleanup ──
 
     def test_remove_user_includes_compose_down(self):
@@ -3337,6 +3430,33 @@ class TestAPIProjectRoot:
             passwd="secret",
         )
         assert result["status"] == "registered"
+
+    def test_a_bare_server_name_is_refused_422_and_nothing_is_written(self):
+        """R14 — a NEW selection naming the instance host is refused.
+
+        The conf is the platform's old shape (`server_name example.com`); the
+        route must answer 422 before creating a template or an instance.
+        """
+        from fastapi import HTTPException
+
+        project_dir = self.sp_dir / "bare"
+        project_dir.mkdir()
+        shutil.copy(FIXTURES_DIR / "docker-compose.template.yml.j2", project_dir)
+        (project_dir / "nginx.conf").write_text(
+            "server {\n    listen 80;\n    server_name example.com;\n"
+            "    location / { proxy_pass http://web:80; }\n}\n"
+        )
+        with pytest.raises(HTTPException) as exc_info:
+            self._call(
+                user_name="pruser", service_name="myapp",
+                project_root="bare",
+                compose_template_path="docker-compose.template.yml.j2",
+                nginx_conf_file_path="nginx.conf",
+                label="0", domain="localhost", passwd="secret",
+            )
+        assert exc_info.value.status_code == 422
+        assert not (project_dir / "nginx.conf.j2").exists(), (
+            "a refused selection writes nothing")
 
 
 # ---------------------------------------------------------------------------
@@ -3769,6 +3889,62 @@ class TestAPINewEndpoints:
             lambda **kw: (_ for _ in ()).throw(KeyError("No registration found")))
         response = self.client.post("/users/ghost/services/myapp/0/down")
         assert response.status_code == 404
+
+    # ── POST /users/{user_name}/stop (G78 user-level stop) ──
+
+    def test_stop_all_handles_zero_one_and_many_entries(self, monkeypatch):
+        from lib import registry as reg_mod
+        calls = []
+        monkeypatch.setattr(self.api.provisioner, "stop_service",
+            lambda **kw: calls.append((kw["service_name"], kw["label"])) or {"ok": True})
+
+        monkeypatch.setattr(reg_mod, "get_user", lambda u: [])
+        r = self.client.post("/users/nobody/stop")
+        assert r.status_code == 200
+        assert r.json()["ok"] is True and r.json()["results"] == []
+
+        entries = [
+            {"user_name": "alice", "service_name": "svc1", "label": "0"},
+            {"user_name": "alice", "service_name": "svc2", "label": "0"},
+            {"user_name": "alice", "service_name": "svc3", "label": "1"},
+        ]
+        monkeypatch.setattr(reg_mod, "get_user", lambda u: entries)
+        r = self.client.post("/users/alice/stop")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ok"] is True
+        assert len(body["results"]) == 3
+        assert calls == [("svc1", "0"), ("svc2", "0"), ("svc3", "1")]
+
+        # Idempotent: a second call attempts every entry again, no restart.
+        r2 = self.client.post("/users/alice/stop")
+        assert r2.status_code == 200 and r2.json()["ok"] is True
+        assert len(calls) == 6
+
+    def test_stop_all_attempts_every_service_and_reports_failures(self, monkeypatch):
+        from lib import registry as reg_mod
+        entries = [
+            {"user_name": "alice", "service_name": "good", "label": "0"},
+            {"user_name": "alice", "service_name": "bad", "label": "0"},
+            {"user_name": "alice", "service_name": "later", "label": "0"},
+        ]
+        attempted = []
+        def stop(**kw):
+            attempted.append(kw["service_name"])
+            if kw["service_name"] == "bad":
+                raise RuntimeError("compose stop failed")
+            return {"ok": True}
+        monkeypatch.setattr(reg_mod, "get_user", lambda u: entries)
+        monkeypatch.setattr(self.api.provisioner, "stop_service", stop)
+
+        r = self.client.post("/users/alice/stop")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ok"] is False
+        assert attempted == ["good", "bad", "later"], "every service must be attempted"
+        assert body["failed_services"] == [
+            {"service_name": "bad", "label": "0", "error": "compose stop failed"}
+        ]
 
     # ── PUT /users/.../password ──
 
@@ -4606,7 +4782,7 @@ class TestRegenerateNginxConfs:
         # v5: the gate lives at the edge — no scaffold in the internal conf.
         assert "auth_request" not in content
         assert "location /__basic__/" not in content
-        assert "server_name myapp-alice-0.localhost;" in content
+        assert "server_name myapp-alice-0--web.localhost;" in content
 
     def test_strips_is_browser_from_orphan(self, tmp_path, monkeypatch):
         """An orphan conf (no registry entry) is surgically stripped of is_browser
@@ -4805,7 +4981,11 @@ class TestEdgeTemplate:
         assert "auth_request_set $client_type  $upstream_http_x_client_type;" in content
         assert "error_page 401 = @auth_401;" in content
         assert "error_page 403 = @auth_403;" in content
-        assert 'proxy_set_header Authorization "Basic $service_basic";' in content
+        # G78 / R7 — the selector, not a literal owner credential. Public
+        # forwards the client Authorization; everything else injects owner Basic.
+        assert "auth_request_set $public_service $upstream_http_x_public_service;" in content
+        assert "map $public_service $edge_authorization" in content
+        assert "proxy_set_header Authorization $edge_authorization;" in content
         # R4-F63 — the client's Host WITH its port, via the `$forwarded_host` map
         # (`$http_host`, falling back to `$host` when the client sent none).
         # `$host` alone strips the port, and an application that builds an
@@ -5866,9 +6046,11 @@ class TestStreamConfConversion:
         assert _re.search(r"proxy_pass\s+\{\{ container_prefix \}\}fastapi-app:8100;", out), out
         assert "$stream_upstream" not in out
         assert "resolver" not in out
+        # R8 is now central: the converter REMOVES per-server policy, because a
+        # server-level list would override the stream-context list.
+        assert "allow " not in out and "deny " not in out, out
         # and everything structural is left alone
         assert "listen              7687 ssl;" in out
-        assert "allow               172.17.0.0/16;" in out
 
     def test_an_unknown_upstream_host_is_left_alone(self):
         from lib.nginx_converter import convert_stream_conf
@@ -5884,6 +6066,569 @@ class TestStreamConfConversion:
             "the http path must still do its http-only work — this asserts the two "
             "paths really are different, so the stream path is not redundant")
         assert "{% if" not in convert_stream_conf(self._CONF, "example-mcp", ["fastapi-app"])
+
+
+class TestCertificateCoverageAndPlatformPolicy:
+    """T3 / R5-R9, R11 — the -api owns certificates and the platform policy.
+
+    Both converters and both `.j2` normalizers walk the same rules; the tests
+    below assert the OBSERVABLE text (directive counts, inserted paths, the
+    replacement pair) rather than a helper's name.
+    """
+
+    # ---- HTTP coverage -------------------------------------------------
+
+    def test_an_http_tls_block_without_a_pair_receives_the_deploy_pair(self):
+        from lib.nginx_converter import convert_nginx
+        out = convert_nginx(
+            "server {\n    listen 443 ssl;\n    server_name x;\n}\n", "svc")
+        assert out.count("ssl_certificate ") == 1
+        assert out.count("ssl_certificate_key ") == 1
+        assert "ssl_certificate     {{ ssl_certificate_path }};" in out
+        assert "ssl_certificate_key {{ ssl_certificate_key_path }};" in out
+        # immediately after the listen line
+        assert out.index("listen 443 ssl;") < out.index("ssl_certificate ")
+
+    def test_a_visible_party_is_rewritten_and_a_block_level_pair_is_not_duplicated(self):
+        from lib.nginx_converter import convert_nginx
+        out = convert_nginx(
+            "server {\n    listen 443 ssl;\n"
+            "    ssl_certificate /mock/ssl/certs/fullchain.pem;\n"
+            "    ssl_certificate_key /mock/ssl/certs/privkey.pem;\n"
+            "}\n", "svc")
+        assert "/mock/ssl" not in out
+        assert out.count("ssl_certificate ") == 1
+        assert out.count("ssl_certificate_key ") == 1
+        assert "{{ ssl_certificate_path }}" in out
+        assert "{{ ssl_certificate_key_path }}" in out
+
+    def test_an_http_file_level_pair_covers_every_block(self):
+        from lib.nginx_converter import convert_nginx
+        out = convert_nginx(
+            "ssl_certificate /c.pem;\nssl_certificate_key /k.pem;\n"
+            "server { listen 443 ssl; server_name a; }\n"
+            "server { listen 443 ssl; server_name b; }\n", "svc")
+        assert out.count("ssl_certificate ") == 1, "one file-level pair, no per-block"
+        assert out.count("ssl_certificate_key ") == 1
+        assert "/c.pem" not in out and "/k.pem" not in out
+        assert "{{ ssl_certificate_path }}" in out
+
+    def test_a_partial_pair_is_replaced_by_the_full_pair(self):
+        from lib.nginx_converter import convert_nginx
+        for conf in (
+            "server { listen 443 ssl; ssl_certificate /only.pem; }\n",
+            "server { listen 443 ssl; ssl_certificate ; ssl_certificate_key ; }\n",
+        ):
+            out = convert_nginx(conf, "svc")
+            assert out.count("ssl_certificate ") == 1, out
+            assert out.count("ssl_certificate_key ") == 1, out
+            assert "/only.pem" not in out
+
+    def test_a_stream_file_level_pair_is_removed_and_the_block_gets_its_own(self):
+        from lib.nginx_converter import convert_stream_conf
+        out = convert_stream_conf(
+            "ssl_certificate /f.pem;\nssl_certificate_key /k.pem;\n"
+            "server {\n    listen 7687 ssl;\n"
+            "    server_name a--neo4j.example.test;\n}\n", "svc")
+        assert out.count("ssl_certificate ") == 1, out
+        assert out.count("ssl_certificate_key ") == 1, out
+        assert "/f.pem" not in out and "/k.pem" not in out
+
+    def test_conversion_is_idempotent_for_both_categories(self):
+        from lib.nginx_converter import convert_nginx, convert_stream_conf
+        http = (
+            "ssl_certificate /c.pem;\nssl_certificate_key /k.pem;\n"
+            "server { listen 443 ssl; server_name a; location / { allow all; deny all; } }\n"
+        )
+        once = convert_nginx(http, "svc")
+        assert convert_nginx(once, "svc") == once
+        # The synthesis branch too: a listen-80 conf gains a guarded 443 clone,
+        # and a second conversion must not wrap or clone it again.
+        http80 = (
+            "server {\n    listen 80;\n    server_name mock_server_name;\n"
+            "    allow all;\n}\n"
+        )
+        once80 = convert_nginx(http80, "svc")
+        assert "listen 443 ssl;" in once80
+        assert convert_nginx(once80, "svc") == once80
+        stream = (
+            "server {\n    listen 7687 ssl;\n"
+            "    server_name a--neo4j.example.test;\n"
+            "    allow 10.0.0.0/8;\n    deny all;\n"
+            "    proxy_pass neo4j:7687;\n}\n"
+        )
+        once = convert_stream_conf(stream, "svc", ["neo4j"])
+        assert convert_stream_conf(once, "svc", ["neo4j"]) == once
+
+    # ---- policy --------------------------------------------------------
+
+    def test_http_policy_is_removed_at_any_depth_and_none_is_added(self):
+        from lib.nginx_converter import convert_nginx
+        out = convert_nginx(
+            "server {\n    listen 80;\n    server_name x;\n"
+            "    allow 10.0.0.0/8;\n    deny all;\n"
+            "    location / { allow 192.168.0.0/16; deny all; }\n}\n", "svc")
+        assert "allow" not in out and "deny" not in out
+
+    def test_http_policy_is_gone_from_the_synthesized_443_block_too(self):
+        from lib.nginx_converter import convert_nginx
+        out = convert_nginx(
+            "server {\n    listen 80;\n    server_name x;\n"
+            "    allow 10.0.0.0/8;\n}\n", "svc")
+        assert "listen 443 ssl;" in out
+        assert "allow" not in out and "deny" not in out
+
+    def test_stream_policy_is_removed_whatever_the_source_said(self):
+        from lib.nginx_converter import convert_stream_conf
+        for policy in (
+            "    allow 10.0.0.0/8;\n    deny all;\n",
+            "    deny all;\n",
+            "",
+        ):
+            conf = (
+                "server {\n    listen 7687 ssl;\n"
+                "    server_name a--neo4j.example.test;\n"
+                f"{policy}\n    proxy_pass neo4j:7687;\n}}\n"
+            )
+            out = convert_stream_conf(conf, "svc", ["neo4j"])
+            assert "allow " not in out and "deny " not in out, out
+            assert "10.0.0.0/8" not in out
+
+    def test_a_rendered_http_conf_keeps_its_location_and_drops_its_policy(self, tmp_path):
+        from lib import template_engine
+        from lib.nginx_converter import convert_nginx
+        tpl_text = convert_nginx(
+            "server {\n    listen 80;\n    server_name x;\n"
+            "    location /api { allow 10.0.0.0/8; deny all; proxy_pass http://web:80; }\n}\n",
+            "svc", ["web"])
+        tpl = tmp_path / "x.nginx.conf.j2"
+        tpl.write_text(tpl_text)
+        out = tmp_path / "x.user-a.0.nginx.conf"
+        rendered = template_engine.render_nginx_conf(
+            str(tpl), str(out), "a", "svc", "0", "example.test", "",
+            https=False,
+        )
+        assert "allow" not in rendered and "deny" not in rendered
+        assert "location /api" in rendered
+        assert "proxy_pass" in rendered and "web:80" in rendered
+
+    # ---- includes ------------------------------------------------------
+
+    def test_an_uncovered_tls_block_with_an_include_is_refused(self, tmp_path):
+        from lib.nginx_converter import convert_nginx, normalize_http_template
+        conf = (
+            "include /etc/nginx/other.conf;\n"
+            "server { listen 443 ssl; server_name x; }\n"
+        )
+        with pytest.raises(ValueError):
+            convert_nginx(conf, "svc")
+        with pytest.raises(ValueError):
+            normalize_http_template(conf)
+        from lib.nginx_converter import nginx_file_to_template
+        src = tmp_path / "include.conf"
+        src.write_text(conf)
+        out = tmp_path / "include.conf.j2"
+        with pytest.raises(ValueError):
+            nginx_file_to_template(str(src), str(out))
+        assert not out.exists(), "a refused conversion writes no template"
+        assert not (tmp_path / "include.conf.j2.generated").exists()
+
+    def test_the_v4_scaffold_include_is_not_opaque(self):
+        from lib.nginx_converter import convert_nginx
+        out = convert_nginx(
+            "include /etc/nginx/env.d/*.env;\n"
+            "server { listen 443 ssl; server_name x; }\n", "svc")
+        assert "ssl_certificate" in out
+        assert "env.d/*.env" in out, "the scaffold include itself is left alone"
+
+    def test_an_include_is_fine_when_every_tls_block_is_covered(self):
+        from lib.nginx_converter import normalize_http_template
+        conf = (
+            "include /etc/nginx/other.conf;\n"
+            "server { listen 443 ssl; server_name x;\n"
+            "  ssl_certificate {{ ssl_certificate_path }};\n"
+            "  ssl_certificate_key {{ ssl_certificate_key_path }}; }\n"
+        )
+        out = normalize_http_template(conf)
+        assert "include /etc/nginx/other.conf;" in out
+
+    def test_a_file_level_pair_covers_an_included_file(self):
+        from lib.nginx_converter import normalize_http_template
+        conf = (
+            "ssl_certificate /c.pem;\nssl_certificate_key /k.pem;\n"
+            "include /etc/nginx/other.conf;\n"
+            "server { listen 443 ssl; server_name x; }\n"
+        )
+        out = normalize_http_template(conf)
+        assert "include /etc/nginx/other.conf;" in out
+        assert out.count("ssl_certificate ") == 1
+        assert out.count("ssl_certificate_key ") == 1
+
+    def test_file_level_stream_policy_is_removed(self):
+        """A file-level rule is a stream-context rule once included; remove it."""
+        from lib.nginx_converter import convert_stream_conf, normalize_stream_template
+        conf = (
+            "allow 10.0.0.0/8;\ndeny 192.168.0.0/16;\n"
+            "server {\n    listen 7687 ssl;\n"
+            "    server_name a--neo4j.example.test;\n"
+            "    proxy_pass neo4j:7687;\n}\n"
+        )
+        for out in (convert_stream_conf(conf, "svc", ["neo4j"]),
+                    normalize_stream_template(conf)):
+            assert "allow " not in out and "deny " not in out, out
+            assert "10.0.0.0/8" not in out and "192.168.0.0/16" not in out
+
+    def test_a_rendered_stream_removes_file_level_policy(self, tmp_path):
+        from lib import template_engine
+        tpl = tmp_path / "x.stream.conf.j2"
+        tpl.write_text(
+            "allow 10.0.0.0/8;\n"
+            "server {\n    listen 7687 ssl;\n"
+            "    server_name {{ hostname_stem }}--neo4j.{{ domain_name }};\n"
+            "    proxy_pass {{ container_prefix }}neo4j:7687;\n}\n"
+        )
+        text = template_engine.render_nginx_conf(
+            str(tpl), str(tmp_path / "x.stream.conf"),
+            "alice", "svc", "0", "example.test", "", https=True,
+            ssl_certificate_path="/c", ssl_certificate_key_path="/k",
+        )
+        assert "allow " not in text and "deny " not in text, text
+
+    def test_the_renderer_removes_http_policy_from_a_raw_template(self, tmp_path):
+        """An HTTP template that bypassed conversion still serves no rule."""
+        from lib import template_engine
+        tpl = tmp_path / "x.nginx.conf.j2"
+        tpl.write_text(
+            "server {\n    listen 80;\n    server_name {{ hostname }};\n"
+            "    allow 10.0.0.0/8;\n    deny all;\n"
+            "    location / { allow all; proxy_pass http://web:80; }\n}\n"
+        )
+        text = template_engine.render_nginx_conf(
+            str(tpl), str(tmp_path / "x.nginx.conf"),
+            "alice", "svc", "0", "example.test", "",
+        )
+        assert "allow " not in text and "deny " not in text, text
+
+    def test_a_non_canonical_stream_name_is_refused(self):
+        from lib.nginx_converter import convert_stream_conf
+        with pytest.raises(ValueError):
+            convert_stream_conf(
+                "server { listen 7687 ssl; server_name plain.example.test; }\n", "svc")
+
+    # ---- selected `.j2` ------------------------------------------------
+
+    def test_a_selected_stream_j2_loses_its_policy(self):
+        from lib.nginx_converter import normalize_stream_template
+        text = (
+            "server {\n    listen 7687 ssl;\n"
+            "    server_name {{ hostname_stem }}--neo4j.{{ domain_name }};\n"
+            "    allow 10.0.0.0/8;\n    deny all;\n"
+            "    proxy_pass {{ container_prefix }}neo4j:7687;\n}\n"
+        )
+        out = normalize_stream_template(text)
+        assert "allow " not in out and "deny " not in out, out
+        assert "10.0.0.0/8" not in out
+        assert normalize_stream_template(out) == out
+
+    def test_a_selected_http_j2_loses_its_policy_and_gains_no_guard(self):
+        from lib.nginx_converter import normalize_http_template
+        text = (
+            "server {\n    listen 443 ssl;\n"
+            "    server_name {{ hostname }};\n    allow all;\n}\n"
+        )
+        out = normalize_http_template(text)
+        assert "allow" not in out
+        assert "{% if tls %}" not in out, "normalization does not rewrite structure"
+        assert "ssl_certificate     {{ ssl_certificate_path }};" in out
+
+    def test_a_selected_j2_with_an_uncovered_block_gets_the_pair(self):
+        from lib.nginx_converter import normalize_http_template
+        out = normalize_http_template(
+            "server { listen 443 ssl; server_name {{ hostname }}; }\n")
+        assert "{{ ssl_certificate_path }}" in out
+        assert "{{ ssl_certificate_key_path }}" in out
+
+    def test_a_j2_that_already_carries_the_variables_is_unchanged(self):
+        from lib.nginx_converter import normalize_http_template
+        text = (
+            "server {\n    listen 443 ssl;\n"
+            "    ssl_certificate     {{ ssl_certificate_path }};\n"
+            "    ssl_certificate_key {{ ssl_certificate_key_path }};\n"
+            "    server_name {{ hostname }};\n}\n"
+        )
+        assert normalize_http_template(text) == text
+
+    # ---- resolver ------------------------------------------------------
+
+    @staticmethod
+    def _fake_inspect(monkeypatch, subnets, returncode=0):
+        import json
+        import subprocess
+        payload = [{"IPAM": {"Config": [{"Subnet": s} for s in subnets]}}]
+
+        def _run(args, **_kw):
+            return subprocess.CompletedProcess(
+                args, returncode, stdout=json.dumps(payload), stderr="boom")
+
+        monkeypatch.setattr("lib.docker_ops.subprocess.run", _run)
+
+    def test_the_resolver_returns_the_single_ipv4_subnet(self, monkeypatch):
+        from lib.docker_ops import shared_network_subnet
+        self._fake_inspect(monkeypatch, ["172.17.0.0/16"])
+        assert shared_network_subnet("subnet_acl_shared") == "172.17.0.0/16"
+
+    def test_the_resolver_refuses_two_or_no_ipv4_subnets(self, monkeypatch):
+        from lib.docker_ops import NetworkSubnetError, shared_network_subnet
+        for subnets in (["172.17.0.0/16", "10.0.0.0/8"], ["fd00::/64"]):
+            self._fake_inspect(monkeypatch, subnets)
+            with pytest.raises(NetworkSubnetError):
+                shared_network_subnet("subnet_acl_shared")
+
+    def test_the_resolver_refuses_an_unset_network(self, monkeypatch):
+        from lib.docker_ops import NetworkSubnetError, shared_network_subnet
+        monkeypatch.delenv("SHARED_NETWORK", raising=False)
+        with pytest.raises(NetworkSubnetError):
+            shared_network_subnet()
+
+    def test_the_resolver_writes_network_addresses_not_host_addresses(self, monkeypatch):
+        from lib.docker_ops import shared_network_subnet
+        for given, want in (("10.20.30.0/24", "10.20.30.0/24"),
+                            ("10.20.30.7/24", "10.20.30.0/24"),
+                            ("172.17.5.9/16", "172.17.0.0/16")):
+            self._fake_inspect(monkeypatch, [given])
+            assert shared_network_subnet("net") == want
+
+    # ---- render --------------------------------------------------------
+
+    _STREAM_TPL = (
+        "server {\n    listen 7687 ssl;\n"
+        "    ssl_certificate     {{ ssl_certificate_path }};\n"
+        "    ssl_certificate_key {{ ssl_certificate_key_path }};\n"
+        "    server_name         {{ hostname_stem }}--neo4j.{{ domain_name }};\n"
+        "    allow {{ stream_allow_subnet }};\n    deny all;\n"
+        "    proxy_pass          {{ container_prefix }}neo4j:7687;\n}\n"
+    )
+
+    def test_a_stream_render_strips_policy_and_needs_no_subnet(self, tmp_path):
+        from lib import template_engine
+        tpl = tmp_path / "x.stream.conf.j2"
+        tpl.write_text(self._STREAM_TPL)
+        out = tmp_path / "x.stream.conf"
+        text = template_engine.render_nginx_conf(
+            str(tpl), str(out), "alice", "svc", "0", "example.test", "",
+            https=True, ssl_certificate_path="/srv/c.pem",
+            ssl_certificate_key_path="/srv/k.pem",
+        )
+        assert "allow " not in text and "deny " not in text, text
+        assert "{{" not in text
+
+    def test_an_http_render_never_asks_for_the_network(self, tmp_path, monkeypatch):
+        from lib import docker_ops, template_engine
+        monkeypatch.delenv("SHARED_NETWORK", raising=False)
+
+        def _boom(*_a, **_k):
+            raise AssertionError("an HTTP render must not inspect docker networks")
+
+        monkeypatch.setattr(docker_ops, "shared_network_subnet", _boom)
+        tpl = tmp_path / "x.nginx.conf.j2"
+        tpl.write_text("server { listen 80; server_name {{ hostname }}; proxy_pass http://web:80; }\n")
+        text = template_engine.render_nginx_conf(
+            str(tpl), str(tmp_path / "x.nginx.conf"),
+            "alice", "svc", "0", "example.test", "",
+        )
+        assert "{{" not in text
+
+    # ---- end-to-end through convert + render + filter ------------------
+
+    _GENERATED = (
+        "# Generated by the provision gateway (one block per stream row).\n"
+        "server {\n    listen              7687 ssl;\n"
+        "    server_name         mock_server_name--neo4j.mock.invalid;\n\n"
+        "    proxy_pass          neo4j:7687;\n}\n"
+        "server {\n    listen              7687 ssl;\n"
+        "    server_name         mock_server_name--falkordb.mock.invalid;\n\n"
+        "    proxy_pass          falkordb:6379;\n}\n"
+    )
+
+    def test_the_generated_artifact_converts_and_renders(self, tmp_path):
+        from lib import template_engine
+        from lib.nginx_converter import convert_stream_conf
+        tpl_text = convert_stream_conf(self._GENERATED, "svc", ["neo4j", "falkordb"])
+        tpl = tmp_path / "nginx.stream.base.1.conf"
+        tpl.write_text(tpl_text)
+        out = tmp_path / "svc.user-alice.0.stream.conf"
+        text = template_engine.render_nginx_conf(
+            str(tpl), str(out), "alice", "svc", "0", "example.test", "",
+            https=True, ssl_certificate_path="/srv/c.pem",
+            ssl_certificate_key_path="/srv/k.pem",
+            stream_allow_subnet="172.17.0.0/16",
+        )
+        assert "svc-alice-0--neo4j.example.test" in text
+        assert "svc-alice-0--falkordb.example.test" in text
+        assert "mock_server_name" not in text and "mock.invalid" not in text
+        assert "{{" not in text
+        assert text.count("ssl_certificate     /srv/c.pem;") == 2
+        assert text.count("ssl_certificate_key /srv/k.pem;") == 2
+        assert "allow " not in text and "deny " not in text, text
+        assert "proxy_pass          svc-user_alice-0-neo4j:7687;" in text
+        assert "proxy_pass          svc-user_alice-0-falkordb:6379;" in text
+
+    def test_a_missing_certificate_path_still_renders_the_pair(self, tmp_path):
+        from lib import template_engine
+        from lib.nginx_converter import convert_stream_conf
+        tpl = tmp_path / "nginx.stream.base.2.conf"
+        tpl.write_text(convert_stream_conf(self._GENERATED, "svc", ["neo4j", "falkordb"]))
+        text = template_engine.render_nginx_conf(
+            str(tpl), str(tmp_path / "x.stream.conf"), "alice", "svc", "0",
+            "example.test", "", https=True,
+            ssl_certificate_path="/does/not/exist/fullchain.pem",
+            ssl_certificate_key_path="/does/not/exist/privkey.pem",
+        )
+        assert text.count("ssl_certificate     /does/not/exist/fullchain.pem;") == 2
+        assert text.count("ssl_certificate_key /does/not/exist/privkey.pem;") == 2
+
+    def test_the_profile_filter_drops_by_upstream_not_by_mock_name(self):
+        from lib import conf_filter
+        from lib.nginx_converter import convert_stream_conf
+        from lib.template_engine import container_prefix
+        tpl_text = convert_stream_conf(self._GENERATED, "svc", ["neo4j", "falkordb"])
+        prefix = container_prefix("svc", "alice", "0")
+        rendered = (
+            tpl_text.replace("{{ container_prefix }}", prefix)
+            .replace("{{ hostname_stem }}", "svc-alice-0")
+            .replace("{{ domain_name }}", "example.test")
+            .replace("{{ stream_allow_subnet }}", "172.17.0.0/16")
+        )
+        text, dropped = conf_filter.filter_conf_blocks(
+            rendered,
+            active_services={"neo4j"},
+            all_services={"neo4j", "falkordb"},
+            container_prefix=prefix,
+        )
+        assert "falkordb" not in text
+        assert "neo4j" in text
+        assert dropped and "falkordb" in dropped[0]
+
+    def test_the_t1_golden_http_conf_converts_to_the_expected_names(self):
+        from lib.nginx_converter import convert_nginx
+        golden = (
+            "server {\n    listen 80;\n    server_name mock_server_name;\n"
+            "    location / { proxy_pass http://web:8000; }\n}\n"
+            "server {\n    listen 80;\n    server_name mock_server_name--mcp-server;\n"
+            "    location / { proxy_pass http://mcp-server:9000; }\n}\n"
+        )
+        out = convert_nginx(golden, "svc", ["web", "mcp-server"])
+        assert "server_name {{ hostname }};" in out
+        assert (
+            "server_name {{ hostname_stem }}--mcp-server.{{ domain_name }};" in out
+        ), "the whole hyphenated sub-service survives"
+        assert "mock_server_name" not in out
+
+
+class TestStreamAccessPolicyFile:
+    """The ONE stream policy file: written before reload, fail-closed."""
+
+    def _resolver(self, monkeypatch, value="172.17.0.0/16"):
+        from lib import docker_ops
+        monkeypatch.setattr(docker_ops, "shared_network_subnet", lambda *a, **k: value)
+
+    def test_refresh_writes_allow_from_the_named_network(self, tmp_path, monkeypatch):
+        from lib import stream_access
+        self._resolver(monkeypatch)
+        changed, text = stream_access.refresh(tmp_path)
+        assert changed is True
+        assert text == "allow 172.17.0.0/16;\ndeny all;\n"
+        assert (tmp_path / "stream-access.conf").read_text() == text
+        # unchanged content is not rewritten
+        changed2, _ = stream_access.refresh(tmp_path)
+        assert changed2 is False
+
+    def test_refresh_fails_closed_when_the_network_cannot_be_resolved(self, tmp_path, monkeypatch):
+        from lib import docker_ops, stream_access
+        def _boom(*a, **k):
+            raise docker_ops.NetworkSubnetError("SHARED_NETWORK is not set")
+        monkeypatch.setattr(docker_ops, "shared_network_subnet", _boom)
+        changed, text = stream_access.refresh(tmp_path)
+        assert changed is True
+        assert text == "deny all;\n"
+        assert (tmp_path / "stream-access.conf").read_text() == "deny all;\n"
+
+    def test_refresh_with_no_generated_dir_is_a_noop(self, monkeypatch, tmp_path):
+        from lib import stream_access
+        monkeypatch.delenv("GENERATED_DIR", raising=False)
+        assert stream_access.refresh() == (False, "")
+
+    def test_reload_happens_after_the_file_is_written(self, tmp_path, monkeypatch):
+        from lib import docker_ops, stream_access
+        self._resolver(monkeypatch)
+        seen = {}
+        def _reload(_container):
+            seen["policy"] = (tmp_path / "stream-access.conf").read_text()
+        monkeypatch.setattr(docker_ops, "nginx_reload", _reload)
+        result = stream_access.refresh_and_reload("nginx", base_dir=tmp_path)
+        assert result["policy_changed"] is True
+        assert seen["policy"] == "allow 172.17.0.0/16;\ndeny all;\n"
+
+    def test_only_if_changed_still_writes_but_does_not_reload(self, tmp_path, monkeypatch):
+        from lib import docker_ops, stream_access
+        self._resolver(monkeypatch)
+        calls = []
+        monkeypatch.setattr(docker_ops, "nginx_reload", lambda c: calls.append(c))
+        stream_access.refresh_and_reload("nginx", base_dir=tmp_path, only_if_changed=True)
+        assert calls == ["nginx"], "first write is a change and must reload"
+        stream_access.refresh_and_reload("nginx", base_dir=tmp_path, only_if_changed=True)
+        assert calls == ["nginx"], "unchanged content needs no second reload"
+
+    def test_the_temp_name_does_not_match_the_nginx_glob(self):
+        import fnmatch
+        from lib import stream_access
+        assert not fnmatch.fnmatch(f".{stream_access.POLICY_FILENAME}.tmp", "stream-access*.conf")
+        assert fnmatch.fnmatch(stream_access.POLICY_FILENAME, "stream-access*.conf")
+
+    def test_a_write_failure_removes_the_allow_file(self, tmp_path, monkeypatch):
+        from lib import stream_access
+        self._resolver(monkeypatch)
+        path = tmp_path / "stream-access.conf"
+        path.write_text("allow 10.0.0.0/8;\ndeny all;\n")
+        def _fail(*a, **k):
+            raise OSError("disk full")
+        monkeypatch.setattr(stream_access, "_write_atomic", _fail)
+        changed, text = stream_access.refresh(tmp_path)
+        assert changed is True and text == "allow 172.17.0.0/16;\ndeny all;\n"
+        assert not path.exists(), "the stale allow must be removed (static deny applies)"
+
+    def test_migration_strips_per_server_policy_from_rendered_confs(self, tmp_path, monkeypatch):
+        from lib import stream_access
+        conf = tmp_path / "svc.user-a.0.stream.conf"
+        conf.write_text(
+            "allow 10.0.0.0/8;\n"
+            "server {\n    listen 7687 ssl;\n"
+            "    ssl_certificate /c.pem;\n    ssl_certificate_key /k.pem;\n"
+            "    server_name a--neo4j.example.test;\n"
+            "    allow 172.17.0.0/16;\n    deny all;\n"
+            "    proxy_pass n:7687;\n}\n"
+        )
+        changed = stream_access.migrate_rendered_stream_confs(tmp_path)
+        text = conf.read_text()
+        assert changed == [str(conf)]
+        assert "allow " not in text and "deny " not in text
+        assert "ssl_certificate /c.pem;" in text
+
+    def test_the_central_conf_includes_the_policy_and_defaults_to_deny(self):
+        from pathlib import Path
+        conf = (Path(__file__).resolve().parents[2] / "nginx.provision.conf").read_text()
+        include = conf.index("include ${GENERATED_DIR}/stream-access*.conf;")
+        deny = conf.index("deny all;", include)
+        server_include = conf.index("include ${GENERATED_DIR}/*.stream.conf;", deny)
+        assert include < deny < server_include
+
+    def test_both_compose_files_use_the_shared_network_name_variable(self):
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[2]
+        prov = (root / "docker-compose.provision.yml").read_text()
+        gw = (root.parent / "_provision_gateway" / "docker-compose.gateway.yml").read_text()
+        for text in (prov, gw):
+            assert "name: ${SHARED_NETWORK:-subnet_acl_shared}" in text
 
 
 class TestRenderedConfNames:
@@ -6398,6 +7143,7 @@ class TestARenderedConfNeverLeavesAProxyVariableUndefined:
             https=True,
             ssl_certificate_path="/srv/ssl/c.pem",
             ssl_certificate_key_path="/srv/ssl/k.pem",
+            stream_allow_subnet="172.17.0.0/16",
         )
         rendered = out.read_text()
 
@@ -7017,3 +7763,439 @@ class TestComposeProfileSemantics:
         assert set(api._expected_container_names({**base, "profiles": ["falkordb"]})) == {
             f"{prefix}b_always", f"{prefix}c_gated"
         }
+
+
+# ---------------------------------------------------------------------------
+# R13 — a stopped instance's stream conf is paused out of the include
+# ---------------------------------------------------------------------------
+
+
+class TestStreamConfPauseRestore:
+    """R13 — stop renames, start restores, delete removes, and never reloads
+    for an instance that has no stream conf."""
+
+    def _entry(self, tmp_path, stream=True):
+        compose = tmp_path / "docker-compose.yml"
+        compose.write_text("services: {}\n")
+        entry = {
+            "user_name": "alice", "service_name": "myapp", "label": "0",
+            "compose_file_path": str(compose),
+            "network_name": "myapp-user_alice-0",
+            "env_file_path": "", "env_files": [], "profiles": [],
+            "nginx_conf_paths": [],
+            "nginx_conf_paths_by_category": {},
+        }
+        active = None
+        if stream:
+            active = tmp_path / "myapp.user-alice.0.stream.conf"
+            active.write_text("server {\n    listen 7687 ssl;\n}\n")
+            entry["nginx_conf_paths"] = [str(active)]
+            entry["nginx_conf_paths_by_category"] = {"stream": str(active)}
+        return entry, active
+
+    def test_stop_renames_before_stopping_and_reloads_while_healthy(self, tmp_path, monkeypatch):
+        from lib import stream_access
+
+        entry, active = self._entry(tmp_path)
+        paused = stream_access.paused_path(active)
+        monkeypatch.setattr(registry, "get_user_service", lambda *a: entry)
+        events = []
+
+        def fake_reload(_container):
+            events.append(("reload", active.exists(), paused.exists()))
+
+        def fake_stop(*a, **k):
+            events.append(("stop", active.exists(), paused.exists()))
+
+        monkeypatch.setattr(stream_access, "refresh_and_reload", fake_reload)
+        monkeypatch.setattr(docker_ops, "compose_stop", fake_stop)
+
+        result = provisioner.stop_service(
+            user_name="alice", service_name="myapp", label="0",
+            nginx_container="nginx",
+        )
+        assert not active.exists()
+        assert paused.exists()
+        assert result["stream_confs_paused"] == 1
+        assert [e[0] for e in events] == ["reload", "stop"]
+        # The rename happened BEFORE the reload, which happened before the stop.
+        assert events[0][1:] == (False, True)
+        assert events[1][1:] == (False, True)
+
+    def test_start_restores_byte_identically_before_the_reload(self, tmp_path, monkeypatch):
+        from lib import stream_access
+
+        entry, active = self._entry(tmp_path)
+        original = active.read_text()
+        paused = stream_access.paused_path(active)
+        active.rename(paused)
+        monkeypatch.setattr(registry, "get_user_service", lambda *a: entry)
+        events = []
+
+        def fake_up(*a, **k):
+            events.append(("up", active.exists(), paused.exists()))
+
+        def fake_reload(_container):
+            events.append(("reload", active.exists(), paused.exists()))
+
+        monkeypatch.setattr(docker_ops, "compose_up", fake_up)
+        monkeypatch.setattr(stream_access, "refresh_and_reload", fake_reload)
+
+        result = provisioner.start_service(
+            user_name="alice", service_name="myapp", label="0",
+            nginx_container="nginx",
+        )
+        assert active.exists() and not paused.exists()
+        assert active.read_text() == original
+        assert result["stream_confs_restored"] == 1
+        assert [e[0] for e in events] == ["up", "reload"]
+        # compose up finished BEFORE the restore; the reload saw the active name.
+        assert events[0][1:] == (False, True)
+        assert events[1][1:] == (True, False)
+
+    def test_stop_without_a_stream_conf_is_a_no_op_for_this_rule(self, tmp_path, monkeypatch):
+        from lib import stream_access
+
+        entry, _ = self._entry(tmp_path, stream=False)
+        monkeypatch.setattr(registry, "get_user_service", lambda *a: entry)
+        monkeypatch.setattr(docker_ops, "compose_stop", lambda *a, **k: None)
+
+        def _boom(_container):
+            raise AssertionError("no stream conf means no stream-specific reload")
+
+        monkeypatch.setattr(stream_access, "refresh_and_reload", _boom)
+        result = provisioner.stop_service(
+            user_name="alice", service_name="myapp", label="0", nginx_container="nginx",
+        )
+        assert result["stream_confs_paused"] == 0
+
+    def test_a_second_stop_is_a_no_op(self, tmp_path, monkeypatch):
+        from lib import stream_access
+
+        entry, active = self._entry(tmp_path)
+        active.rename(stream_access.paused_path(active))
+        monkeypatch.setattr(registry, "get_user_service", lambda *a: entry)
+        monkeypatch.setattr(docker_ops, "compose_stop", lambda *a, **k: None)
+
+        def _boom(_container):
+            raise AssertionError("an already-paused instance needs no reload")
+
+        monkeypatch.setattr(stream_access, "refresh_and_reload", _boom)
+        result = provisioner.stop_service(
+            user_name="alice", service_name="myapp", label="0", nginx_container="nginx",
+        )
+        assert result["stream_confs_already_paused"] == 1
+
+    def test_start_with_both_names_keeps_the_active_file_and_reports_the_conflict(self, tmp_path, monkeypatch):
+        from lib import stream_access
+
+        entry, active = self._entry(tmp_path)
+        paused = stream_access.paused_path(active)
+        paused.write_text("paused copy\n")
+        monkeypatch.setattr(registry, "get_user_service", lambda *a: entry)
+        monkeypatch.setattr(docker_ops, "compose_up", lambda *a, **k: None)
+        monkeypatch.setattr(stream_access, "refresh_and_reload", lambda _c: None)
+
+        result = provisioner.start_service(
+            user_name="alice", service_name="myapp", label="0", nginx_container="nginx",
+        )
+        assert active.read_text() != "paused copy\n"
+        assert paused.read_text() == "paused copy\n", "the paused file is never silently deleted"
+        assert result["stream_conf_conflicts"], result
+
+    def test_delete_removes_the_paused_file(self, tmp_path, monkeypatch):
+        from lib import stream_access
+
+        entry, active = self._entry(tmp_path)
+        paused = stream_access.paused_path(active)
+        active.rename(paused)
+        active.with_suffix(active.suffix + ".generated").write_text("")
+        monkeypatch.setattr(registry, "get_user_service", lambda *a: entry)
+        monkeypatch.setattr(docker_ops, "network_disconnect", lambda *a, **k: None)
+        monkeypatch.setattr(docker_ops, "compose_down", lambda *a, **k: None)
+        monkeypatch.setattr(docker_ops, "remove_project_volumes", lambda *a, **k: [])
+        monkeypatch.setattr(docker_ops, "orphan_network_cleanup", lambda *a, **k: None)
+        monkeypatch.setattr(stream_access, "refresh_and_reload", lambda _c: None)
+        monkeypatch.setattr(provisioner, "_purge_user_artifacts", lambda *a, **k: None)
+        monkeypatch.setattr(registry, "remove_user_service", lambda *a: None)
+
+        provisioner.remove_user(
+            user_name="alice", service_name="myapp", label="0", nginx_container="nginx",
+        )
+        assert not paused.exists(), "a delete removes the paused copy with the instance"
+
+
+# ---------------------------------------------------------------------------
+# R12 — an out-of-band instance-container start/recreate reloads nginx once
+# ---------------------------------------------------------------------------
+
+
+class TestInstanceEvents:
+    """R12 — Docker-event filter, readiness, coalescing and the fail-closed retry."""
+
+    def _ev(self, name, action="start", project=None):
+        attrs = {"name": name}
+        if project:
+            attrs["com.docker.compose.project"] = project
+        return {"Type": "container", "Action": action,
+                "Actor": {"Attributes": attrs}}
+
+    def test_only_instance_start_or_create_matches(self):
+        from lib import instance_events as ie
+
+        names = {"myapp-user_alice-0-web"}
+        projects = {"myapp-user_alice-0"}
+        assert ie.event_matches(self._ev("myapp-user_alice-0-web"), names, projects)
+        assert ie.event_matches(self._ev("myapp-user_alice-0-web", "create"), names, projects)
+        # A project fallback matches a container whose recorded name is stale.
+        assert ie.event_matches(
+            self._ev("renamed-container", "start", "myapp-user_alice-0"), names, projects)
+        # Unrelated container, a stop, and a non-container event do not.
+        assert not ie.event_matches(self._ev("postgres"), names, projects)
+        assert not ie.event_matches(self._ev("myapp-user_alice-0-web", "stop"), names, projects)
+        assert not ie.event_matches(
+            {"Type": "network", "Action": "connect",
+             "Actor": {"Attributes": {"name": "x"}}}, names, projects)
+
+    def test_parse_event_line_ignores_malformed_lines(self):
+        from lib import instance_events as ie
+
+        assert ie.parse_event_line("not json") is None
+        assert ie.parse_event_line("") is None
+        assert ie.parse_event_line('{"Type": "container"}') == {"Type": "container"}
+
+    def test_readiness_requires_running_and_attached(self):
+        from lib import instance_events as ie
+
+        states = {"c": [False, True, True]}
+        infos = []
+
+        def inspect(name):
+            running = states[name].pop(0)
+            return {"State": {"Running": running},
+                    "NetworkSettings": {"Networks": {"n": {}} if running else {}}}
+
+        ready, pending = ie.wait_until_ready(
+            {"c"}, timeout=5, interval=0, inspect=inspect, sleep=lambda _s: None)
+        assert ready == {"c"} and pending == set()
+
+    def test_a_container_that_never_becomes_ready_is_not_reloaded(self):
+        from lib import instance_events as ie
+
+        calls = []
+        res = ie.handle_event_batch(
+            {"c"}, "nginx", readiness_timeout=0,
+            inspect=lambda _n: {"State": {"Running": False}, "NetworkSettings": {}},
+            sleep=lambda _s: None,
+            reload_fn=lambda *a, **k: calls.append(a) or True,
+        )
+        assert res["reloaded"] is False
+        assert res["not_ready"] == ["c"]
+        assert calls == []
+
+    def test_a_settled_batch_reloads_once(self):
+        from lib import instance_events as ie
+
+        calls = []
+
+        def reload_fn(names, container, **k):
+            calls.append((set(names), container))
+            return True
+
+        res = ie.handle_event_batch(
+            {"c"}, "nginx",
+            inspect=lambda _n: {"State": {"Running": True},
+                                "NetworkSettings": {"Networks": {"n": {}}}},
+            sleep=lambda _s: None, reload_fn=reload_fn,
+        )
+        assert res["reloaded"] is True
+        assert calls == [({"c"}, "nginx")]
+
+    def test_the_watcher_coalesces_a_burst_into_one_reload(self, monkeypatch):
+        from lib import instance_events as ie
+
+        class _Proc:
+            def __init__(self):
+                self.stdout = io.StringIO(
+                    '{"Type":"container","Action":"create","Actor":{"ID":"o1","Attributes":{"name":"other"}}}\n'
+                    '{"Type":"container","Action":"create","Actor":{"ID":"c1id","Attributes":{"name":"c1"}}}\n'
+                    '{"Type":"container","Action":"start","Actor":{"ID":"c1id","Attributes":{"name":"c1"}}}\n'
+                    '{"Type":"container","Action":"start","Actor":{"ID":"c2id","Attributes":{"name":"c2"}}}\n'
+                )
+            def terminate(self):
+                pass
+
+        monkeypatch.setattr(ie, "instance_targets", lambda: ({"c1", "c2"}, set()))
+        calls = []
+
+        def reload_fn(names, container, **k):
+            calls.append((set(names), container))
+            return True
+
+        ie.watch_instance_events(
+            "nginx", proc_factory=_Proc, _once=True, settle_seconds=0.01,
+            readiness_timeout=0,
+            inspect=lambda _n: {"State": {"Running": True},
+                                "NetworkSettings": {"Networks": {"n": {}}}},
+            sleep=lambda _s: None, reload_fn=reload_fn,
+        )
+        # Readiness is ID-based: a compose recreate's temporary name would fail
+        # a name-based inspect.  One burst still means ONE reload.
+        assert calls == [({"c1id", "c2id"}, "nginx")], "one burst, one reload"
+
+    def test_a_write_failure_is_retried_and_can_succeed(self, monkeypatch):
+        from lib import instance_events as ie
+
+        attempts = []
+
+        def flaky(_container):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise OSError("write failed")
+
+        monkeypatch.setattr(ie.stream_access, "refresh_and_reload", flaky)
+        assert ie.reload_for_batch({"c"}, "nginx", sleep=lambda _s: None) is True
+        assert len(attempts) == 2
+
+    def test_a_persistent_write_failure_never_reloads_a_stale_policy(self, monkeypatch):
+        from lib import instance_events as ie
+
+        def always(_container):
+            raise OSError("write failed")
+
+        monkeypatch.setattr(ie.stream_access, "refresh_and_reload", always)
+        assert ie.reload_for_batch(
+            {"c"}, "nginx", attempts=2, sleep=lambda _s: None) is False
+
+
+# ---------------------------------------------------------------------------
+# R14 — the primary is gone: bare conf names, migration and ignored input
+# ---------------------------------------------------------------------------
+
+
+class TestPrimaryRemoval:
+    """R14 — every HTTP endpoint is `--<sub>`; a bare name is refused/dropped."""
+
+    def test_a_bare_server_name_is_refused(self):
+        from lib.nginx_converter import reject_bare_http_server_names
+
+        for text in (
+            "server { listen 80; server_name example.com; }",
+            "server { listen 80; server_name mock_server_name; }",
+            "server { listen 80; server_name {{ hostname }}; }",
+        ):
+            with pytest.raises(ValueError):
+                reject_bare_http_server_names(text)
+
+    def test_an_endpoint_name_is_accepted(self):
+        from lib.nginx_converter import reject_bare_http_server_names
+
+        reject_bare_http_server_names(
+            "server { listen 80; server_name mock_server_name--neo4j; }")
+        reject_bare_http_server_names(
+            "server { listen 80; server_name {{ hostname_stem }}--web.{{ domain_name }}; }")
+
+    def test_migration_strips_the_old_host_and_keeps_the_endpoints(self, tmp_path):
+        from lib.nginx_converter import migrate_rendered_http_confs
+
+        conf = tmp_path / "svc.user-alice.0.nginx.conf"
+        conf.write_text(
+            "server {\n    listen 80;\n    server_name svc-alice-0.localhost;\n"
+            "    location / { proxy_pass http://svc-web:80; }\n}\n"
+            "server {\n    listen 80;\n    server_name svc-alice-0--web.localhost;\n"
+            "    location / { proxy_pass http://svc-web:80; }\n}\n"
+        )
+        changed = migrate_rendered_http_confs(tmp_path)
+        text = conf.read_text()
+        assert changed == [str(conf)]
+        assert "server_name svc-alice-0.localhost;" not in text
+        assert "server_name svc-alice-0--web.localhost;" in text
+
+    def test_the_registration_route_consults_the_refusal(self):
+        """The refusal lives at the route (see the 422 test in
+        `TestAPIProjectRoot`); `convert_nginx` keeps the legacy mapping so an
+        already-converted template can still be normalized."""
+        import inspect
+
+        import api
+        src = inspect.getsource(api.register_user)
+        assert "reject_bare_http_server_names" in src
+
+    def test_rendering_a_legacy_template_does_not_recreate_the_route(self, tmp_path):
+        from lib.nginx_converter import strip_unserved_http_blocks
+
+        rendered = (
+            "server {\n    listen 80;\n    server_name svc-alice-0.localhost;\n}\n"
+            "server {\n    listen 80;\n    server_name svc-alice-0--web.localhost;\n}\n"
+        )
+        stripped = strip_unserved_http_blocks(rendered)
+        assert "svc-alice-0.localhost" not in stripped
+        assert "svc-alice-0--web.localhost" in stripped
+
+
+class TestStoppedInstanceIsNotHealthy:
+    """R13/T5 — an instance with nothing up is DOWN, not a completed init.
+
+    `Exited (0)` counts as healthy only BESIDE a running service. Treating it
+    as healthy everywhere made a stopped instance read as running: the card kept
+    offering "Stop" and never "Start", so the paused stream conf could not be
+    restored through the UI (measured 2026-10-27).
+    """
+
+    def _entry(self):
+        return {
+            "user_name": "alice", "service_name": "myapp", "label": "0",
+            "compose_template_path": "", "compose_file_path": "",
+            "nginx_conf_template_path": "", "nginx_conf_path": "",
+            "container_names": ["app", "init"],
+        }
+
+    def _status(self, running, monkeypatch):
+        import api
+        monkeypatch.setattr(registry, "get_user", lambda _u: [self._entry()])
+        return api._status_for_user("alice", running)["unhealthy_services"] + \
+            api._status_for_user("alice", running)["healthy_services"]
+
+    def test_all_exited_is_down(self, monkeypatch):
+        svc = self._status(
+            {"app": "Exited (0) 1 minute ago", "init": "Exited (0) 1 minute ago"},
+            monkeypatch,
+        )[0]
+        assert svc["healthy_containers"] == {}, svc
+        assert set(svc["unhealthy_containers"]) == {"app", "init"}
+
+    def test_a_completed_init_beside_a_running_service_is_healthy(self, monkeypatch):
+        svc = self._status(
+            {"app": "Up 2 minutes (healthy)", "init": "Exited (0) 3 minutes ago"},
+            monkeypatch,
+        )[0]
+        assert set(svc["healthy_containers"]) == {"app", "init"}
+        assert svc["unhealthy_containers"] == {}
+
+    def test_a_compose_recreate_temporary_name_still_matches(self):
+        from lib import instance_events as ie
+
+        event = {"Type": "container", "Action": "create",
+                 "Actor": {"ID": "abc",
+                           "Attributes": {"name": "0123456789ab_myapp-user_alice-0-app"}}}
+        assert ie.event_matches(event, {"myapp-user_alice-0-app"}, set())
+
+
+
+# ---------------------------------------------------------------------------
+# G78 — public-card auth annotation (T5)
+# ---------------------------------------------------------------------------
+
+
+class TestHasAuthAnnotation:
+    def test_reads_the_rendered_conf_not_just_passwd_plain(self, tmp_path):
+        import api
+        conf = tmp_path / "svc.conf"
+        conf.write_text("server {\n    auth_basic \"x\";\n    auth_basic_user_file /x;\n}\n")
+        assert api._has_auth({"nginx_conf_path": str(conf), "passwd_plain": ""}) is True
+        conf.write_text("server { location / { proxy_pass http://x; } }\n")
+        assert api._has_auth({"nginx_conf_path": str(conf), "passwd_plain": "still-recorded"}) is False
+        # Any conf carrying auth_basic is enough across a multi-conf instance.
+        second = tmp_path / "svc2.conf"
+        second.write_text("server {\n    auth_basic \"y\";\n}\n")
+        assert api._has_auth({"nginx_conf_paths": [str(conf), str(second)]}) is True

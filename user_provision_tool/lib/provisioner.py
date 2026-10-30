@@ -7,12 +7,15 @@ duplicating it.
 
 from __future__ import annotations
 
+import logging
 import shutil
 from pathlib import Path
 from typing import Any
 
-from . import auth, conf_filter, docker_ops, registry, subnet_manager, template_engine
+from . import auth, conf_filter, docker_ops, registry, stream_access, subnet_manager, template_engine
 from .compose_converter import ensure_subnet_ipam_block, get_compose_service_names
+
+_log = logging.getLogger(__name__)
 
 # Registry writes are serialised by lib.registry.transaction() — Tier 1
 # (in-process RLock) + Tier 2 (cross-process flock on the registry sidecar
@@ -972,7 +975,7 @@ def register_user(
     # --- Connect provision-nginx to user network + reload ---
     net = entry["network_name"]
     docker_ops.network_connect(nginx_container, net)
-    docker_ops.nginx_reload(nginx_container)
+    stream_access.refresh_and_reload(nginx_container)
 
     return {
         "entry": entry,
@@ -1140,6 +1143,10 @@ def remove_user(
             try:
                 Path(fpath).unlink(missing_ok=True)
                 Path(str(fpath) + ".generated").unlink(missing_ok=True)
+                # R13 — a stopped instance's stream conf lives under `.paused`;
+                # a delete removes it on the same explicit path as every other
+                # per-instance generated file.
+                Path(str(fpath) + stream_access.PAUSED_SUFFIX).unlink(missing_ok=True)
             except OSError:
                 pass
 
@@ -1156,6 +1163,9 @@ def remove_user(
         try:
             Path(fpath).unlink(missing_ok=True)
             Path(str(fpath) + ".generated").unlink(missing_ok=True)
+            # R13 — the paused copy of a stream conf is a per-instance generated
+            # file too; a delete must not leave it behind.
+            Path(str(fpath) + stream_access.PAUSED_SUFFIX).unlink(missing_ok=True)
         except OSError:
             pass
 
@@ -1184,7 +1194,7 @@ def remove_user(
         except Exception:
             pass
 
-    docker_ops.nginx_reload(nginx_container)
+    stream_access.refresh_and_reload(nginx_container)
 
     with registry.transaction():
         registry.remove_user_service(user_name, service_name, label)
@@ -1224,6 +1234,7 @@ def rebuild_user(
     label: str,
     no_cache: bool = False,
     build_args: dict[str, str] | None = None,
+    nginx_container: str = "subnet-acl-nginx",
 ) -> dict[str, str]:
     """Rebuild and restart a user's service containers.
 
@@ -1287,6 +1298,14 @@ def rebuild_user(
         raise
     _update_registry_status(user_name, service_name, label, "running")
 
+    # G: a rebuild recreates the containers, and Docker may hand the same
+    # container name a different address.  Stream confs point at the name with a
+    # STATIC proxy_pass, which nginx resolves once at config load — so without a
+    # reload here the route keeps dialling the old address until something else
+    # reloads nginx.  Reload after compose up has completed and the new
+    # endpoints are registered.
+    stream_access.refresh_and_reload(nginx_container)
+
     return {"user_name": user_name, "service_name": service_name, "label": label}
 
 
@@ -1304,6 +1323,7 @@ def start_service(
     user_name: str,
     service_name: str,
     label: str,
+    nginx_container: str = "subnet-acl-nginx",
 ) -> dict[str, str]:
     """Start a user's service containers (docker compose up -d).
 
@@ -1334,7 +1354,29 @@ def start_service(
     project_name = entry.get("network_name")
     docker_ops.compose_up(compose_file, env_file=env_files, project_name=project_name, profiles=profiles)
 
-    return {"user_name": user_name, "service_name": service_name, "label": label}
+    # R13 — the stream conf was renamed to `.stream.conf.paused` by
+    # `stop_service`, because its static upstream would otherwise be a load-time
+    # liability while the containers are down.  Bring it back BEFORE the reload
+    # that follows compose up, so the route returns with the containers.  The
+    # active file wins when both names exist; the conflict is reported and the
+    # paused copy is left untouched.
+    restored = stream_access.restore_stream_confs(entry)
+    if restored["conflicts"] or restored["failed"]:
+        _log.warning(
+            "stream restore for %s/%s/%s: conflicts=%s failed=%s",
+            user_name, service_name, label,
+            restored["conflicts"], restored["failed"],
+        )
+
+    # Same reason as rebuild_user: compose up may recreate containers, so the
+    # static upstream names must be resolved again by a reload.
+    stream_access.refresh_and_reload(nginx_container)
+
+    return {
+        "user_name": user_name, "service_name": service_name, "label": label,
+        "stream_confs_restored": len(restored["restored"]),
+        "stream_conf_conflicts": restored["conflicts"],
+    }
 
 
 def stop_service(
@@ -1342,8 +1384,18 @@ def stop_service(
     user_name: str,
     service_name: str,
     label: str,
-) -> dict[str, str]:
+    nginx_container: str = "subnet-acl-nginx",
+) -> dict[str, Any]:
     """Stop a user's service containers (docker compose stop).
+
+    R13 — the instance's stream conf leaves the served set for as long as the
+    instance is stopped: its static upstream names a container that is about to
+    be down, and the internal nginx resolves that name at config load, so a
+    later reload (or a restart) would fail for EVERY service.  Each recorded
+    stream conf is renamed to `<name>.stream.conf.paused` BEFORE the containers
+    stop, and nginx is reloaded while they are still healthy.  The registry
+    entry and the file are kept — this is a pause, not a deletion; `start_service`
+    restores it.
 
     Raises
     ------
@@ -1364,10 +1416,39 @@ def stop_service(
     profiles = list(entry.get("profiles") or [])
     if not env_files and env_file:
         env_files = [env_file]
+
+    # No stream conf → this rule does not apply at all (no rename, no reload).
+    stream_paths = stream_access.stream_conf_paths(entry)
+    paused: dict[str, object] = {"changed": [], "already": [], "failed": [], "conflicts": []}
+    if stream_paths:
+        # Rename while the containers are still up, then reload: nginx drops
+        # the route from a config that no longer names the upstream.
+        paused = stream_access.pause_stream_confs(entry)
+        if paused["failed"] or paused["conflicts"]:
+            # A failed rename is reported and the stop is NOT claimed as paused.
+            # Reloading now would load the conf that is still there, so skip it.
+            _log.error(
+                "stream pause for %s/%s/%s: failed=%s conflicts=%s — the stop "
+                "is not paused; the stream conf still names a container that is "
+                "about to stop",
+                user_name, service_name, label,
+                paused["failed"], paused["conflicts"],
+            )
+        elif paused["changed"]:
+            # Only a batch that actually renamed something changes what nginx
+            # serves; a second stop (already paused) is a no-op.
+            stream_access.refresh_and_reload(nginx_container)
+
     project_name = entry.get("network_name")
     docker_ops.compose_stop(compose_file, env_file=env_files or None, project_name=project_name, profiles=profiles)
 
-    return {"user_name": user_name, "service_name": service_name, "label": label}
+    return {
+        "user_name": user_name, "service_name": service_name, "label": label,
+        "stream_confs_paused": len(paused["changed"]),
+        "stream_confs_already_paused": len(paused["already"]),
+        "stream_conf_conflicts": paused["conflicts"],
+        "stream_conf_failures": paused["failed"],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1460,7 +1541,7 @@ def change_password(
         if matched:
             registry._save(users)
 
-    docker_ops.nginx_reload(nginx_container)
+    stream_access.refresh_and_reload(nginx_container)
 
     return {"user_name": user_name, "service_name": service_name, "label": label}
 
@@ -1474,16 +1555,10 @@ def remove_password(
 ) -> dict[str, str]:
     """Remove a service's password protection and reload nginx.
 
-    Steps
-    -----
-    1. Look up registration entry.
-    2. Re-render the nginx conf with NO htpasswd — ``render_nginx_conf`` strips
-       the ``auth_basic`` directives when the htpasswd path is falsy
-       (template_engine.py:600-604), so the instance stops asking for a password
-       the gate can no longer supply.
-    3. Clear ``passwd`` / ``passwd_plain`` / ``htpasswd_path`` on the entry.
-    4. Delete the htpasswd file (and its ``.generated`` marker).
-    5. Reload nginx.
+    Order matters. The conf is rendered and RELOADED first; only after the
+    reload succeeds are the registry and the htpasswd file changed. If the
+    render/reload fails, the previous conf is restored and the registry and
+    secret file are untouched, so the instance is exactly as it was.
 
     This is the exit for a protected service whose plaintext is gone: bcrypt is
     one-way, so the original password cannot be recovered and the gate can never
@@ -1503,7 +1578,7 @@ def remove_password(
     nginx_tpl = entry.get("nginx_conf_template_path") or ""
     nginx_out = entry.get("nginx_conf_path") or ""
 
-    # --- Re-render the conf WITHOUT auth_basic ---
+    old_conf: str | None = None
     if nginx_tpl and nginx_out:
         # Same derivation as reconciliation.regenerate_nginx_confs:
         # hostname = f"{service}-{user}-{label}.{domain}".
@@ -1511,16 +1586,43 @@ def remove_password(
         hostname = entry.get("hostname", "")
         if hostname and "." in hostname:
             domain = hostname.split(".", 1)[1]
-        template_engine.render_nginx_conf(
+        out_path = Path(nginx_out)
+        if out_path.exists():
+            old_conf = out_path.read_text(encoding="utf-8")
+        rendered = template_engine.render_nginx_conf(
             nginx_tpl, nginx_out,
             user_name, service_name, label,
             domain, "",  # no htpasswd -> the render strips auth_basic
             https=registry.entry_tls(entry),
             ssl_certificate_path=entry.get("ssl_certificate_path") or "",
             ssl_certificate_key_path=entry.get("ssl_certificate_key_path") or "",
+            write=False,
         )
+        out_path.write_text(rendered, encoding="utf-8")
+        Path(str(out_path) + ".generated").write_text("")
 
-    # --- Registry ---
+    # Reload the new conf (and refresh the central policy) BEFORE any registry
+    # or secret mutation. If this raises, restore the previous conf so the disk
+    # matches the still-running nginx; the registry and htpasswd are untouched.
+    try:
+        stream_access.refresh_and_reload(nginx_container)
+    except Exception:
+        if nginx_out:
+            out_path = Path(nginx_out)
+            if old_conf is not None:
+                try:
+                    out_path.write_text(old_conf, encoding="utf-8")
+                except OSError:
+                    pass
+            else:
+                try:
+                    out_path.unlink()
+                    Path(str(out_path) + ".generated").unlink(missing_ok=True)
+                except OSError:
+                    pass
+        raise
+
+    # --- Registry: only after the served conf changed successfully ---
     with registry.transaction():
         users = registry._load()
         matched = False
@@ -1546,7 +1648,5 @@ def remove_password(
                 Path(path).unlink(missing_ok=True)
             except OSError:
                 pass
-
-    docker_ops.nginx_reload(nginx_container)
 
     return {"user_name": user_name, "service_name": service_name, "label": label}

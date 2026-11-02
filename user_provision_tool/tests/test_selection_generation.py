@@ -549,9 +549,11 @@ class TestRegistryRecordsSelection:
         assert entry["profiles"] == ["a"]
         assert entry["env_files"], "per-user env file must be recorded"
         assert entry["env_files"][0].endswith(".env.1.alice.0")  # positional canonical name
-        assert entry["compose_sources"] == ["docker-compose.yml"]
-        # service_env_files records declared paths that exist in the recipe
-        assert entry["service_env_files"] == ["./svc.env"]
+        # The frozen instance projection (task doc §3.3) records the per-user env
+        # copies and the profiles. `compose_sources` / declared service env files
+        # are render inputs, not instance state, and are not persisted.
+        assert "compose_sources" not in entry
+        assert "service_env_files" not in entry
 
     def test_rebuild_reenjoys_recorded_profiles_and_env(self, tmp_path, monkeypatch, registry_file):
         """Rebuild re-applies the recorded profiles + env_files order."""

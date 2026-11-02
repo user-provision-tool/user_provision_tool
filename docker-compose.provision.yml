@@ -1,11 +1,41 @@
 services:
+  # T1 — the one PostgreSQL service. Database, roles, citext and the two
+  # schemas are created once by postgres-init; application tables are created
+  # by each owner's migration runner. 5432 is deliberately NOT published to the
+  # host: every consumer is on subnet_acl_shared (R1.1/R9.4).
+  subnet-acl-postgres:
+    image: postgres:16.4
+    container_name: subnet-acl-postgres
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-subnet_acl}
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-subnet_acl_pg_admin}
+      - REGISTRY_DB_PASSWORD=${REGISTRY_DB_PASSWORD:-registry_app_pw}
+      - GATEWAY_DB_PASSWORD=${GATEWAY_DB_PASSWORD:-gateway_app_pw}
+      - GATEWAY_READER_DB_PASSWORD=${GATEWAY_READER_DB_PASSWORD:-gateway_reader_pw}
+    volumes:
+      # PGDATA is part of the backup set (R8.6). A named volume lets Docker
+      # create it with the postgres image's ownership; a host bind directory
+      # created by root would make the server refuse to start.
+      - ${PGDATA_VOLUME:-subnet-acl-pgdata}:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks:
+      - subnet_acl_shared
+    restart: unless-stopped
+
   subnet-acl-provision-api:
     build:
       context: ./user_provision_tool
 
     container_name: subnet-acl-provision-api
     ports:
-      - "${PROVISION_API_PORT:-8875}:8000"
+      # Operator boundary only: loopback by default (R9.2/R9.4).
+      - "127.0.0.1:${PROVISION_API_PORT:-8875}:8000"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       # Same-path bind-mount so generated compose files reference valid host paths
@@ -16,11 +46,16 @@ services:
     networks:
       - subnet_acl_shared
     environment:
+      # The keyring lives under PROVISION_DIR/keys; same-path mount above.
+      - PROVISION_DIR=${PROVISION_DIR:-/srv/provision_subnet_acl}
       - SSL_PROVIDER_PATH=${SSL_PROVIDER_PATH:-/etc/letsencrypt}
       - GENERATED_DIR=${PROVISION_DIR:-/srv/provision_subnet_acl}/generated
       - USER_DATA_DIR=${PROVISION_DIR:-/srv/provision_subnet_acl}/user_data
       - SOURCE_PROJECTS_DIR=${PROVISION_DIR:-/srv/provision_subnet_acl}/source_projects
       - REGISTRY_FILE=${PROVISION_DIR:-/srv/provision_subnet_acl}/generated/user_registry.yml
+      # T1 — the registry schema is the live store. The YAML path above stays
+      # only as the migration/rollback source until T12 retires it.
+      - DATABASE_URL=postgresql://registry_app:${REGISTRY_DB_PASSWORD:-registry_app_pw}@subnet-acl-postgres:5432/${POSTGRES_DB:-subnet_acl}
       - NGINX_CONTAINER=subnet-acl-nginx
       # The network whose IPv4 subnet a stream block's `allow` rule names. It is
       # the same network this compose already attaches the -api to; the value is
@@ -99,6 +134,13 @@ services:
       /bin/sh -c "mkdir -p /etc/nginx/services.d &&
       envsubst '$$GENERATED_DIR' < /etc/nginx/nginx.provision.conf > /etc/nginx/nginx.conf && nginx -g 'daemon off;'"
     restart: unless-stopped
+
+volumes:
+  # PGDATA is part of the backup set (R8.6); the logical dump is the restore
+  # path. The name is pinned so a compose project rename cannot silently
+  # orphan the live database.
+  subnet-acl-pgdata:
+    name: ${PGDATA_VOLUME:-subnet-acl-pgdata}
 
 networks:
   subnet_acl_shared:

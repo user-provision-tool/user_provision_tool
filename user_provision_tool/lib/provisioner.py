@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import logging
 import shutil
+import uuid
 from pathlib import Path
 from typing import Any
 
-from . import auth, conf_filter, docker_ops, registry, stream_access, subnet_manager, template_engine
+from . import auth, conf_filter, db, docker_ops, keys, registry, stream_access, subnet_manager, template_engine
 from .compose_converter import ensure_subnet_ipam_block, get_compose_service_names
 
 _log = logging.getLogger(__name__)
@@ -78,107 +79,62 @@ def classify_failure_reason(message: str) -> str:
 
 
 def _mark_failed(
-    user_name: str,
-    service_name: str,
-    label: str,
+    service_id: str,
     stage: str,
     message: str,
     reason: str | None = None,
 ) -> None:
-    """Record a failure ON the entry instead of dropping it (GRILLING G10).
+    """Record a failure on the instance row instead of dropping it (G10/G17).
 
-    Failure is instance-scoped state, so the entry stays (``status: failed``)
-    with a bounded ``failure`` payload, keeping the services page answerable
-    from the instance store alone and leaving the ordinary delete path able to
-    clean up whatever Docker residue the attempt left behind (G17).
-
-    Thread-safe and process-safe: runs under registry.transaction().
+    Failure is instance-scoped state: the service identity stays and the card
+    survives with a bounded ``failure`` payload. There is no ``error`` status.
     """
     import datetime
 
     failure = {
         "stage": stage,
         "message": _bounded_failure_message(message),
-        # A stable code for the UI to branch on. PREFERRED SOURCE is the raising
-        # error's own `reason` (typed, travels with the failure); classifying the
-        # text is only the fallback for errors that do not carry one.
         "reason": reason or classify_failure_reason(message),
         "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
     }
-    with registry.transaction():
-        users = registry._load()
-        matched = False
-        for u in users:
-            if (
-                u.get("user_name") == user_name
-                and u.get("service_name") == service_name
-                and str(u.get("label", "")) == str(label)
-            ):
-                u["status"] = "failed"
-                u["failure"] = failure
-                matched = True
-                break
-        # Save ONLY on a real match — same guard as _update_registry_status.
-        if matched:
-            registry._save(users)
+    with db.connection() as conn:
+        registry.update_instance(conn, service_id, status="failed", failure=failure)
 
 
 def _update_registry_endpoints(
-    user_name: str, service_name: str, label: str,
+    service_id: str,
     pairs: list[tuple[str, str]], instance_stem: str,
 ) -> None:
-    """Record the endpoints the RENDERED confs serve (R6.1/R6.2).
-
-    Called once the confs are on disk — the entry itself is built earlier, and a
-    reader that runs before the render finds nothing (R3-F53; measured on a live
-    deployment that served two extra endpoints and recorded none).
-    Thread-safe and process-safe: runs under registry.transaction().
-    """
+    """Record the endpoints the RENDERED confs serve (R6.1/R6.2)."""
     stream = _stream_sub_services(pairs)
     http = _http_endpoints(pairs, instance_stem)
-    with registry.transaction():
-        users = registry._load()
-        matched = False
-        for u in users:
-            if (
-                u.get("user_name") == user_name
-                and u.get("service_name") == service_name
-                and str(u.get("label", "")) == str(label)
-            ):
-                u["stream_sub_services"] = stream
-                u["http_endpoints"] = http
-                matched = True
-                break
-        # Save ONLY on a real match — the same guard as _update_registry_status.
-        if matched:
-            registry._save(users)
+    with db.connection() as conn:
+        registry.set_endpoints(
+            conn, service_id, http, stream,
+            _stream_port(pairs),
+        )
 
 
-def _update_registry_status(user_name: str, service_name: str, label: str, status: str) -> None:
-    """Update the status field of a registry entry (building → running).
+def _after_successful_transition(service_id: str, status: str) -> None:
+    """A successful transition clears a stale failure payload."""
+    with db.connection() as conn:
+        registry.update_instance(conn, service_id, status=status, failure=None)
 
-    Used so the API can report accurate service state during long builds.
-    Thread-safe and process-safe: runs under registry.transaction().
-    """
-    with registry.transaction():
-        users = registry._load()
-        matched = False
-        for u in users:
-            if (
-                u.get("user_name") == user_name
-                and u.get("service_name") == service_name
-                and str(u.get("label", "")) == str(label)
-            ):
-                u["status"] = status
-                # A successful transition clears any stale failure payload.
-                if status in ("running", "building"):
-                    u.pop("failure", None)
-                matched = True
-                break
-        # Save ONLY on a real match: writing back an unchanged (possibly empty)
-        # list is how an empty registry could be persisted over real data.
-        if matched:
-            registry._save(users)
+
+def _stream_port(pairs: list[tuple[str, str]]) -> int | None:
+    """The stream row's target port from the rendered stream conf."""
+    import re as _re
+    for _tpl, out in pairs or []:
+        if not str(out).endswith(".stream.conf"):
+            continue
+        try:
+            text = Path(out).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        m = _re.search(r"proxy_pass\s+(?:https?://)?[^:;\s]+:(\d+)", text)
+        if m:
+            return int(m.group(1))
+    return None
 
 
 def _copy_bind_source_if_empty(
@@ -268,6 +224,7 @@ def _materialize_env_examples(recipe_dir: Path) -> None:
 def _register_render_and_start(
     nginx_conf_pairs: dict[str, tuple[str, str]] | list[tuple[str, str]] | None = None,
     *,
+    service_id: str,
     user_name: str,
     service_name: str,
     label: str,
@@ -346,24 +303,17 @@ def _register_render_and_start(
     entry["container_names"] = container_names
     entry["env_files"] = _env_files_used
 
-    # Update registry with per-user copied env path + container names
-    # so rebuild/remove/reconciliation always have the correct references.
+    # Update the instance projection with the per-user copied env path and
+    # container names so rebuild/remove/reconciliation resolve them by ID.
     if copied_env:
         entry["env_file_path"] = copied_env
-    with registry.transaction():
-        users = registry._load()
-        for u in users:
-            if (
-                u.get("user_name") == user_name
-                and u.get("service_name") == service_name
-                and str(u.get("label", "")) == str(label)
-            ):
-                if copied_env:
-                    u["env_file_path"] = copied_env
-                u["env_files"] = _env_files_used
-                u["container_names"] = container_names
-                break
-        registry._save(users)
+    with db.connection() as conn:
+        registry.update_instance(
+            conn, service_id,
+            env_file_path=copied_env or entry.get("env_file_path") or "",
+            env_files=_env_files_used,
+            container_names=container_names,
+        )
 
     # --- Render nginx conf + htpasswd ---
     # --- Render nginx conf(s) + htpasswd ---
@@ -418,12 +368,12 @@ def _register_render_and_start(
     # offered no `/go/` row for an endpoint that existed. `stream_sub_services`
     # (round 1's R6.1) had the same hole for the same reason.
     _update_registry_endpoints(
-        user_name, service_name, label, _pairs,
+        service_id, _pairs,
         f"{service_name}-{user_name}-{label}",
     )
 
     # --- Mark as building (container not yet started) ---
-    _update_registry_status(user_name, service_name, label, "building")
+    _after_successful_transition(service_id, "building")
 
     # --- Start containers ---
     # Profiles: explicit per-user --profile flags; default (none) activates
@@ -558,9 +508,180 @@ def _http_endpoints(pairs: list[tuple[str, str]], instance_stem: str) -> list[st
     return found
 
 
+def prepare_registration(
+    *,
+    service_id: str | None = None,
+    procedure_id: str | None = None,
+    task_id: str,
+    owner_api_user_id: str | None = None,
+    owner_username: str | None = None,
+    user_name: str | None = None,
+    service_name: str,
+    label: str | None,
+    recipe_path: str,
+    compose_service_count: int = 0,
+    domain: str = "localhost",
+) -> dict[str, Any]:
+    """Synchronously reserve the deploy: task + services + instance(building).
+
+    Called by the register handler BEFORE it returns 202 (R6.1). No Docker work
+    happens here; the worker only builds and starts. The owner is resolved (and
+    a direct/CLI owner is ensured) in the same transaction as ``services``.
+
+    Adoption rules (R2.2): a supplied ``service_id`` is adopted only for a
+    failed row (retry) or a paused-fix redeploy; an identical replay while
+    building/running returns the existing instance/task; a different
+    tuple/recipe or a tombstone is 409; a new deploy procedure for the same
+    tuple while building/running is 409.
+    """
+    if owner_username is None and user_name:
+        owner_username = user_name
+    if not recipe_path and recipe_path != "":
+        raise ValueError("recipe_path is required")
+    supplied_service_id = uuid.UUID(str(service_id)) if service_id else None
+    new_service_id = supplied_service_id or uuid.uuid4()
+    new_procedure_id = uuid.UUID(str(procedure_id)) if procedure_id else uuid.uuid4()
+    subnet_manager._load_env()
+    template_engine._load_env()
+
+    with db.connection() as conn:
+        owner_id = registry.resolve_owner(
+            conn, owner_api_user_id, owner_username, ensure_mode="owner"
+        )
+        owner = conn.execute(
+            "SELECT username FROM registry.api_users WHERE id=%s", (owner_id,)
+        ).fetchone()
+        username = owner["username"]
+
+        # Allocate the label under the per-(owner,service) lock so two
+        # concurrent creates cannot pick the same one; the partial unique index
+        # is the final backstop.
+        registry.label_lock(conn, owner_id, service_name)
+        if label is None:
+            labels = conn.execute(
+                "SELECT label FROM registry.services WHERE owner_api_user_id=%s "
+                "AND service_name=%s", (owner_id, service_name)
+            ).fetchall()
+            ints = []
+            for r in labels:
+                try:
+                    ints.append(int(str(r["label"])))
+                except (TypeError, ValueError):
+                    continue
+            label = str(max(ints) + 1) if ints else "0"
+
+        existing = conn.execute(
+            "SELECT id, recipe_path, deleted_at FROM registry.services "
+            "WHERE owner_api_user_id=%s AND service_name=%s AND label=%s "
+            "AND deleted_at IS NULL",
+            (owner_id, service_name, str(label)),
+        ).fetchone()
+        current = None
+        if service_id:
+            current = conn.execute(
+                "SELECT s.id, s.owner_api_user_id, s.service_name, s.label, s.recipe_path, "
+                "s.deleted_at, i.status, i.current_procedure_id "
+                "FROM registry.services s LEFT JOIN registry.service_instances i "
+                "ON i.service_id=s.id WHERE s.id=%s", (str(service_id),)
+            ).fetchone()
+            if current and current["deleted_at"] is not None:
+                raise registry.RegistryError("service id is tombstoned")
+            if current and (
+                current["owner_api_user_id"] != owner_id
+                or current["service_name"] != service_name
+                or str(current["label"]) != str(label)
+            ):
+                raise registry.RegistryError("service id does not match this owner/tuple")
+            if current and current["recipe_path"] != recipe_path:
+                raise registry.RegistryError("recipe_path is immutable for a service")
+        if existing and (not current or existing["id"] != current["id"]):
+            raise registry.RegistryError(
+                f"service {service_name!r} label {label!r} is already registered"
+            )
+        if current is None:
+            tomb = conn.execute(
+                "SELECT id FROM registry.services WHERE owner_api_user_id=%s "
+                "AND service_name=%s AND label=%s AND deleted_at IS NOT NULL",
+                (owner_id, service_name, str(label)),
+            ).fetchone()
+            if tomb:
+                raise registry.RegistryError(
+                    f"label {label!r} is historical and is never reused; use a new label"
+                )
+
+        sid = current["id"] if current else new_service_id
+        status = current["status"] if current else None
+        if current and status in ("building", "running"):
+            same_proc = current["current_procedure_id"] == new_procedure_id
+            if same_proc:
+                # Identical replay: return the existing instance/task.
+                row = conn.execute(
+                    "SELECT task_id FROM registry.tasks WHERE procedure_id=%s "
+                    "ORDER BY created_at DESC, task_id DESC LIMIT 1",
+                    (new_procedure_id,),
+                ).fetchone()
+                return {"service_id": str(sid), "procedure_id": str(new_procedure_id),
+                        "task_id": row["task_id"] if row else task_id,
+                        "owner_api_user_id": str(owner_id), "username": username,
+                        "label": str(label), "replayed": True}
+            raise registry.RegistryError(
+                "a deploy is already running for this owner/service/label"
+            )
+
+        if current is None:
+            registry.insert_service(
+                conn, service_id=sid, owner_id=owner_id, service_name=service_name,
+                label=str(label), recipe_path=recipe_path,
+            )
+        registry.insert_task(
+            conn, task_id=task_id, procedure_id=new_procedure_id, service_id=sid,
+            kind="deploy", operation="register",
+        )
+        # Hostname/network identity is name-derived but the owner component is
+        # the validated, immutable api_users.username.
+        hostname = template_engine.service_hostname(service_name, username, str(label), domain)
+        network_name = template_engine.user_network_name(service_name, username, str(label))
+        if status is None:
+            registry.insert_instance(
+                conn, sid, procedure_id=new_procedure_id, status="building",
+                hostname=hostname, network_name=network_name,
+                compose_template_path="", compose_file_path="",
+            )
+        else:
+            registry.update_instance(
+                conn, sid, status="building", current_procedure_id=new_procedure_id,
+                failure=None, previous_status=None, previous_failure=None,
+                hostname=hostname, network_name=network_name,
+            )
+        return {"service_id": str(sid), "procedure_id": str(new_procedure_id),
+                "task_id": task_id, "owner_api_user_id": str(owner_id),
+                "username": username, "label": str(label), "replayed": False,
+                "created_service": current is None}
+
+
+def abort_new_registration(service_id: str, task_id: str, *, created: bool) -> None:
+    """Capacity refusal before a worker starts: leave no half-created identity.
+
+    A brand-new service/task/instance is removed; an adopted failed row keeps
+    its service and history, and only the refused task row is dropped.
+    """
+    with db.connection() as conn:
+        conn.execute("DELETE FROM registry.tasks WHERE task_id=%s", (task_id,))
+        if created:
+            conn.execute("DELETE FROM registry.service_endpoints WHERE service_id=%s", (service_id,))
+            conn.execute("DELETE FROM registry.service_basic WHERE service_id=%s", (service_id,))
+            conn.execute("DELETE FROM registry.service_instances WHERE service_id=%s", (service_id,))
+            conn.execute("DELETE FROM registry.services WHERE id=%s", (service_id,))
+
+
 def register_user(
     *,
-    user_name: str,
+    service_id: str | None = None,
+    procedure_id: str | None = None,
+    owner_api_user_id: str | None = None,
+    owner_username: str | None = None,
+    recipe_path: str = "",
+    user_name: str | None = None,
     service_name: str,
     label: str,
     compose_template: str,
@@ -644,6 +765,36 @@ def register_user(
     RuntimeError
         If ``docker compose up`` fails.
     """
+    # --- Reserve the identity synchronously if the caller did not ------------
+    if service_id is None:
+        prepared = prepare_registration(
+            procedure_id=procedure_id,
+            task_id=_task_id or f"api-{uuid.uuid4().hex[:12]}",
+            owner_api_user_id=owner_api_user_id, owner_username=owner_username,
+            user_name=user_name, service_name=service_name, label=label,
+            recipe_path=recipe_path, domain=domain,
+        )
+        service_id = prepared["service_id"]
+        procedure_id = prepared["procedure_id"]
+    entry_row = registry.get_service_by_id(service_id)
+    if not entry_row:
+        raise KeyError(f"Service not found: {service_id}")
+    user_name = entry_row["user_name"]
+    service_name = entry_row["service_name"]
+    label = entry_row["label"]
+
+    # The Basic credential: a supplied plaintext is encrypted; an instance-only
+    # redeploy re-derives .htpasswd from the stored secret (R2.6); a
+    # reset_required (bcrypt-only import) row is never guessed.
+    existing_basic = db.fetch_one(
+        "SELECT secret_enc, key_version, basic_version, reset_required "
+        "FROM registry.service_basic WHERE service_id=%s", (service_id,)
+    )
+    plain_password = passwd or None
+    if (plain_password is None and existing_basic and existing_basic["secret_enc"]
+            and not existing_basic["reset_required"]):
+        plain_password = keys.decrypt(existing_basic["secret_enc"].decode())
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     nginx_dir = Path(nginx_output_dir) if nginx_output_dir else output_dir
@@ -689,8 +840,8 @@ def register_user(
     missing_vols = [k for k in expected_vols if k not in volumes]
     extra_vols = [k for k in volumes if k not in expected_vols]
 
-    # --- Hash password ---
-    passwd_hash = auth.hash_password(user_name, passwd) if passwd else ""
+    # --- Hash password (derived from the stored/supplied plaintext) ---
+    passwd_hash = auth.hash_password(user_name, plain_password) if plain_password else ""
 
     # --- HTTPS: validate + copy certs ---
     ssl_certificate_path = ""
@@ -804,104 +955,74 @@ def register_user(
     # another stack on the same host (parallel integration run, registry reset).
     # Merge live Docker-network subnets inside the pools so we never collide
     # with an existing network (Docker would fail: "Pool overlaps").
-    allocated_subnets = subnet_manager.get_allocated_subnets(registry._load())
+    allocated_subnets = subnet_manager.get_allocated_subnets(registry.get_all_users())
     allocated_subnets += subnet_manager.get_host_allocated_subnets()
     allocated = subnet_manager.allocate_subnet(
         container_count,
         allocated_subnets,
     )
-    _subnet = allocated["subnet"] if allocated else ""
-    _gateway = allocated["gateway"] if allocated else ""
+    # No pool => NULL, not "" (T4/R2.4): the partial UNIQUE index on subnet is
+    # `WHERE subnet IS NOT NULL`, so an empty string would collide across every
+    # service on a pool-less install.
+    _subnet = allocated["subnet"] if allocated else None
+    _gateway = allocated["gateway"] if allocated else None
 
-    # --- Registry entry (design §Implementation notes L287-288: profiles,
-    # interpolation env_files order and service_env_files are recorded so
-    # rebuild/up/down/reconciliation re-apply the exact settings) ---
-    entry: dict[str, Any] = {
-        "user_name": user_name,
-        "passwd": passwd_hash,
-        "service_name": service_name,
-        "label": label,
-        # The task that produced this entry — recorded on EVERY entry, not just
-        # failed ones, so the card can link to the task and fix availability can
-        # be decided from the entry alone (llm-based-fix-todo.md §4).
-        "task_id": _task_id or "",
+    # --- Persist the rendered-file metadata on the instance projection -------
+    nginx_conf_paths = [o for _t, o in nginx_out_by_category.values()] or ([nginx_out] if nginx_out else [])
+    nginx_conf_paths_by_category = {
+        cat: o for cat, (_t, o) in nginx_out_by_category.items()
+    }
+    instance_fields: dict[str, Any] = {
+        "hostname": template_engine.service_hostname(service_name, user_name, label, domain),
         "network_name": template_engine.user_network_name(service_name, user_name, label),
         "compose_template_path": compose_template,
-        "nginx_conf_template_path": nginx_template,
-        # R9.2's recording: EVERY conf the deploy carried, template and rendered
-        # path — which is what the delete sweep walks and what the card's
-        # per-sub-service list is keyed by. The singular fields above stay as the
-        # http conf for the readers that predate the list.
-        "nginx_conf_template_paths": [t for t, _o in nginx_out_by_category.values()] or ([nginx_template] if nginx_template else []),
-        "nginx_conf_paths": [o for _t, o in nginx_out_by_category.values()] or ([nginx_out] if nginx_out else []),
-        # G55 — the per-category record. The lists above stay for readers that
-        # predate the map; these two are the authority for "one file per
-        # category" and for the stream mint's rendered-conf lookup.
-        "nginx_conf_template_paths_by_category": {
-            cat: t for cat, (t, _o) in nginx_out_by_category.items()
-        },
-        "nginx_conf_paths_by_category": {
-            cat: o for cat, (_t, o) in nginx_out_by_category.items()
-        },
-        # R6.1/R9.2: the card must know which SUB-SERVICES this instance exposes a
-        # stream endpoint for, and it decides that from the RECORDED state — never
-        # by re-deriving "TLS is on and a row exists" in the panel. The names come
-        # from the rendered stream conf's own `server_name`s: they are exactly the
-        # names the edge dials and the internal nginx selects on, so the card and
-        # the routing cannot disagree. Names, not ports — the registry stays
-        # ports-free.
-        "stream_sub_services": _stream_sub_services(list(nginx_out_by_category.values())),
-        # R1.5/R6.2 — and the EXTRA http endpoints it serves, read from the same
-        # rendered confs. The card's URL section is built from these (plus the
-        # primary, keyed `primary`), so the surface cannot offer a link the
-        # deployment does not have.
-        "http_endpoints": _http_endpoints(
-            list(nginx_out_by_category.values()), f"{service_name}-{user_name}-{label}"
-        ),
-        "env_file_path": env_file,
-        "env_files": [],  # filled after render (order preserved)
-        "profiles": list(profiles or []),
-        "service_env_files": [],
-        "compose_sources": list(compose_sources or []),
         "compose_file_path": compose_out,
-        "nginx_conf_path": nginx_out,
-        "htpasswd_path": htpasswd_out,
-        "volumes": volumes,
-        "build_args": build_args or {},
-        # The record's switch is named `tls` — the same word the deploy request,
-        # the CLI and the template variable use (ruled 2026-10-10; it used to be
-        # stored as `https`, and `registry.entry_tls` reads either for one round).
-        "tls": https,
+        "nginx_conf_template_path": nginx_template or "",
+        "nginx_conf_path": nginx_out or "",
+        "nginx_conf_paths": nginx_conf_paths,
+        "nginx_conf_paths_by_category": nginx_conf_paths_by_category,
+        "htpasswd_path": htpasswd_out or None,
         "ssl_certificate_path": ssl_certificate_path,
         "ssl_certificate_key_path": ssl_certificate_key_path,
-        "hostname": template_engine.service_hostname(service_name, user_name, label, domain),
-        "passwd_plain": passwd,
+        "env_file_path": env_file or "",
+        "env_files": [],
+        "profiles": list(profiles or []),
+        "volumes": volumes,
+        "build_args": build_args or {},
+        "tls": https,
         "subnet": _subnet,
         "gateway": _gateway,
     }
+    entry: dict[str, Any] = dict(entry_row)
+    entry.update(instance_fields)
+    entry["container_names"] = []
 
-    # --- Record declared service env files that exist in the recipe
-    # (copied per-user-per-recipe at render time; missing stay missing) ---
-    for _key, _declared in template_engine.extract_template_env_file_sources(compose_template).items():
-        if (Path(compose_template).parent / _declared).is_file():
-            entry["service_env_files"].append(_declared)
-
-    # Duplicate check + add are atomic to prevent concurrent registrations
-    with registry.transaction():
-        existing = registry.get_user_service(user_name, service_name, label)
-        if existing:
-            # Retry must REPLACE a failed entry rather than collide with it
-            # (doc §5.1): the failed entry keeps the (user, service, label) key
-            # on purpose, so the duplicate gate would otherwise reject the retry
-            # that the failed card exists to offer. Every other status still
-            # blocks — a running instance is never silently overwritten.
-            if str(existing.get("status") or "") != "failed":
-                raise ValueError(
-                    f"User '{user_name}' with service '{service_name}' "
-                    f"and label '{label}' is already registered."
-                )
-            registry.remove_user_service(user_name, service_name, label)
-        registry.add_user(entry)
+    with db.connection() as conn:
+        registry.update_instance(conn, service_id, **instance_fields)
+        basic_version = (existing_basic["basic_version"] if existing_basic else 0) or 0
+        if passwd:
+            registry.set_basic(
+                conn, service_id, basic_username=user_name,
+                secret_enc=keys.encrypt(passwd, version="v1").encode(),
+                key_version=1, basic_version=max(basic_version + 1, 1),
+                reset_required=False,
+            )
+        elif existing_basic and existing_basic["secret_enc"]:
+            # Instance-only redeploy: re-derive .htpasswd from the stored
+            # secret; never write a plaintext second copy.
+            registry.set_basic(
+                conn, service_id, basic_username=user_name,
+                secret_enc=existing_basic["secret_enc"],
+                key_version=existing_basic["key_version"],
+                basic_version=max(basic_version, 1),
+                reset_required=bool(existing_basic["reset_required"]),
+            )
+        else:
+            registry.set_basic(
+                conn, service_id, basic_username=user_name,
+                secret_enc=None, key_version=None,
+                basic_version=max(basic_version, 1), reset_required=False,
+            )
 
     # --- Materialize declared service env files from .example siblings ---
     # Projects like dify ship envs/*/x.env.example ONLY — the declared
@@ -919,14 +1040,8 @@ def register_user(
     # entry (`if status != "failed": raise ValueError(...)`, above).
     try:
         copied_env = _register_render_and_start(
-            # R3-F52: the PAIRS, not just the http conf. Without this every conf
-            # but the http one is recorded and never rendered — `_pairs` falls
-            # back to `[(nginx_template, nginx_out)]`, so the stream conf's path
-            # reaches the registry while the file never reaches the disk, and
-            # `stream_sub_services` reads an empty set forever. Measured on the
-            # live stack 2026-10-10: `/srv/.../<svc>.user-<user>.<label>.stream.conf`
-            # absent, entry's `stream_sub_services` `[]`.
             nginx_conf_pairs=nginx_out_by_category,
+            service_id=service_id,
             user_name=user_name, service_name=service_name, label=label,
             entry=entry, compose_template=compose_template,
             compose_out=compose_out, volumes=volumes,
@@ -957,7 +1072,7 @@ def register_user(
         except Exception as down_err:
             _log.warning("Failed to clean up Docker resources after failed deploy: %s", down_err)
         _mark_failed(
-            user_name, service_name, label,
+            service_id,
             getattr(exc, "stage", "deploy"),
             str(exc),
             reason=getattr(exc, "reason", None),
@@ -965,22 +1080,27 @@ def register_user(
         raise
     except Exception as exc:
         # Broader path: no Docker teardown (nothing is known to have started),
-        # but the entry still records the failure rather than vanishing.
-        _mark_failed(user_name, service_name, label, "deploy", str(exc))
+        # but the instance still records the failure rather than vanishing.
+        _mark_failed(service_id, "deploy", str(exc))
         raise
 
     # --- Mark as running (containers started successfully) ---
-    _update_registry_status(user_name, service_name, label, "running")
+    _after_successful_transition(service_id, "running")
 
     # --- Connect provision-nginx to user network + reload ---
     net = entry["network_name"]
     docker_ops.network_connect(nginx_container, net)
     stream_access.refresh_and_reload(nginx_container)
 
+    # The result is persisted on the task row: return the redacted projection,
+    # never a plaintext credential (R4.4/R5.9).
+    public_entry = registry.get_service_by_id(service_id) or entry
     return {
-        "entry": entry,
+        "entry": public_entry,
         "volume_warnings": {"missing": missing_vols, "extra": extra_vols},
         "copied_env": copied_env,
+        "service_id": service_id,
+        "procedure_id": procedure_id,
     }
 
 
@@ -1054,184 +1174,162 @@ def _purge_user_artifacts(
         _sh.rmtree(tree, ignore_errors=True)
 
 
-def remove_user(
-    *,
-    user_name: str,
-    service_name: str,
-    label: str,
-    nginx_container: str = "subnet-acl-nginx",
-) -> dict[str, str]:
-    """Stop containers and remove a user's service registration.
+def _teardown_instance(entry: dict[str, Any], nginx_container: str) -> None:
+    """Stop the instance's containers and remove ONLY its stream conf(s).
 
-    Steps
-    -----
-    1. Disconnect provision-nginx from the user's network.
-    2. ``docker compose down`` (falls back to project-name if compose file missing).
-    3. Remove generated files (nginx conf, htpasswd, compose file).
-    4. Reload provision-nginx.
-    5. Remove registry entry.
-
-    Raises
-    ------
-    KeyError
-        If no registration is found.
-    RuntimeError
-        If ``docker compose down`` fails.
+    The no-auto-delete rule (R2.6/B27): generated files, user data and named
+    volumes are preserved on both delete scopes. The one exception is the
+    per-instance stream conf — a leftover `proxy_pass` names a container that
+    no longer exists, which makes the next nginx restart fail for every service.
     """
-    import logging
-    _log = logging.getLogger(__name__)
-
-    entry = registry.get_user_service(user_name, service_name, label)
-    if not entry:
-        raise KeyError(
-            f"No registration found for {user_name}/{service_name}/{label}."
-        )
-
-    compose_file = entry.get("compose_file_path", "")
-    net = entry.get("network_name", "")
+    _log_ = logging.getLogger(__name__)
+    compose_file = entry.get("compose_file_path") or ""
+    net = entry.get("network_name") or ""
     project_name = entry.get("network_name")
-
-    # Resolve env_file to absolute path (registry stores it relative to project)
-    env_file = entry.get("env_file_path") or None
-    if env_file and not Path(env_file).is_absolute():
-        # Reconstruct absolute path from the compose template directory
-        compose_tpl = entry.get("compose_template_path", "")
-        if compose_tpl:
-            env_file = str(Path(compose_tpl).parent / env_file)
-
-    # Disconnect nginx before compose_down so Docker can remove the network
     if net:
         docker_ops.network_disconnect(nginx_container, net)
-
-    # Tear down containers: prefer compose file, fall back to project name.
-    # NOTE: --env-file is intentionally NOT passed to compose_down — it is only
-    # needed for variable substitution during 'up', and a missing env file should
-    # never block teardown.
-    compose_exists = compose_file and Path(compose_file).exists()
-    # R4-F59 — the PROFILES, or the delete leaves containers behind.
-    #
-    # `docker compose down` acts on the services in the ACTIVE profile set, and a
-    # service gated by `profiles: [x]` is not in the default set. So an instance
-    # deployed with a profile (graphiti-local's `falkordb` — the entry records it
-    # at register time for exactly this reason) kept `…-falkordb` and
-    # `…-graph-falkordb` RUNNING after the card was deleted, while their network
-    # was removed underneath them. Measured 2026-10-11 on `shared2/graphiti-local/2`:
-    # the registry entry went, two of four containers went, and the two profiled
-    # ones stayed `Up`. §10's step 11 expects the stack to be HEALTHY after a
-    # delete, so this is that step failing, not tidiness.
-    if compose_exists:
+    if compose_file and Path(compose_file).exists():
         docker_ops.compose_down(
-            compose_file, project_name=project_name, remove_volumes=True,
+            compose_file, project_name=project_name, remove_volumes=False,
             profiles=list(entry.get("profiles") or []) or None,
         )
     elif project_name:
-        _log.warning(
-            "Compose file %s not found for %s/%s/%s — attempting down by project name %s",
-            compose_file, user_name, service_name, label, project_name,
-        )
-        docker_ops.compose_down_by_project(project_name, remove_volumes=True)
-    else:
-        _log.warning(
-            "No compose file or project name for %s/%s/%s — skipping container teardown",
-            user_name, service_name, label,
-        )
-
-    # Remove generated files
-    for key in ("compose_file_path", "nginx_conf_path", "htpasswd_path"):
-        fpath = entry.get(key, "")
-        if fpath:
+        _log_.warning("Compose file %s missing — down by project %s", compose_file, project_name)
+        docker_ops.compose_down_by_project(project_name, remove_volumes=False)
+    # Stream confs only.
+    by_cat = entry.get("nginx_conf_paths_by_category") or {}
+    paths = [by_cat.get("stream")] if isinstance(by_cat, dict) and by_cat.get("stream") else []
+    for fpath in (entry.get("nginx_conf_paths") or []):
+        if isinstance(fpath, str) and fpath.endswith(".stream.conf"):
+            paths.append(fpath)
+    for fpath in {p for p in paths if p}:
+        for candidate in (fpath, fpath + ".generated", fpath + stream_access.PAUSED_SUFFIX):
             try:
-                Path(fpath).unlink(missing_ok=True)
-                Path(str(fpath) + ".generated").unlink(missing_ok=True)
-                # R13 — a stopped instance's stream conf lives under `.paused`;
-                # a delete removes it on the same explicit path as every other
-                # per-instance generated file.
-                Path(str(fpath) + stream_access.PAUSED_SUFFIX).unlink(missing_ok=True)
+                Path(candidate).unlink(missing_ok=True)
             except OSError:
                 pass
-
-    # R7.1's -api half: EVERY rendered conf the deploy carried goes with the
-    # instance — including a stream conf, whose removal is not tidiness but
-    # safety. Its `set $upstream` names a container that is about to stop
-    # existing, and the internal nginx resolves literal upstreams at
-    # config-parse time: a leftover stream conf makes the NEXT RESTART of that
-    # container fail (`host not found in upstream`), taking every service down
-    # with it. Measured 2026-10-10 while testing the minimal door.
-    for fpath in (entry.get("nginx_conf_paths") or []):
-        if not fpath:
-            continue
-        try:
-            Path(fpath).unlink(missing_ok=True)
-            Path(str(fpath) + ".generated").unlink(missing_ok=True)
-            # R13 — the paused copy of a stream conf is a per-instance generated
-            # file too; a delete must not leave it behind.
-            Path(str(fpath) + stream_access.PAUSED_SUFFIX).unlink(missing_ok=True)
-        except OSError:
-            pass
-
-    # Full purge (decision #2): a deleted service leaves NOTHING behind —
-    # per-user artifacts in the recipe dir + the user_data volume tree.
-    _purge_user_artifacts(user_name, service_name, label, entry)
-
-    # Named volumes live in Docker's volume store, not in the user_data tree the
-    # purge walks, so the bind-mount cleanup above cannot reach them. Without
-    # this, a compose declaring named volumes keeps its database/keys and the
-    # next deploy of the same (user, service, label) silently inherits them —
-    # not a clean deploy. The compose_file_path is unlinked further up, so the
-    # sweep is by compose-project label rather than by the file's declarations.
-    if project_name:
-        removed = docker_ops.remove_project_volumes(project_name)
-        if removed:
-            _log.info(
-                "removed %d named volume(s) for %s/%s/%s: %s",
-                len(removed), user_name, service_name, label, ", ".join(removed),
-            )
-
-    # P1: Orphan network cleanup — if network still exists after compose_down, clean it up
     if net:
         try:
             docker_ops.orphan_network_cleanup(net, nginx_container)
         except Exception:
             pass
 
+
+def remove_user(
+    *,
+    service_id: str | None = None,
+    user_name: str | None = None,
+    service_name: str | None = None,
+    label: str | None = None,
+    procedure_id: str | None = None,
+    nginx_container: str = "subnet-acl-nginx",
+    recovery: bool = False,
+) -> dict[str, str]:
+    """Full service delete: `deleting` -> tombstone (R6.3).
+
+    With an instance row the status moves `deleting -> gone`, remembering the
+    exact prior status/failure so a failed teardown restores it. Without an
+    instance row (paused fix, pre-deploy-only) one transaction removes
+    endpoints/Basic and writes the tombstone; a failure before commit leaves
+    `services` live. Generated files/volumes are preserved except the stream
+    conf.
+    """
+    sid = registry.resolve_service_id(
+        service_id, user_name=user_name, service_name=service_name, label=label
+    )
+    if not sid:
+        raise KeyError("No registration found for this service.")
+    entry = registry.get_service_by_id(sid)
+    if not entry or entry.get("deleted_at") is not None:
+        raise KeyError("No active service found for this id.")
+    status = entry.get("status")
+    if status in ("building", "deleting") and not recovery:
+        raise ValueError(f"service is {status}; cancel it before delete")
+    proc = uuid.UUID(str(procedure_id)) if procedure_id else uuid.uuid4()
+
+    if status is None:
+        # Instance-less: one atomic tombstone transaction.
+        with db.connection() as conn:
+            registry.set_current_procedure(conn, uuid.UUID(sid), proc)
+            registry.tombstone(conn, uuid.UUID(sid))
+        return {"service_id": sid, "user_name": entry["user_name"],
+                "service_name": entry["service_name"], "label": entry["label"]}
+
+    if recovery and status == "deleting":
+        # A crash left the instance mid-delete. Complete the same idempotent
+        # teardown/tombstone; `previous_*` are already the restore point.
+        previous_failure = entry.get("previous_failure")
+        status = entry.get("previous_status") or "unknown"
+    else:
+        previous_failure = entry.get("failure")
+    with db.connection() as conn:
+        registry.update_instance(
+            conn, sid, status="deleting", previous_status=status,
+            previous_failure=previous_failure, current_procedure_id=proc,
+        )
+    try:
+        _teardown_instance(entry, nginx_container)
+        with db.connection() as conn:
+            registry.tombstone(conn, uuid.UUID(sid))
+        stream_access.refresh_and_reload(nginx_container)
+    except Exception:
+        with db.connection() as conn:
+            registry.update_instance(
+                conn, sid, status=status or "unknown",
+                failure=previous_failure, previous_status=None, previous_failure=None,
+            )
+        raise
+    return {"service_id": sid, "user_name": entry["user_name"],
+            "service_name": entry["service_name"], "label": entry["label"]}
+
+
+def remove_instance_only(
+    *,
+    service_id: str | None = None,
+    user_name: str | None = None,
+    service_name: str | None = None,
+    label: str | None = None,
+    procedure_id: str | None = None,
+    nginx_container: str = "subnet-acl-nginx",
+) -> dict[str, str]:
+    """Fix / instance-only delete: instance + endpoints, `services` and Basic stay.
+
+    Used by the paused-fix handoff. It creates no `deleting` card state and
+    never tombstones the service, so the paused session's redeploy reuses the
+    same identity and re-derives `.htpasswd` from `service_basic.secret_enc`.
+    """
+    sid = registry.resolve_service_id(
+        service_id, user_name=user_name, service_name=service_name, label=label
+    )
+    if not sid:
+        raise KeyError("No registration found for this service.")
+    entry = registry.get_service_by_id(sid)
+    if not entry or entry.get("status") is None:
+        raise KeyError("No deployed instance for this service.")
+    if entry["status"] in ("building", "deleting"):
+        raise ValueError(f"service is {entry['status']}; cannot remove its instance")
+    _teardown_instance(entry, nginx_container)
+    with db.connection() as conn:
+        if procedure_id:
+            registry.set_current_procedure(conn, uuid.UUID(sid), uuid.UUID(str(procedure_id)))
+        registry.delete_instance(conn, uuid.UUID(sid))
     stream_access.refresh_and_reload(nginx_container)
-
-    with registry.transaction():
-        registry.remove_user_service(user_name, service_name, label)
-
-    return {"user_name": user_name, "service_name": service_name, "label": label}
+    return {"service_id": sid, "user_name": entry["user_name"],
+            "service_name": entry["service_name"], "label": entry["label"]}
 
 
 def remove_user_marked(**kwargs) -> dict[str, str]:
-    """``remove_user`` with a persisted ``deleting`` registry status.
-
-    The status is written BEFORE the teardown starts so the dashboard keeps
-    showing "Deleting…" across page refreshes (mirrors the ``building`` status
-    written on register/rebuild). ``remove_user`` drops the registry entry on
-    success; on failure the status is reset so a card cannot stay stuck.
-    """
-    user_name = kwargs.get("user_name", "")
-    service_name = kwargs.get("service_name", "")
-    label = str(kwargs.get("label", ""))
-    try:
-        _update_registry_status(user_name, service_name, label, "deleting")
-    except Exception:
-        pass
-    try:
-        return remove_user(**kwargs)
-    except Exception:
-        try:
-            _update_registry_status(user_name, service_name, label, "running")
-        except Exception:
-            pass
-        raise
+    """Full delete with the persisted `deleting` state (R6.3)."""
+    return remove_user(**kwargs)
 
 
 def rebuild_user(
     *,
-    user_name: str,
-    service_name: str,
-    label: str,
+    service_id: str | None = None,
+    user_name: str | None = None,
+    service_name: str | None = None,
+    label: str | None = None,
+    procedure_id: str | None = None,
     no_cache: bool = False,
     build_args: dict[str, str] | None = None,
     nginx_container: str = "subnet-acl-nginx",
@@ -1252,11 +1350,14 @@ def rebuild_user(
     RuntimeError
         If build or up fails.
     """
-    entry = registry.get_user_service(user_name, service_name, label)
+    sid = registry.resolve_service_id(
+        service_id, user_name=user_name, service_name=service_name, label=label
+    )
+    entry = registry.get_service_by_id(sid) if sid else None
     if not entry:
-        raise KeyError(
-            f"No registration found for {user_name}/{service_name}/{label}."
-        )
+        raise KeyError("No registration found for this service.")
+    sid = entry["service_id"]
+    user_name, service_name, label = entry["user_name"], entry["service_name"], entry["label"]
 
     compose_file = entry.get("compose_file_path", "")
     if not compose_file or not Path(compose_file).exists():
@@ -1289,14 +1390,18 @@ def rebuild_user(
     if build_args is None:
         build_args = entry.get("build_args") or None
 
-    _update_registry_status(user_name, service_name, label, "building")
+    with db.connection() as conn:
+        fields: dict[str, Any] = {"status": "building", "failure": None}
+        if procedure_id:
+            fields["current_procedure_id"] = uuid.UUID(str(procedure_id))
+        registry.update_instance(conn, sid, **fields)
     try:
         docker_ops.compose_build(compose_file, no_cache=no_cache, env_file=env_files, project_name=project_name, build_args=build_args, profiles=profiles)
         docker_ops.compose_up(compose_file, env_file=env_files, project_name=project_name, profiles=profiles)
-    except Exception:
-        _update_registry_status(user_name, service_name, label, "error")
+    except Exception as exc:
+        _mark_failed(sid, "rebuild", str(exc))
         raise
-    _update_registry_status(user_name, service_name, label, "running")
+    _after_successful_transition(sid, "running")
 
     # G: a rebuild recreates the containers, and Docker may hand the same
     # container name a different address.  Stream confs point at the name with a
@@ -1320,9 +1425,10 @@ def rebuild_user(
 
 def start_service(
     *,
-    user_name: str,
-    service_name: str,
-    label: str,
+    service_id: str | None = None,
+    user_name: str | None = None,
+    service_name: str | None = None,
+    label: str | None = None,
     nginx_container: str = "subnet-acl-nginx",
 ) -> dict[str, str]:
     """Start a user's service containers (docker compose up -d).
@@ -1333,9 +1439,13 @@ def start_service(
     FileNotFoundError if the compose file is missing.
     RuntimeError if docker compose up fails.
     """
-    entry = registry.get_user_service(user_name, service_name, label)
+    sid = registry.resolve_service_id(
+        service_id, user_name=user_name, service_name=service_name, label=label
+    )
+    entry = registry.get_service_by_id(sid) if sid else None
     if not entry:
-        raise KeyError(f"No registration found for {user_name}/{service_name}/{label}.")
+        raise KeyError("No registration found for this service.")
+    user_name, service_name, label = entry["user_name"], entry["service_name"], entry["label"]
 
     compose_file = entry.get("compose_file_path", "")
     if not compose_file or not Path(compose_file).exists():
@@ -1381,9 +1491,10 @@ def start_service(
 
 def stop_service(
     *,
-    user_name: str,
-    service_name: str,
-    label: str,
+    service_id: str | None = None,
+    user_name: str | None = None,
+    service_name: str | None = None,
+    label: str | None = None,
     nginx_container: str = "subnet-acl-nginx",
 ) -> dict[str, Any]:
     """Stop a user's service containers (docker compose stop).
@@ -1403,9 +1514,13 @@ def stop_service(
     FileNotFoundError if the compose file is missing.
     RuntimeError if docker compose stop fails.
     """
-    entry = registry.get_user_service(user_name, service_name, label)
+    sid = registry.resolve_service_id(
+        service_id, user_name=user_name, service_name=service_name, label=label
+    )
+    entry = registry.get_service_by_id(sid) if sid else None
     if not entry:
-        raise KeyError(f"No registration found for {user_name}/{service_name}/{label}.")
+        raise KeyError("No registration found for this service.")
+    user_name, service_name, label = entry["user_name"], entry["service_name"], entry["label"]
 
     compose_file = entry.get("compose_file_path", "")
     if not compose_file or not Path(compose_file).exists():
@@ -1457,100 +1572,95 @@ def stop_service(
 
 def change_password(
     *,
-    user_name: str,
-    service_name: str,
-    label: str,
+    service_id: str | None = None,
+    user_name: str | None = None,
+    service_name: str | None = None,
+    label: str | None = None,
     passwd: str,
     nginx_container: str = "subnet-acl-nginx",
 ) -> dict[str, str]:
-    """Change a user's htpasswd password and reload nginx.
+    """Change a service's Basic password (R6.5).
 
-    Steps
-    -----
-    1. Look up registration entry.
-    2. Re-hash new password.
-    3. Re-write .htpasswd file.
-    4. Update the registry entry with the new hash **and the new plaintext**.
-    5. Reload nginx.
-
-    Step 4's plaintext is not cosmetic: the gateway rebuilds
-    ``Authorization: Basic user_name:passwd_plain`` from the registry on every
-    allowed request (gateway ``_get_service_basic_credential``), because a bcrypt
-    hash is one-way and cannot be replayed. A hash without a matching plaintext
-    leaves the instance protected by an ``auth_basic`` the gate can never satisfy
-    — the gate passes, the instance answers 401 with its OWN realm, and the
-    service is unopenable through the gate.
-
-    Raises
-    ------
-    KeyError
-        If no registration is found.
-    FileNotFoundError
-        If the htpasswd file path is missing or the file doesn't exist.
-    ValueError
-        If *passwd* is empty (removing protection is ``remove_password``'s job —
-        an empty password would hash to "" and lock the service out).
+    The plaintext is encrypted into ``service_basic.secret_enc`` with the
+    keyring and the derived ``.htpasswd`` is ``<basic_username>:<hash>``. Both
+    halves come from the same stored ``basic_username``, so the gateway's
+    ``X-Service-Basic`` and the instance's auth_basic always agree. The account
+    password is separate.
     """
-    import logging
-    _log = logging.getLogger(__name__)
-
-    entry = registry.get_user_service(user_name, service_name, label)
+    sid = registry.resolve_service_id(
+        service_id, user_name=user_name, service_name=service_name, label=label
+    )
+    entry = registry.get_service_by_id(sid) if sid else None
     if not entry:
-        raise KeyError(
-            f"No registration found for {user_name}/{service_name}/{label}."
-        )
-
-    htpasswd_path = entry.get("htpasswd_path", "")
-    if not htpasswd_path:
-        raise FileNotFoundError(
-            f"No htpasswd file path in registry for {user_name}/{service_name}/{label}."
-        )
-    if not Path(htpasswd_path).exists():
-        raise FileNotFoundError(f"htpasswd file not found: {htpasswd_path}")
-
+        raise KeyError("No registration found for this service.")
+    sid = entry["service_id"]
+    user_name, service_name, label = entry["user_name"], entry["service_name"], entry["label"]
     if not passwd:
-        # `hash_password("")` returns "" (lib/auth.py:26), and writing that to the
-        # htpasswd produces an entry no password can match — the service would be
-        # locked out entirely. register_user guards this (`if passwd else ""`);
-        # removing protection is remove_password()'s job, never a silent rewrite.
         raise ValueError("passwd must be non-empty (use remove_password to drop protection)")
+
+    htpasswd_path = entry.get("htpasswd_path") or str(
+        Path(entry.get("nginx_conf_path") or ".").with_name(
+            f"{service_name}.user-{user_name}.{label}.htpasswd"
+        )
+    )
+    # Capture the previous state so a FAILED reload restores it: the operation
+    # must not report a password that nginx never loaded (and must not silently
+    # half-apply one).
+    old_htpasswd = Path(htpasswd_path).read_bytes() if Path(htpasswd_path).exists() else None
+    with db.connection() as conn:
+        _old = conn.execute(
+            "SELECT basic_version, secret_enc, key_version, reset_required "
+            "FROM registry.service_basic WHERE service_id=%s", (sid,)
+        ).fetchone()
+    old_basic = dict(_old) if _old else None
 
     passwd_hash = auth.hash_password(user_name, passwd)
     auth.write_htpasswd_file(htpasswd_path, user_name, passwd_hash)
+    Path(htpasswd_path + ".generated").write_text("")
 
-    # Update registry
-    with registry.transaction():
-        users = registry._load()
-        matched = False
-        for u in users:
-            if (
-                u.get("user_name") == user_name
-                and u.get("service_name") == service_name
-                and str(u.get("label", "")) == str(label)
-            ):
-                u["passwd"] = passwd_hash
-                # The plaintext MUST track the hash: it is what the gate injects
-                # upstream as Basic. Losing it makes the service unopenable
-                # through the gate (see the docstring).
-                u["passwd_plain"] = passwd
-                matched = True
-                break
-        # Save ONLY on a real match — same guard as _mark_failed and
-        # _update_registry_status: writing back an unchanged (possibly empty)
-        # list is how an empty registry could be persisted over real data.
-        if matched:
-            registry._save(users)
+    with db.connection() as conn:
+        row = conn.execute(
+            "SELECT basic_version FROM registry.service_basic WHERE service_id=%s", (sid,)
+        ).fetchone()
+        version = int(row["basic_version"]) if row else 0
+        registry.set_basic(
+            conn, uuid.UUID(sid), basic_username=user_name,
+            secret_enc=keys.encrypt(passwd, version="v1").encode(),
+            key_version=1, basic_version=max(version + 1, 1), reset_required=False,
+        )
+        registry.update_instance(conn, sid, htpasswd_path=str(htpasswd_path))
 
-    stream_access.refresh_and_reload(nginx_container)
-
-    return {"user_name": user_name, "service_name": service_name, "label": label}
+    try:
+        stream_access.refresh_and_reload(nginx_container)
+    except Exception:
+        # Roll the credential back with the conf: nginx is still serving the
+        # previous state, so the record and the secret file must match it.
+        with db.connection() as conn:
+            if old_basic is not None:
+                registry.set_basic(
+                    conn, uuid.UUID(sid), basic_username=user_name,
+                    secret_enc=old_basic.get("secret_enc"),
+                    key_version=old_basic.get("key_version"),
+                    basic_version=int(old_basic.get("basic_version") or 0),
+                    reset_required=bool(old_basic.get("reset_required")),
+                )
+            registry.update_instance(conn, sid, htpasswd_path=str(htpasswd_path))
+        if old_htpasswd is None:
+            Path(htpasswd_path).unlink(missing_ok=True)
+            Path(htpasswd_path + ".generated").unlink(missing_ok=True)
+        else:
+            Path(htpasswd_path).write_bytes(old_htpasswd)
+        raise
+    return {"service_id": sid, "user_name": user_name,
+            "service_name": service_name, "label": label}
 
 
 def remove_password(
     *,
-    user_name: str,
-    service_name: str,
-    label: str,
+    service_id: str | None = None,
+    user_name: str | None = None,
+    service_name: str | None = None,
+    label: str | None = None,
     nginx_container: str = "subnet-acl-nginx",
 ) -> dict[str, str]:
     """Remove a service's password protection and reload nginx.
@@ -1570,9 +1680,14 @@ def remove_password(
     KeyError
         If no registration is found.
     """
-    entry = registry.get_user_service(user_name, service_name, label)
+    sid = registry.resolve_service_id(
+        service_id, user_name=user_name, service_name=service_name, label=label
+    )
+    entry = registry.get_service_by_id(sid) if sid else None
     if not entry:
-        raise KeyError(f"No registration found for {user_name}/{service_name}/{label}.")
+        raise KeyError("No registration found for this service.")
+    sid = entry["service_id"]
+    user_name, service_name, label = entry["user_name"], entry["service_name"], entry["label"]
 
     htpasswd_path = entry.get("htpasswd_path") or ""
     nginx_tpl = entry.get("nginx_conf_template_path") or ""
@@ -1623,23 +1738,16 @@ def remove_password(
         raise
 
     # --- Registry: only after the served conf changed successfully ---
-    with registry.transaction():
-        users = registry._load()
-        matched = False
-        for u in users:
-            if (
-                u.get("user_name") == user_name
-                and u.get("service_name") == service_name
-                and str(u.get("label", "")) == str(label)
-            ):
-                u.pop("passwd", None)
-                u.pop("passwd_plain", None)
-                u["htpasswd_path"] = None
-                matched = True
-                break
-        # Save ONLY on a real match.
-        if matched:
-            registry._save(users)
+    with db.connection() as conn:
+        row = conn.execute(
+            "SELECT basic_version FROM registry.service_basic WHERE service_id=%s", (sid,)
+        ).fetchone()
+        version = int(row["basic_version"]) if row else 0
+        registry.set_basic(
+            conn, uuid.UUID(sid), basic_username=user_name, secret_enc=None,
+            key_version=None, basic_version=max(version + 1, 1), reset_required=False,
+        )
+        registry.update_instance(conn, sid, htpasswd_path=None)
 
     # --- The htpasswd file itself (never leave a served secret behind) ---
     if htpasswd_path:

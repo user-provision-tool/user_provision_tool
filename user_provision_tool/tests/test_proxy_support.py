@@ -147,10 +147,6 @@ class TestRegisterUserWithBuildArgs:
     def _setup(self, monkeypatch, tmp_path):
         _mock_network_nginx_reload(monkeypatch)
         self.calls = _mock_docker_ops_run(monkeypatch)
-        # Redirect registry to temp file
-        from lib import registry as reg_mod
-        self.reg_path = tmp_path / "user_registry.yml"
-        monkeypatch.setattr(reg_mod, "REGISTRY_FILE", self.reg_path)
         self.tmp_path = tmp_path
         # user_data_dir so _auto_volumes creates the volume directories needed
         # by the compose template (app_data, db_data references)
@@ -253,9 +249,6 @@ class TestRebuildUserWithBuildArgs:
     def _setup(self, monkeypatch, tmp_path):
         _mock_network_nginx_reload(monkeypatch)
         self.calls = _mock_docker_ops_run(monkeypatch)
-        from lib import registry as reg_mod
-        self.reg_path = tmp_path / "user_registry.yml"
-        monkeypatch.setattr(reg_mod, "REGISTRY_FILE", self.reg_path)
         self.tmp_path = tmp_path
         self.user_data_dir = tmp_path / "user_data"
         self.user_data_dir.mkdir()

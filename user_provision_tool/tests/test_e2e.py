@@ -59,8 +59,7 @@ class _MockDockerCalls:
 
 @pytest.fixture(autouse=True)
 def isolated_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """Redirect REGISTRY_FILE and generated/ to tmp_path for every e2e test."""
-    monkeypatch.setattr(reg_mod, "REGISTRY_FILE", tmp_path / "user_registry.yml")
+    """Redirect generated/ to tmp_path for every e2e test (registry is PostgreSQL)."""
     # Patch the GENERATED_DIR used in cli.register
     import cli.register as reg_script
     monkeypatch.setattr(reg_script, "GENERATED_DIR", tmp_path / "generated")

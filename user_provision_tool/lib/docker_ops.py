@@ -397,8 +397,19 @@ def network_disconnect(container: str, network: str) -> None:
 
 
 def nginx_reload(container: str) -> None:
-    """Send a reload signal to nginx inside *container*."""
-    _run(["docker", "exec", container, "nginx", "-s", "reload"], check=False)
+    """Send a reload signal to nginx inside *container*.
+
+    A failed reload is NOT silent: the caller's rollback (a delete/rename that
+    must not take effect without the live reload, or a password change that
+    re-derives the htpasswd) is only meaningful if it learns that nginx did not
+    accept the change. Best-effort callers (startup reconciliation) catch it.
+    """
+    proc = _run(["docker", "exec", container, "nginx", "-s", "reload"], check=False)
+    if getattr(proc, "returncode", 0):
+        stderr = (getattr(proc, "stderr", "") or "").strip()
+        raise RuntimeError(
+            f"nginx reload failed in {container}: {stderr[:300] or 'no stderr'}"
+        )
 
 
 def nginx_restart(container: str) -> None:

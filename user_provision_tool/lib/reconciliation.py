@@ -11,11 +11,12 @@ from __future__ import annotations
 import logging
 import os
 import re
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import docker_ops, registry, stream_access
+from . import db, docker_ops, registry, stream_access
 
 _log = logging.getLogger(__name__)
 
@@ -194,10 +195,13 @@ def _sweep_transient_statuses() -> dict[str, Any]:
         if not user_name or not service_name:
             continue
 
-        if status in ("building", "error"):
+        sid = entry.get("service_id")
+        if not sid:
+            continue
+        if status == "building":
             try:
                 provisioner._mark_failed(
-                    user_name, service_name, label, "interrupted",
+                    sid, "interrupted",
                     "provision-api restarted while the deploy was running",
                 )
                 swept["interrupted"] += 1
@@ -209,8 +213,9 @@ def _sweep_transient_statuses() -> dict[str, Any]:
             print(f"[recovery] Completing interrupted delete of {user_name}/{service_name}/{label}", flush=True)
             try:
                 provisioner.remove_user(
-                    user_name=user_name, service_name=service_name, label=label,
+                    service_id=sid,
                     nginx_container=entry.get("nginx_container") or "subnet-acl-nginx",
+                    recovery=True,
                 )
                 swept["delete_completed"] += 1
             except Exception as exc:
@@ -307,13 +312,14 @@ def recover_on_startup(
         user_name = entry.get("user_name", "")
         service_name = entry.get("service_name", "")
         label = str(entry.get("label", "0"))
+        sid = entry.get("service_id")
 
-        # A FAILED entry has container_names but no containers by design (the
-        # failure path tears them down and keeps the entry). Restarting it here
-        # would silently resurrect a failed deploy and leave the registry saying
-        # `failed` while containers run — the operator's Retry is the only path
-        # back (GRILLING G17). `deleting` is already being torn down.
-        if str(entry.get("status") or "") in ("failed", "deleting"):
+        # The zombie sweep scans ONLY service_instances. A live `services` row
+        # with no instance (a paused fix, a pre-deploy-only identity) is not a
+        # zombie and must never be treated as one (R6.6).
+        if not sid or entry.get("status") is None:
+            continue
+        if str(entry.get("status") or "") in ("failed", "deleting", "unknown"):
             continue
 
         if not container_names:
@@ -338,8 +344,9 @@ def recover_on_startup(
                 except Exception as exc:
                     print(f"[recovery] WARNING: Failed to recover zombie {user_name}/{service_name}/{label}: {exc}", flush=True)
             else:
-                print(f"[recovery] Removing zombie registry entry {user_name}/{service_name}/{label} — compose file missing", flush=True)
-                registry.remove_user_service(user_name, service_name, label)
+                print(f"[recovery] Tombstoning zombie {user_name}/{service_name}/{label} — compose file missing", flush=True)
+                with db.connection() as _conn:
+                    registry.tombstone(_conn, uuid.UUID(sid))
                 zombies_cleaned += 1
 
     # Reload registry after cleaning

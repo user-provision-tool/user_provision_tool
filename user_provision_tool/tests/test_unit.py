@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import sys
+import uuid
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -14,6 +15,8 @@ import pytest
 import yaml
 
 from lib import auth, docker_ops, provisioner, registry, template_engine, validation
+from registry_support import add_user as add_registry_user
+from registry_support import remove_user_service as remove_registry_service
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 COMPOSE_TEMPLATE = str(FIXTURES_DIR / "docker-compose.template.yml.j2")
@@ -85,58 +88,66 @@ class TestValidation:
 
 
 class TestRegistry:
+    """The registry is the PostgreSQL ``registry`` schema (T1/T3)."""
+
     def test_empty_registry(self, registry_file):
         assert registry.get_all_users() == []
 
     def test_add_and_get_user(self, registry_file, sample_entry):
-        registry.add_user(sample_entry)
+        add_registry_user(sample_entry)
         users = registry.get_all_users()
         assert len(users) == 1
         assert users[0]["user_name"] == "alice"
+        assert users[0]["service_id"]
 
     def test_get_user_by_name(self, registry_file, sample_entry):
-        registry.add_user(sample_entry)
+        add_registry_user(sample_entry)
         result = registry.get_user("alice")
         assert len(result) == 1
         assert result[0]["service_name"] == "myapp"
 
     def test_get_user_unknown(self, registry_file, sample_entry):
-        registry.add_user(sample_entry)
+        add_registry_user(sample_entry)
         assert registry.get_user("nobody") == []
 
     def test_get_user_service_exact_match(self, registry_file, sample_entry):
-        registry.add_user(sample_entry)
+        add_registry_user(sample_entry)
         found = registry.get_user_service("alice", "myapp", "0")
         assert found is not None
         assert found["label"] == "0"
 
     def test_get_user_service_no_match(self, registry_file, sample_entry):
-        registry.add_user(sample_entry)
+        add_registry_user(sample_entry)
         assert registry.get_user_service("alice", "myapp", "99") is None
 
     def test_remove_user_service(self, registry_file, sample_entry):
-        registry.add_user(sample_entry)
-        removed = registry.remove_user_service("alice", "myapp", "0")
+        add_registry_user(sample_entry)
+        removed = remove_registry_service("alice", "myapp", "0")
         assert removed is True
         assert registry.get_all_users() == []
 
     def test_remove_nonexistent_returns_false(self, registry_file):
-        assert registry.remove_user_service("ghost", "svc", "0") is False
+        assert remove_registry_service("ghost", "svc", "0") is False
 
     def test_multiple_users_isolated(self, registry_file, sample_entry):
         entry_bob = dict(sample_entry, user_name="bob")
-        registry.add_user(sample_entry)
-        registry.add_user(entry_bob)
-        registry.remove_user_service("alice", "myapp", "0")
+        add_registry_user(sample_entry)
+        add_registry_user(entry_bob)
+        remove_registry_service("alice", "myapp", "0")
         remaining = registry.get_all_users()
         assert len(remaining) == 1
         assert remaining[0]["user_name"] == "bob"
 
-    def test_registry_persists_to_yaml(self, registry_file, sample_entry):
-        registry.add_user(sample_entry)
-        raw = yaml.safe_load(registry_file.read_text())
-        assert isinstance(raw, list)
-        assert raw[0]["user_name"] == "alice"
+    def test_registry_persists_to_postgres(self, registry_file, sample_entry):
+        service_id, _proc = add_registry_user(sample_entry)
+        row = registry.db.fetch_one(
+            "SELECT s.service_name, a.username FROM registry.services s "
+            "JOIN registry.api_users a ON a.id = s.owner_api_user_id "
+            "WHERE s.id = %s",
+            (service_id,),
+        )
+        assert row["service_name"] == "myapp"
+        assert row["username"] == "alice"
 
 
 # ---------------------------------------------------------------------------
@@ -665,19 +676,17 @@ server {
         assert registry.next_free_label("alice", "myapp") == "0"
 
     def test_next_free_label_skips_past_existing(self, monkeypatch):
-        monkeypatch.setattr(registry, "get_user", lambda u: [
-            {"service_name": "myapp", "label": "0"},
-            {"service_name": "myapp", "label": "1"},
-            {"service_name": "other", "label": "7"},   # different service — ignored
-        ])
+        add_registry_user({"user_name": "alice", "service_name": "myapp", "label": "0"})
+        add_registry_user({"user_name": "alice", "service_name": "myapp", "label": "1"})
+        # a different service's label is not this service's history
+        add_registry_user({"user_name": "alice", "service_name": "other", "label": "7"})
         assert registry.next_free_label("alice", "myapp") == "2"
 
     def test_next_free_label_never_reuses_a_freed_label(self, monkeypatch):
         """max+1, deliberately: a freed label can collide with surviving Docker objects."""
-        monkeypatch.setattr(registry, "get_user", lambda u: [
-            {"service_name": "myapp", "label": "0"},
-            {"service_name": "myapp", "label": "2"},
-        ])
+        add_registry_user({"user_name": "alice", "service_name": "myapp", "label": "0"})
+        add_registry_user({"user_name": "alice", "service_name": "myapp", "label": "2"})
+        remove_registry_service("alice", "myapp", "2")
         assert registry.next_free_label("alice", "myapp") == "3"
 
     def test_register_request_label_is_optional(self):
@@ -1038,17 +1047,20 @@ class TestDockerOps:
         monkeypatch.setattr(docker_ops.subprocess, "Popen", _FailProc)
         docker_ops.network_disconnect("subnet-acl-nginx", "nonexistent-net")
 
-    def test_nginx_reload_uses_check_false(self, monkeypatch):
-        class _FailProc:
-            def __init__(self, args, **kwargs):
-                self.returncode = 1
-                self.stdout = io.StringIO("")
-                self.stderr = io.StringIO("")
-            def wait(self): pass
-            def __enter__(self): return self
-            def __exit__(self, *a): pass
-        monkeypatch.setattr(docker_ops.subprocess, "Popen", _FailProc)
-        docker_ops.nginx_reload("subnet-acl-nginx")
+    def test_nginx_reload_surfaces_a_failed_exec(self, monkeypatch):
+        """`check=False` stays (the runner must not raise on the status), but the
+        failed reload is then raised by nginx_reload so rollbacks can run."""
+        import subprocess
+        calls = []
+
+        def fake_run(args, check=True):
+            calls.append((args, check))
+            return subprocess.CompletedProcess(args, 1, "", "container is not running")
+
+        monkeypatch.setattr(docker_ops, "_run", fake_run)
+        with pytest.raises(RuntimeError, match="nginx reload failed"):
+            docker_ops.nginx_reload("subnet-acl-nginx")
+        assert calls and calls[0][1] is False
 
     def test_compose_build_with_build_args(self, monkeypatch):
         """compose_build appends --build-arg flags before the build subcommand."""
@@ -2472,8 +2484,7 @@ class TestProvisioner:
             "container_names": [],
             "volumes": {},
         }
-        monkeypatch.setattr(reg_mod, "get_user", lambda u: [entry])
-        monkeypatch.setattr(api_mod.registry, "get_user", lambda u: [entry])
+        add_registry_user(entry)
 
         status = api_mod._status_for_user("alice", {})
         bucket = (
@@ -2611,9 +2622,6 @@ class TestProvisionerEnvFile:
             lambda *a, **kw: self.events.append("reload"),
         )
 
-        # Redirect registry to temp file
-        self.reg_path = tmp_path / "user_registry.yml"
-        monkeypatch.setattr(registry, "REGISTRY_FILE", self.reg_path)
         self.tmp_path = tmp_path
         self.user_data_dir = tmp_path / "user_data"
         self.user_data_dir.mkdir()
@@ -3068,7 +3076,6 @@ class TestProvisionerEnvFile:
             passwd="oldpass",
         )
         entry_before = registry.get_user_service("pwuser", "myapp", "0")
-        old_hash = entry_before.get("passwd", "")
 
         result = provisioner.change_password(
             user_name="pwuser",
@@ -3080,17 +3087,20 @@ class TestProvisionerEnvFile:
         assert result["user_name"] == "pwuser"
 
         entry_after = registry.get_user_service("pwuser", "myapp", "0")
-        new_hash = entry_after.get("passwd", "")
-        assert new_hash != old_hash, "Password hash should change"
-        assert new_hash.startswith("$2"), "Should be bcrypt hash"
+        assert entry_after["basic_version"] == entry_before["basic_version"] + 1
+        assert entry_after["has_basic"] is True
 
-        # The gate rebuilds `Authorization: Basic user:passwd_plain` from the
-        # registry, so the plaintext must track the htpasswd: a stale or absent
-        # plaintext makes a protected service unopenable through the gate
-        # (the instance answers 401 with its OWN realm while the gate passes).
-        assert entry_after.get("passwd_plain") == "newpass", (
-            "change_password must re-record the plaintext beside the new hash"
+        # The stored secret is ciphertext and decrypts to the new password;
+        # the gateway injects `Authorization: Basic <basic_username>:<secret>`
+        # from the same row, so both halves always agree.
+        from lib import keys
+        row = registry.db.fetch_one(
+            "SELECT secret_enc, basic_username FROM registry.service_basic "
+            "WHERE service_id=%s", (entry_after["service_id"],),
         )
+        assert row["basic_username"] == "pwuser"
+        assert keys.decrypt(bytes(row["secret_enc"]).decode()) == "newpass"
+        assert "newpass" not in bytes(row["secret_enc"]).decode(errors="replace")
 
         # htpasswd file should contain new hash
         htpasswd_path = entry_after.get("htpasswd_path", "")
@@ -3138,9 +3148,19 @@ class TestProvisionerEnvFile:
                 nginx_container="subnet-acl-nginx",
             )
 
-        # Neither the htpasswd nor the registry hash may move.
+        # Neither the htpasswd nor the stored ciphertext may move.
         assert Path(entry_before["htpasswd_path"]).read_text() == htpasswd_before
-        assert registry.get_user_service("pwuser", "myapp", "0")["passwd"] == entry_before["passwd"]
+        after = registry.get_user_service("pwuser", "myapp", "0")
+        assert after["basic_version"] == entry_before["basic_version"]
+        before_row = registry.db.fetch_one(
+            "SELECT secret_enc FROM registry.service_basic WHERE service_id=%s",
+            (entry_before["service_id"],),
+        )
+        after_row = registry.db.fetch_one(
+            "SELECT secret_enc FROM registry.service_basic WHERE service_id=%s",
+            (entry_before["service_id"],),
+        )
+        assert after_row["secret_enc"] == before_row["secret_enc"]
 
     def test_change_password_without_a_matching_entry_never_writes_the_registry(self, monkeypatch):
         """The write-back is guarded on a real match.
@@ -3163,23 +3183,31 @@ class TestProvisionerEnvFile:
             passwd="oldpass",
         )
         entry = registry.get_user_service("pwuser", "myapp", "0")
-        before = Path(registry.REGISTRY_FILE).read_bytes()
-
-        monkeypatch.setattr(registry, "get_user_service", lambda *a, **k: entry)
-        monkeypatch.setattr(registry, "_load", lambda: [])
-        saves = []
-        monkeypatch.setattr(registry, "_save", lambda users: saves.append(users))
-
-        provisioner.change_password(
-            user_name="pwuser",
-            service_name="myapp",
-            label="0",
-            passwd="newpass",
-            nginx_container="subnet-acl-nginx",
+        before = registry.db.fetch_one(
+            "SELECT secret_enc, basic_version FROM registry.service_basic "
+            "WHERE service_id=%s",
+            (entry["service_id"],),
         )
 
-        assert saves == [], "an unmatched change_password must not write the registry back"
-        assert Path(registry.REGISTRY_FILE).read_bytes() == before
+        # No matching identity ⇒ the operation is refused before any write.
+        with pytest.raises(KeyError):
+            provisioner.change_password(
+                user_name="ghost",
+                service_name="myapp",
+                label="0",
+                passwd="newpass",
+                nginx_container="subnet-acl-nginx",
+            )
+
+        after = registry.get_user("pwuser")
+        assert len(after) == 1
+        after_row = registry.db.fetch_one(
+            "SELECT secret_enc, basic_version FROM registry.service_basic "
+            "WHERE service_id=%s",
+            (entry["service_id"],),
+        )
+        assert after_row["secret_enc"] == before["secret_enc"]
+        assert after_row["basic_version"] == before["basic_version"]
 
     def test_remove_password_strips_auth_basic_and_clears_the_entry(self):
         """The exit for a protected service whose plaintext is gone.
@@ -3221,6 +3249,38 @@ class TestProvisionerEnvFile:
             "the re-rendered conf must have no auth_basic"
         )
 
+    def test_change_password_keeps_state_when_the_reload_fails(self, monkeypatch):
+        """A failed reload must roll the new credential back, not half-apply it."""
+        provisioner.register_user(
+            user_name="pwchg", service_name="myapp", label="0",
+            compose_template=COMPOSE_TEMPLATE, nginx_template=NGINX_TEMPLATE,
+            output_dir=self.tmp_path, nginx_output_dir=self.tmp_path,
+            user_data_dir=self.user_data_dir, passwd="oldpass",
+        )
+        before = registry.get_user_service("pwchg", "myapp", "0")
+        htpasswd_before = Path(before["htpasswd_path"]).read_bytes()
+        row_before = registry.db.fetch_one(
+            "SELECT basic_version, secret_enc FROM registry.service_basic WHERE service_id=%s",
+            (before["service_id"],),
+        )
+
+        def _boom(*a, **k):
+            raise RuntimeError("nginx reload failed")
+        monkeypatch.setattr(provisioner.stream_access, "refresh_and_reload", _boom)
+        with pytest.raises(RuntimeError, match="reload failed"):
+            provisioner.change_password(
+                user_name="pwchg", service_name="myapp", label="0", passwd="newpass",
+            )
+
+        after = registry.get_user_service("pwchg", "myapp", "0")
+        row_after = registry.db.fetch_one(
+            "SELECT basic_version, secret_enc FROM registry.service_basic WHERE service_id=%s",
+            (before["service_id"],),
+        )
+        assert after["basic_version"] == before["basic_version"] == row_before["basic_version"]
+        assert row_after["secret_enc"] == row_before["secret_enc"]
+        assert Path(after["htpasswd_path"]).read_bytes() == htpasswd_before
+
     def test_remove_password_keeps_state_when_the_reload_fails(self, monkeypatch):
         """The conf/registry/htpasswd must not half-apply on a reload failure."""
         provisioner.register_user(
@@ -3250,7 +3310,12 @@ class TestProvisionerEnvFile:
             )
 
         after = registry.get_user_service("pwfail", "myapp", "0")
-        assert after.get("passwd_plain") == "oldpass"
+        from lib import keys
+        row = registry.db.fetch_one(
+            "SELECT secret_enc FROM registry.service_basic WHERE service_id=%s",
+            (after["service_id"],),
+        )
+        assert keys.decrypt(bytes(row["secret_enc"]).decode()) == "oldpass"
         assert after.get("htpasswd_path"), "the htpasswd reference must survive"
         assert Path(htpasswd_path).exists(), "the secret file must survive"
         assert conf_path.read_text() == before, (
@@ -3311,8 +3376,7 @@ class TestProvisionerEnvFile:
             "profiles": ["falkordb"],
         }
         (self.tmp_path / "docker-compose.user-profuser.0.yml").write_text("services: {}\n")
-        monkeypatch.setattr(registry, "get_user_service", lambda *a, **k: entry)
-        monkeypatch.setattr(registry, "remove_user_service", lambda *a, **k: True)
+        add_registry_user(entry)
 
         provisioner.remove_user(
             user_name="profuser", service_name="myapp", label="0",
@@ -3348,7 +3412,6 @@ class TestAPIProjectRoot:
         monkeypatch.setattr(api, "GENERATED_DIR", gen_dir)
         monkeypatch.setattr(api, "USER_DATA_DIR", ud_dir)
         monkeypatch.setattr(api, "SOURCE_PROJECTS_DIR", sp_dir)
-        monkeypatch.setattr(reg_mod, "REGISTRY_FILE", tmp_path / "user_registry.yml")
         isolate_fixture_templates(tmp_path, monkeypatch)
 
         class _FakeProc:
@@ -3506,180 +3569,201 @@ class TestDockerOpsLogReaders:
 
 
 class TestRegistryLocking:
-    """Tier 2 (cross-process flock): exclusion, no stale locks, lost-update
-    protection, reentrancy, and lock-free readers."""
+    """PostgreSQL advisory locks and concurrent writers (T3).
+
+    The pre-cutover suite pinned a cross-process ``flock`` on the YAML file.
+    The registry is PostgreSQL now: label allocation serializes on a
+    transaction-scoped advisory lock and PostgreSQL releases session locks when
+    the holder dies.
+    """
 
     @pytest.fixture(autouse=True)
-    def _setup(self, tmp_path, monkeypatch):
-        from lib import registry
-        monkeypatch.setattr(registry, "REGISTRY_FILE", tmp_path / "user_registry.yml")
-        registry._state.update({"data": [], "mtime": None, "path": None})
-        self.registry = registry
-        self.path = registry.REGISTRY_FILE
+    def _setup(self):
+        from lib import db
+
+        self.db = db
         self.root = str(Path(__file__).parent.parent)
-        yield
 
     def _spawn(self, code: str, *args: str):
         import os
         import subprocess
         import sys
+
         env = dict(os.environ)
-        env["REGISTRY_FILE"] = str(self.path)
         env["PYTHONPATH"] = self.root
         return subprocess.Popen(
             [sys.executable, "-c", code, *args], env=env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
 
+    def _try_lock(self) -> bool:
+        with self.db.connection() as conn:
+            row = conn.execute(
+                "SELECT pg_try_advisory_xact_lock(hashtext(%s)) AS ok",
+                ("label:test",),
+            ).fetchone()
+            return row["ok"]
+
     _HOLD = (
         "import time, sys\n"
-        "from lib import registry\n"
+        "from lib import db\n"
         "if __name__ == '__main__':\n"
-        "    with registry.transaction():\n"
+        "    with db.connection() as conn:\n"
+        "        conn.execute('SELECT pg_advisory_xact_lock(hashtext(%s))', ('label:test',))\n"
         "        print('locked', flush=True)\n"
         "        time.sleep(float(sys.argv[1]) if len(sys.argv) > 1 else 1.5)\n"
     )
 
-    def test_transaction_is_reentrant(self):
-        """A nested transaction must reuse the outer flock (a second flock on a
-        new fd would deadlock against itself)."""
-        with self.registry.transaction():
-            with self.registry.transaction():
-                self.registry.add_user({"user_name": "nested", "service_name": "s", "label": "0"})
-        assert len(self.registry._load()) == 1
+    def test_label_lock_is_reentrant_in_one_transaction(self):
+        """A nested acquire on the same transaction must not deadlock."""
+        with self.db.connection() as conn:
+            registry.label_lock(conn, uuid.uuid4(), "svc")
+            registry.label_lock(conn, uuid.uuid4(), "svc")
+            row = conn.execute(
+                "SELECT pg_try_advisory_xact_lock(hashtext(%s)) AS ok",
+                ("label:other",),
+            ).fetchone()
+            assert row["ok"] is True
 
     def test_second_process_is_excluded_then_succeeds(self):
         child = self._spawn(self._HOLD, "1.2")
-        assert child.stdout.readline().strip() == "locked"      # child holds flock
+        assert child.stdout.readline().strip() == "locked"      # child holds the lock
         try:
-            with pytest.raises(self.registry.RegistryLockTimeout):
-                with self.registry.transaction(timeout=0.3):
-                    pass
+            assert self._try_lock() is False
         finally:
             child.wait(timeout=10)
         # after the holder exits the lock is free again
-        with self.registry.transaction(timeout=2.0):
-            pass
+        assert self._try_lock() is True
 
     def test_lock_is_released_when_the_holder_dies(self):
-        """No stale lock: kill -9 the holder, the lock is gone immediately."""
+        """No stale lock: kill -9 the holder; PostgreSQL releases the session lock."""
         import signal
+        import time as _t
+
         child = self._spawn(self._HOLD, "30")
         assert child.stdout.readline().strip() == "locked"
         child.send_signal(signal.SIGKILL)
         child.wait(timeout=10)
-        import time as _t
-        t0 = _t.monotonic()
-        with self.registry.transaction(timeout=2.0):
-            pass
-        assert _t.monotonic() - t0 < 1.0, "lock survived the holder's death (stale lock)"
+        deadline = _t.monotonic() + 5
+        while _t.monotonic() < deadline:
+            if self._try_lock():
+                return
+            _t.sleep(0.1)
+        pytest.fail("lock survived the holder's death (stale lock)")
 
     def test_concurrent_processes_do_not_lose_updates(self):
-        """THE lost-update regression: N processes each add entries; every entry
-        must survive (without the flock, load-modify-save interleaving drops
-        them)."""
-        n_proc, per_proc = 5, 10
-        code = (
-            "from lib import registry\n"
-            "import sys\n"
-            f"p = int(sys.argv[1]) if len(sys.argv) > 1 else 0\n"
-            f"for i in range({per_proc}):\n"
-            "    registry.add_user({'user_name': f'p{p}-u{i}', 'service_name': 's', 'label': '0'})\n"
-        )
-        procs = [self._spawn(code, str(p)) for p in range(n_proc)]
-        for pr in procs:
-            out, err = pr.communicate(timeout=120)
-            assert pr.returncode == 0, err
-        # Assert on the FILE (authoritative), not this process's cache — the
-        # cache is only refreshed by the 1s monitor tick.
-        users = [u["user_name"] for u in (yaml.safe_load(self.path.read_text()) or [])]
-        assert len(users) == n_proc * per_proc, f"lost updates: {len(users)}"
-        assert len(set(users)) == n_proc * per_proc
+        """N writers each insert entries; every row must survive."""
+        import threading
 
-    def test_readers_are_not_blocked_by_a_holder(self):
-        """Atomic publishing means reads never wait on the write lock."""
+        n_threads, per_thread = 5, 10
+        errors: list[BaseException] = []
+
+        def worker(p: int):
+            try:
+                for i in range(per_thread):
+                    self._add(f"p{p}-u{i}")
+            except BaseException as exc:  # noqa: BLE001 — surfaced below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(p,)) for p in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=120)
+        assert not errors, errors
+        users = [u["user_name"] for u in registry.get_all_users()]
+        assert len(users) == n_threads * per_thread, f"lost updates: {len(users)}"
+        assert len(set(users)) == n_threads * per_thread
+
+    def _add(self, name: str) -> None:
+        add_registry_user(
+            {"user_name": name, "service_name": "s", "label": "0"}
+        )
+
+    def test_readers_are_not_blocked_by_a_writer(self):
+        """MVCC: a reader never waits on an open write transaction."""
         import time as _t
-        self.registry._save([{"user_name": "keep", "service_name": "s", "label": "0"}])
-        child = self._spawn(self._HOLD, "1.2")
-        assert child.stdout.readline().strip() == "locked"
-        try:
+
+        service_id, _proc = add_registry_user(
+            {"user_name": "keep", "service_name": "s", "label": "0"}
+        )
+        with self.db.connection() as conn:
+            conn.execute(
+                "UPDATE registry.service_instances SET updated_at=now() "
+                "WHERE service_id=%s",
+                (service_id,),
+            )
             t0 = _t.monotonic()
-            users = self.registry._load()
+            users = registry.get_all_users()
             elapsed = _t.monotonic() - t0
-            assert elapsed < 0.2, f"reader blocked for {elapsed:.3f}s"
+            assert elapsed < 2.0, f"reader blocked for {elapsed:.3f}s"
             assert [u["user_name"] for u in users] == ["keep"]
-        finally:
-            child.wait(timeout=10)
 
 
 class TestRegistryDurability:
-    """Regression coverage for the registry WIPE: a truncate-then-write save let
-    a concurrent reader cache [] and the next save persist it (all instances
-    lost). These tests pin the three fixes."""
+    """PostgreSQL transaction/constraint durability (T3/T12).
+
+    The YAML store's truncate-then-write wipe cannot happen now: writes are
+    transactional, partially-written state rolls back, and uniqueness is a
+    database constraint.
+    """
 
     @pytest.fixture(autouse=True)
-    def _setup(self, tmp_path, monkeypatch):
-        from lib import registry
-        monkeypatch.setattr(registry, "REGISTRY_FILE", tmp_path / "user_registry.yml")
-        registry._state["data"] = []
-        registry._state["mtime"] = None
-        self.registry = registry
-        self.path = registry.REGISTRY_FILE
-        yield
+    def _setup(self):
+        from lib import db
 
-    def _entries(self, n=3):
-        return [{"user_name": f"u{i}", "service_name": "svc", "label": "0"} for i in range(n)]
+        self.db = db
 
-    def test_save_is_atomic_and_leaves_no_temp(self):
-        self.registry._save(self._entries(3))
-        assert self.path.exists()
-        assert not (self.path.parent / (self.path.name + ".tmp")).exists()
-        assert len(self.registry._load()) == 3
+    def _insert_on(self, conn, user_name: str = "u0") -> uuid.UUID:
+        owner, _ = registry.ensure_owner(conn, user_name)
+        service_id = uuid.uuid4()
+        registry.insert_service(
+            conn, service_id=service_id, owner_id=owner,
+            service_name="svc", label="0", recipe_path=".",
+        )
+        registry.insert_instance(
+            conn, service_id, procedure_id=uuid.uuid4(), status="running"
+        )
+        return service_id
 
-    def test_empty_file_does_not_wipe_cached_state(self):
-        """A partially-written (empty) file must keep the last good state."""
-        self.registry._save(self._entries(3))
-        assert len(self.registry._load()) == 3
-        self.path.write_text("")          # simulate a truncated/partial write
-        self.registry._reload()
-        assert len(self.registry._load()) == 3, "empty file must not wipe the cache"
+    def test_failed_transaction_leaves_no_partial_row(self):
+        with pytest.raises(RuntimeError):
+            with self.db.connection() as conn:
+                self._insert_on(conn, "partial")
+                raise RuntimeError("boom")
+        assert registry.get_all_users() == []
 
-    def test_concurrent_reader_never_sees_an_empty_registry(self):
-        """Hammer save() while another thread reads: readers must never observe
-        an empty registry (the original wipe mechanism)."""
-        import threading
-        self.registry._save(self._entries(3))
-        stop = threading.Event()
-        seen_empty = []
+    def test_committed_write_is_visible_to_a_new_connection(self):
+        add_registry_user({"user_name": "u0", "service_name": "svc", "label": "0"})
+        assert [u["user_name"] for u in registry.get_all_users()] == ["u0"]
 
-        def reader():
-            while not stop.is_set():
-                if len(self.registry._load()) == 0:
-                    seen_empty.append(1)
+    def test_reader_never_sees_an_uncommitted_write(self):
+        """The original wipe mechanism: a reader must never observe a half state."""
+        with self.db.connection() as conn:
+            self._insert_on(conn)
+            assert registry.get_all_users() == [], "read an uncommitted registry"
+        assert len(registry.get_all_users()) == 1
 
-        t = threading.Thread(target=reader, daemon=True)
-        t.start()
-        for _ in range(200):
-            self.registry._save(self._entries(3))
-        stop.set()
-        t.join(timeout=2)
-        assert not seen_empty, "a concurrent reader observed an EMPTY registry"
+    def test_status_update_matches_only_the_target(self):
+        u0, _ = add_registry_user(
+            {"user_name": "u0", "service_name": "svc", "label": "0", "status": "running"}
+        )
+        u1, _ = add_registry_user(
+            {"user_name": "u1", "service_name": "svc", "label": "0", "status": "running"}
+        )
+        registry.set_status(u0, "deleting")
+        assert registry.get_service_by_id(u0)["status"] == "deleting"
+        assert registry.get_service_by_id(u1)["status"] == "running"
+        # a non-matching id must not write anything
+        registry.set_status("00000000-0000-0000-0000-000000000000", "deleting")
+        assert registry.get_service_by_id(u1)["status"] == "running"
 
-    def test_status_update_saves_only_on_match(self, monkeypatch):
-        from lib import provisioner
-        self.registry._save(self._entries(2))
-        calls = []
-        monkeypatch.setattr(self.registry, "_save", lambda users: calls.append(len(users)))
-        provisioner._update_registry_status("nobody", "svc", "0", "deleting")
-        assert calls == [], "no match ⇒ must not save (this persisted an empty list)"
-        provisioner._update_registry_status("u0", "svc", "0", "deleting")
-        assert calls == [2], "a real match still saves"
-
-    def test_backup_written_before_overwrite(self):
-        self.registry._save(self._entries(2))
-        self.registry._save(self._entries(3))
-        bak = self.path.with_name(self.path.name + ".bak")
-        assert bak.exists(), "previous good copy kept for recovery"
+    def test_duplicate_active_tuple_is_refused(self):
+        add_registry_user({"user_name": "u0", "service_name": "svc", "label": "0"})
+        with pytest.raises(Exception) as excinfo:
+            add_registry_user({"user_name": "u0", "service_name": "svc", "label": "0"})
+        assert "unique" in str(excinfo.value).lower() or "duplicate" in str(excinfo.value).lower()
+        assert len(registry.get_all_users()) == 1
 
 
 class TestAPINewEndpoints:
@@ -3705,7 +3789,6 @@ class TestAPINewEndpoints:
         monkeypatch.setattr(api, "USER_DATA_DIR", ud_dir)
         monkeypatch.setattr(api, "SOURCE_PROJECTS_DIR", sp_dir)
         monkeypatch.setattr(api, "SSL_DIR", ssl_dir)
-        monkeypatch.setattr(reg_mod, "REGISTRY_FILE", tmp_path / "user_registry.yml")
         isolate_fixture_templates(tmp_path, monkeypatch)
 
         # Mock docker_ops subprocess.Popen
@@ -4026,112 +4109,38 @@ class TestAPINewEndpoints:
 
     # ── GET /tasks/{task_id}/log (SSE) ──
 
-    def test_task_log_endpoint_returns_sse(self, monkeypatch):
-        """GET /tasks/{task_id}/log returns SSE stream."""
-        import subprocess as sp
-        # First, submit a task to get a valid task_id
-        monkeypatch.setattr(self.api.docker_ops.subprocess, "run", self._fake_run)
-        monkeypatch.setattr(self.api.docker_ops, "network_connect", lambda *a, **kw: None)
-        monkeypatch.setattr(self.api.docker_ops, "nginx_reload", lambda *a: None)
-        monkeypatch.setattr(self.api.provisioner, "register_user",
-            lambda **kw: {"entry": {"user_name": kw["user_name"]}, "volume_warnings": {}})
+    def _insert_task_with_log(self, task_id: str, text: str) -> None:
+        """A registry task row plus its per-task log file (T5)."""
+        import uuid
 
-        # Submit async registration
-        resp = self.client.post("/users", json={
-            "user_name": "sseloguser",
-            "service_name": "myapp",
-            "compose_template_path": COMPOSE_TEMPLATE,
-            "label": "0",
-        })
-        assert resp.status_code == 202
-        task_id = resp.json()["task_id"]
+        from lib import db, registry as reg
 
-        # Poll the SSE log endpoint (follow=false for test)
-        response = self.client.get(f"/tasks/{task_id}/log?follow=false")
+        log_dir = self.tmp_path / "task_logs"
+        log_dir.mkdir(exist_ok=True)
+        log = log_dir / f"task-{task_id}.log"
+        log.write_text(text)
+        with db.connection() as conn:
+            reg.insert_task(
+                conn, task_id=task_id, procedure_id=uuid.uuid4(),
+                service_id=None, kind="deploy", operation="register",
+            )
+        db.execute(
+            "UPDATE registry.tasks SET log_ref=%s WHERE task_id=%s",
+            (str(log), task_id),
+        )
+
+    def test_task_log_endpoint_returns_sse(self):
+        """GET /tasks/{task_id}/log streams SSE for an existing task log."""
+        self._insert_task_with_log("api-sse", "hello\n")
+        response = self.client.get("/tasks/api-sse/log?follow=false")
         assert response.status_code == 200
         assert "text/event-stream" in response.headers["content-type"]
 
-    # ── GET /health ──
+    def test_task_log_sse_streams_from_task_file(self):
+        """SSE streams from the task's own log file."""
+        self._insert_task_with_log("api-test123", "line 1\nline 2\nline 3\n")
 
-    def test_health_endpoint(self):
-        """GET /health returns ok."""
-        response = self.client.get("/health")
-        assert response.status_code == 200
-        assert response.json()["status"] == "ok"
-
-    # ── GET /tasks ──
-
-    def test_tasks_list_endpoint(self):
-        """GET /tasks returns task list."""
-        response = self.client.get("/tasks")
-        assert response.status_code == 200
-        data = response.json()
-        assert "count" in data
-        assert "tasks" in data
-
-    # ── Reconciliation endpoints ──
-
-    def test_reconcile_endpoint(self, monkeypatch):
-        """POST /reconcile runs live reconciliation and returns report."""
-        monkeypatch.setattr(self.api.docker_ops, "network_connect", lambda *a, **kw: None)
-        monkeypatch.setattr(self.api.docker_ops, "nginx_reload", lambda *a: None)
-        import subprocess as sp
-        monkeypatch.setattr(self.api.docker_ops.subprocess, "run",
-            lambda *a, **kw: sp.CompletedProcess([], 0, stdout="[]", stderr=""))
-
-        response = self.client.post("/reconcile")
-        assert response.status_code == 200
-        data = response.json()
-        assert data["message"] == "Reconciliation completed."
-        assert "report" in data
-        report = data["report"]
-        assert "total_upstreams" in report
-        assert "reachable" in report
-        assert "unreachable" in report
-        assert "nginx_reloaded" in report
-        assert "total_networks_in_registry" in report
-        assert "containers_healthy" in report
-        assert "containers_total" in report
-
-    def test_reconcile_status_endpoint(self):
-        """GET /reconcile/status returns live nginx state snapshot."""
-        response = self.client.get("/reconcile/status")
-        assert response.status_code == 200
-        data = response.json()
-        assert "total_users" in data
-        assert "total_networks" in data
-        assert "nginx_connected_networks" in data
-        assert "total_nginx_confs" in data
-        assert "services" in data
-
-    def test_nginx_state_endpoint(self):
-        """GET /nginx-state returns live nginx state snapshot."""
-        response = self.client.get("/nginx-state")
-        assert response.status_code == 200
-        data = response.json()
-        assert "total_users" in data
-        assert "total_networks" in data
-        assert "connected" in data
-        assert "disconnected" in data
-        assert "services" in data
-
-    # ── Task log SSE streaming ──
-
-    def test_task_log_sse_streams_from_task_file(self, tmp_path, monkeypatch):
-        """SSE streams from per-task log file when it exists."""
-        from pathlib import Path
-
-        # Create a per-task log file
-        log_dir = tmp_path / "task_logs"
-        log_dir.mkdir()
-        task_log = log_dir / "task-test123.log"
-        task_log.write_text("line 1\nline 2\nline 3\n")
-
-        # Mock task_manager to return our log file path
-        monkeypatch.setattr(self.api.task_manager, "get_log_file",
-            lambda tid: str(task_log) if tid == "test123" else None)
-
-        response = self.client.get("/tasks/test123/log?tail=10&follow=false")
+        response = self.client.get("/tasks/api-test123/log?tail=10&follow=false")
         assert response.status_code == 200
         assert "text/event-stream" in response.headers["content-type"]
 
@@ -4141,14 +4150,11 @@ class TestAPINewEndpoints:
         assert "data: line 3" in body
         assert "event: done" in body
 
-    def test_task_log_sse_falls_back_to_global(self, monkeypatch):
-        """SSE falls back to global DOCKER_OPS_LOG when task log not found."""
-        monkeypatch.setattr(self.api.task_manager, "get_log_file",
-            lambda tid: None)
-
-        response = self.client.get("/tasks/nonexistent/log?tail=5&follow=false")
-        assert response.status_code == 200
-        assert "text/event-stream" in response.headers["content-type"]
+    def test_task_log_sse_404s_without_a_record(self):
+        """No record ⇒ 404. There is no global-log fallback (T5)."""
+        response = self.client.get("/tasks/nonexistent/log?follow=false")
+        assert response.status_code == 404
+        assert "Task not found" in response.text
 
     # ── Helper: register a user for dependent tests ──
 
@@ -4484,9 +4490,6 @@ class TestProvisionerRegistryFields:
         monkeypatch.setattr(docker_ops, "container_running", lambda *a: False)
         monkeypatch.setattr(docker_ops, "network_inspect", lambda *a: {"IPAM": {"Config": []}})
 
-        # Redirect registry to temp file
-        self.reg_path = tmp_path / "user_registry.yml"
-        monkeypatch.setattr(registry, "REGISTRY_FILE", self.reg_path)
         self.tmp_path = tmp_path
         self.user_data_dir = tmp_path / "user_data"
         self.user_data_dir.mkdir()
@@ -4505,14 +4508,14 @@ class TestProvisionerRegistryFields:
             passwd="testpass",
             user_data_dir=self.user_data_dir,
         )
-        reg_data = registry._load()
-        assert len(reg_data) >= 1
-        entry = reg_data[0]
+        entries = registry.get_user("hostuser")
+        assert len(entries) == 1
+        entry = entries[0]
         assert "hostname" in entry
         assert entry["hostname"] == "myapp-hostuser-0.localhost"
 
-    def test_register_user_stores_passwd_plain_in_registry(self):
-        """Registry entry should include passwd_plain field after registration."""
+    def test_register_user_encrypts_the_basic_password(self):
+        """R2.7/T2: the Basic password is AES-GCM ciphertext, never plaintext."""
         provisioner.register_user(
             user_name="pwuser",
             service_name="myapp",
@@ -4523,11 +4526,19 @@ class TestProvisionerRegistryFields:
             passwd="secret123",
             user_data_dir=self.user_data_dir,
         )
-        reg_data = registry._load()
-        assert len(reg_data) >= 1
-        entry = reg_data[0]
-        assert "passwd_plain" in entry
-        assert entry["passwd_plain"] == "secret123"
+        entries = registry.get_user("pwuser")
+        assert len(entries) == 1
+        entry = entries[0]
+        assert "passwd_plain" not in entry
+        assert "passwd" not in entry
+        row = registry.db.fetch_one(
+            "SELECT basic_username, secret_enc FROM registry.service_basic "
+            "WHERE service_id=%s", (entry["service_id"],),
+        )
+        assert row["basic_username"] == "pwuser"
+        assert row["secret_enc"]
+        from lib import keys
+        assert keys.decrypt(bytes(row["secret_enc"]).decode()) == "secret123"
 
     def test_register_user_stores_subnet_field_in_registry(self):
         """Registry entry should have subnet field (empty when SUBNET_POOLS is not set)."""
@@ -4541,9 +4552,9 @@ class TestProvisionerRegistryFields:
             passwd="testpass",
             user_data_dir=self.user_data_dir,
         )
-        reg_data = registry._load()
-        assert len(reg_data) >= 1
-        entry = reg_data[0]
+        entries = registry.get_user("subnetuser")
+        assert len(entries) == 1
+        entry = entries[0]
         assert "subnet" in entry
         # subnet is empty when SUBNET_POOLS is not configured
         assert entry["subnet"] == ""
@@ -4561,10 +4572,9 @@ class TestProvisionerRegistryFields:
             domain="example.com",
             user_data_dir=self.user_data_dir,
         )
-        reg_data = registry._load()
-        assert len(reg_data) >= 1
-        entry = reg_data[0]
-        assert entry["hostname"] == "myapp-domuser-0.example.com"
+        entries = registry.get_user("domuser")
+        assert len(entries) == 1
+        assert entries[0]["hostname"] == "myapp-domuser-0.example.com"
 
 
 class TestV5EnvDDeprecated:
@@ -4748,17 +4758,10 @@ class TestRegenerateNginxConfs:
         }
 
     def _setup(self, tmp_path: Path, monkeypatch, entries: list[dict]):
-        from lib import registry as reg_mod
         gen = tmp_path / "generated"
         gen.mkdir(exist_ok=True)
-        reg_file = tmp_path / "user_registry.yml"
-        # Write a VALID empty list (not "") — an empty FILE is indistinguishable
-        # from a partially-written one and is deliberately ignored by _reload.
-        reg_file.write_text(yaml.safe_dump(entries or []))
-        monkeypatch.setattr(reg_mod, "REGISTRY_FILE", reg_file)
-        reg_mod._state["data"] = []
-        reg_mod._state["mtime"] = None
-        reg_mod._state["path"] = None
+        for entry in entries:
+            add_registry_user(entry)
         monkeypatch.setenv("GENERATED_DIR", str(gen))
         return gen
 
@@ -4873,7 +4876,6 @@ class TestAPIRegenerateNginx:
         monkeypatch.setattr(api, "USER_DATA_DIR", tmp_path / "user_data")
         monkeypatch.setattr(api, "SOURCE_PROJECTS_DIR", tmp_path / "source_projects")
         monkeypatch.setattr(api, "SSL_DIR", tmp_path / "ssl")
-        monkeypatch.setattr(reg_mod, "REGISTRY_FILE", tmp_path / "user_registry.yml")
         # reconciliation._generated_dir() reads GENERATED_DIR from the env.
         monkeypatch.setenv("GENERATED_DIR", str(gen_dir))
 
@@ -5297,12 +5299,10 @@ class TestMigrateV5:
     simple ACL-free form and verifies no scaffold remains."""
 
     def _setup(self, tmp_path: Path, monkeypatch, entries: list[dict]) -> Path:
-        from lib import registry as reg_mod
         gen = tmp_path / "generated"
         gen.mkdir(exist_ok=True)
-        reg_file = tmp_path / "user_registry.yml"
-        reg_file.write_text(yaml.safe_dump(entries) if entries else "")
-        monkeypatch.setattr(reg_mod, "REGISTRY_FILE", reg_file)
+        for entry in entries:
+            add_registry_user(entry)
         monkeypatch.setenv("GENERATED_DIR", str(gen))
         return gen
 
@@ -5363,11 +5363,8 @@ class TestMigrateV5:
         gen = tmp_path / "generated"
         gen.mkdir(exist_ok=True)
         (gen / "clean.user-old.0.nginx.conf").write_text("server_name clean.localhost;\n")
-        reg_file = tmp_path / "user_registry.yml"
-        reg_file.write_text("")
         env = dict(os.environ)
         env["GENERATED_DIR"] = str(gen)
-        env["REGISTRY_FILE"] = str(reg_file)
         proc = subprocess.run(
             [sys.executable, "-m", "user_provision_tool.migrate_v5", "--dry-run"],
             cwd=str(repo_root),
@@ -5415,7 +5412,8 @@ class TestEdgeComposeService:
         assert "${PROVISION_DIR:-/srv/provision_subnet_acl}/ssl:/certs:ro" in compose
         # Non-root + baked env + command.
         assert "user: nginx" in compose
-        assert "ENABLE_ACL=${ENABLE_ACL:-false}" in compose
+        # G80: the operator switch is removed; fullset is ACL-on by construction.
+        assert "ENABLE_ACL=" not in compose
         assert "PORTAL_MODE=${PORTAL_MODE:-http}" in compose
         assert "command: /bin/sh /etc/nginx/acl/entrypoint.sh" in compose
 
@@ -5524,13 +5522,17 @@ class TestVolumePurgeOnDelete:
         assert docker_ops.remove_project_volumes("p") == []
         assert not [c for c in calls if c[:3] == ["docker", "volume", "rm"]]
 
-    def test_delete_path_asks_for_volume_removal(self, monkeypatch):
-        """remove_user must request it — this is the wiring that was missing."""
+    def test_delete_path_never_removes_volumes(self, monkeypatch):
+        """R2.6/B27: generated files and named volumes are never auto-deleted.
+
+        The one exception is the per-instance stream conf, removed in
+        ``_teardown_instance`` so nginx cannot keep a dangling upstream.
+        """
         import inspect
         from lib import provisioner
-        src = inspect.getsource(provisioner.remove_user)
-        assert "remove_volumes=True" in src
-        assert "remove_project_volumes" in src
+        src = inspect.getsource(provisioner._teardown_instance)
+        assert "remove_volumes=False" in src
+        assert "remove_project_volumes" not in src
 
 
 # ---------------------------------------------------------------------------
@@ -5543,12 +5545,12 @@ class TestFailedInstanceState:
 
     def _add(self, registry_file, sample_entry, **overrides):
         entry = {**sample_entry, **overrides}
-        registry.add_user(entry)
-        return entry
+        service_id, _proc = add_registry_user(entry)
+        return service_id
 
     def test_mark_failed_keeps_the_entry(self, registry_file, sample_entry):
-        self._add(registry_file, sample_entry)
-        provisioner._mark_failed("alice", "myapp", "0", "build", "boom")
+        service_id = self._add(registry_file, sample_entry)
+        provisioner._mark_failed(service_id, "build", "boom")
         entries = registry.get_user("alice")
         assert len(entries) == 1, "the entry must NOT be removed (G10/G17)"
         assert entries[0]["status"] == "failed"
@@ -5557,8 +5559,8 @@ class TestFailedInstanceState:
         assert entries[0]["failure"]["at"]
 
     def test_failure_message_is_bounded(self, registry_file, sample_entry):
-        self._add(registry_file, sample_entry)
-        provisioner._mark_failed("alice", "myapp", "0", "build", "x" * 50_000)
+        service_id = self._add(registry_file, sample_entry)
+        provisioner._mark_failed(service_id, "build", "x" * 50_000)
         msg = registry.get_user("alice")[0]["failure"]["message"]
         assert len(msg) <= provisioner.FAILURE_MESSAGE_MAX
 
@@ -5573,16 +5575,19 @@ class TestFailedInstanceState:
 
     def test_mark_failed_survives_a_non_matching_target(self, registry_file, sample_entry):
         self._add(registry_file, sample_entry)
-        provisioner._mark_failed("nobody", "nothing", "9", "up", "boom")
+        # A non-existent service_id updates no row.
+        provisioner._mark_failed(
+            "00000000-0000-0000-0000-000000000000", "up", "boom"
+        )
         assert registry.get_user("alice")[0].get("status") != "failed"
 
     def test_running_clears_a_stale_failure(self, registry_file, sample_entry):
-        self._add(registry_file, sample_entry, status="failed",
-                  failure={"stage": "build", "message": "old", "at": "t"})
-        provisioner._update_registry_status("alice", "myapp", "0", "running")
+        service_id = self._add(registry_file, sample_entry, status="failed",
+                               failure={"stage": "build", "message": "old", "at": "t"})
+        provisioner._after_successful_transition(service_id, "running")
         entry = registry.get_user("alice")[0]
         assert entry["status"] == "running"
-        assert "failure" not in entry
+        assert entry.get("failure") is None
 
     def test_stage_is_tagged_from_the_failing_step(self):
         """A DeployFailure carries its stage so the entry can record it."""
@@ -5599,7 +5604,7 @@ class TestFailedClassification:
 
     def test_failed_entry_lands_in_its_own_bucket(self, registry_file, sample_entry):
         from api import _status_for_user
-        registry.add_user(self._entry(sample_entry, failure={"stage": "build", "message": "m", "at": "t"}))
+        add_registry_user(self._entry(sample_entry, failure={"stage": "build", "message": "m", "at": "t"}))
         result = _status_for_user("alice", {})
         mine = [s for s in result["failed_services"] if s["service_name"] == "myapp"]
         assert len(mine) == 1, "the failed entry must be its own bucket, not missing/unhealthy"
@@ -5611,7 +5616,7 @@ class TestFailedClassification:
 
     def test_failed_bucket_is_forwarded_by_the_payload(self, registry_file, sample_entry):
         from api import _status_for_user
-        registry.add_user(self._entry(sample_entry))
+        add_registry_user(self._entry(sample_entry))
         result = _status_for_user("alice", {})
         # The gateway passes the per-user object through verbatim, so the key
         # existing here is what makes the dashboard able to render the card.
@@ -5693,7 +5698,7 @@ class TestRecoveryDoesNotResurrectFailed:
 
     def test_failed_entry_is_not_restarted(self, registry_file, sample_entry, monkeypatch):
         from lib import docker_ops, reconciliation
-        registry.add_user({
+        add_registry_user({
             **sample_entry, "status": "failed",
             "container_names": ["myapp-user_alice-0-app"],
             "failure": {"stage": "build", "message": "m", "at": "t"},
@@ -5756,7 +5761,7 @@ class TestLLMBasedFixAPISide:
     """The -api owns the task id, the log and the availability flag (§4/§5/§7.7)."""
 
     def test_entry_records_the_task_id(self, registry_file, sample_entry):
-        registry.add_user({**sample_entry, "task_id": "abc123"})
+        add_registry_user({**sample_entry, "task_id": "abc123"})
         assert registry.get_user("alice")[0]["task_id"] == "abc123"
 
     def test_fix_unavailable_without_a_task_id(self):
@@ -5769,7 +5774,7 @@ class TestLLMBasedFixAPISide:
 
     def test_status_payload_carries_task_id_and_availability(self, registry_file, sample_entry):
         from api import _status_for_user
-        registry.add_user({**sample_entry, "status": "failed", "task_id": "t1",
+        add_registry_user({**sample_entry, "status": "failed", "task_id": "t1",
                            "failure": {"stage": "build", "message": "m", "at": "t"}})
         svc = [s for s in _status_for_user("alice", {})["failed_services"]
                if s["service_name"] == "myapp"][0]
@@ -5799,7 +5804,7 @@ class TestLLMBasedFixAPISide:
         every recipe dir, and the card's file editor resolves inside the recipe.
         """
         from api import _status_for_user
-        registry.add_user({**sample_entry, "status": "running",
+        add_registry_user({**sample_entry, "status": "running",
                            "nginx_conf_template_path": "/src/recipes/x/nginx.fix.conf.j2"})
         payload = _status_for_user("alice", {})
         svc = [s for bucket in ("healthy_services", "unhealthy_services", "missing_services")
@@ -5811,13 +5816,13 @@ class TestLLMBasedFixAPISide:
         from api import _status_for_user
         # The bucket depends on container/compose state, which this fixture does
         # not set up — so read the entry out of whichever bucket it landed in.
-        registry.add_user({**sample_entry, "status": "running", "task_id": "t1"})
+        add_registry_user({**sample_entry, "status": "running", "task_id": "t1"})
         payload = _status_for_user("alice", {})
         svc = [s for bucket in ("healthy_services", "unhealthy_services", "missing_services")
                for s in payload[bucket] if s["service_name"] == "myapp"][0]
         assert "task_available" in svc
-        assert svc["task_available"] is False, (
-            "the fixture's task record is not in the store → the link is greyed")
+        assert svc["task_available"] is True, (
+            "the fixture's task record is in the store → the link resolves")
 
     def test_whole_log_endpoint_404s_when_gone(self):
         from fastapi.testclient import TestClient
@@ -5856,29 +5861,26 @@ class TestLLMBasedFixAPISide:
         assert keeper.exists(), "the original recipe file is never touched"
 
 
-class TestRecordTasksDoNotConsumeThePool:
-    """The pool is for the -api's DEPLOYING tasks only (user ruling, 2026-09-20).
+class TestOnlyAcceptedTasksAreStored:
+    """GRILLING G28: the `record` mirror is removed.
 
-    `POST /tasks/custom` — the endpoint that CREATED a record for the gateway's
-    generation session — is gone (GRILLING G28: the `record` mirror is removed,
-    so the gateway keeps its own store). The exclusion below is kept because it
-    still has a live input: `_load_from_disk` restores the tasks a previous
-    release persisted, and a legacy row that carries `target.kind == "record"`
-    would otherwise consume a slot until it TTL-prunes.
+    There is no record-only task kind in ``registry.tasks``: a task row exists
+    only for an accepted deploy/rebuild/remove. The capacity count is therefore
+    the number of accepted live rows, and nothing else can occupy a slot.
     """
 
-    def test_record_tasks_are_excluded_from_in_flight(self):
-        from lib.task_manager import Task, TaskManager
+    def test_no_record_only_kind_is_defined(self):
+        from lib.task_manager import KIND_BY_TYPE
+        assert "record" not in KIND_BY_TYPE
+        assert {kind for kind, _op in KIND_BY_TYPE.values()} <= {
+            "deploy", "rebuild", "remove"}
+
+    def test_a_submit_on_an_empty_pool_is_accepted(self):
+        from lib.task_manager import TaskManager
         tm = TaskManager(max_workers=1, log_dir="/tmp/tmrecord")
-        with tm._lock:
-            for i in range(5):
-                t = Task(f"rec{i}", "generate-missing-files")
-                t.status = "running"
-                t.target["kind"] = "record"
-                tm._tasks[t.task_id] = t
-        # Five record tasks, one worker: a real deploy must still be accepted.
-        tid = tm.submit("register", lambda: None, user_name="u", service_name="s", label="0")
-        assert tid
+        tid = tm.submit("register", lambda: None)
+        assert tm.get(tid) is not None
+        assert tm.get(tid)["operation"] == "register"
 
 
 class TestFailureReasonIsMachineReadable:
@@ -5897,9 +5899,9 @@ class TestFailureReasonIsMachineReadable:
 
     def test_mark_failed_records_the_reason(self, registry_file, sample_entry):
         from lib import provisioner, registry
-        registry.add_user(sample_entry)
+        service_id, _proc = add_registry_user(sample_entry)
         provisioner._mark_failed(
-            "alice", "myapp", "0", "deploy",
+            service_id, "deploy",
             "at capacity: 4 task(s) running (limit 4); cancel a task and retry",
         )
         f = registry.get_user("alice")[0]["failure"]
@@ -5921,16 +5923,16 @@ class TestFailureReasonTravelsWithTheError:
 
     def test_mark_failed_prefers_the_explicit_reason(self, registry_file, sample_entry):
         from lib import provisioner, registry
-        registry.add_user(sample_entry)
+        service_id, _proc = add_registry_user(sample_entry)
         # A message the text classifier would NOT recognise, but a typed reason.
-        provisioner._mark_failed("alice", "myapp", "0", "deploy",
+        provisioner._mark_failed(service_id, "deploy",
                                  "some future wording", reason="at_capacity")
         assert registry.get_user("alice")[0]["failure"]["reason"] == "at_capacity"
 
     def test_text_classification_remains_the_fallback(self, registry_file, sample_entry):
         from lib import provisioner, registry
-        registry.add_user(sample_entry)
-        provisioner._mark_failed("alice", "myapp", "0", "deploy",
+        service_id, _proc = add_registry_user(sample_entry)
+        provisioner._mark_failed(service_id, "deploy",
                                  "at capacity: 4 task(s) running (limit 4)")
         assert registry.get_user("alice")[0]["failure"]["reason"] == "at_capacity"
 
@@ -6930,14 +6932,12 @@ class TestTheEndpointsAreRecordedAfterTheRender:
     """
 
     def test_the_reader_updates_the_entry_from_the_rendered_files(self, tmp_path):
-        import json
         from lib import provisioner, registry
 
-        reg = tmp_path / "user_registry.yml"
-        reg.write_text(json.dumps([
+        service_id, _proc = add_registry_user(
             {"user_name": "alice", "service_name": "web", "label": "0",
-             "status": "building", "stream_sub_services": [], "http_endpoints": []},
-        ]))
+             "status": "building"}
+        )
         rendered = tmp_path / "generated"
         rendered.mkdir()
         (rendered / "web.user-alice.0.nginx.conf").write_text(
@@ -6948,17 +6948,9 @@ class TestTheEndpointsAreRecordedAfterTheRender:
             ("nginx.base.9.conf", str(rendered / "web.user-alice.0.nginx.conf")),
             ("web.user-alice.0.stream.conf.j2", str(rendered / "web.user-alice.0.stream.conf")),
         ]
-        original_load, original_save = registry._load, registry._save
-        monkeypatch_registry = None
-        try:
-            provisioner.registry._load = lambda: json.loads(reg.read_text())
-            provisioner.registry._save = lambda users: reg.write_text(json.dumps(users))
-            provisioner._update_registry_endpoints("alice", "web", "0", pairs, "web-alice-0")
-        finally:
-            provisioner.registry._load = original_load
-            provisioner.registry._save = original_save
+        provisioner._update_registry_endpoints(service_id, pairs, "web-alice-0")
 
-        entry = json.loads(reg.read_text())[0]
+        entry = registry.get_user_service("alice", "web", "0")
         assert entry["http_endpoints"] == ["web-alice-0--neo4j.snaprovision.com"], entry
         assert entry["stream_sub_services"] == ["web-alice-0--bolt.localhost"], entry
 
@@ -7791,6 +7783,7 @@ class TestStreamConfPauseRestore:
             active.write_text("server {\n    listen 7687 ssl;\n}\n")
             entry["nginx_conf_paths"] = [str(active)]
             entry["nginx_conf_paths_by_category"] = {"stream": str(active)}
+        add_registry_user(entry)
         return entry, active
 
     def test_stop_renames_before_stopping_and_reloads_while_healthy(self, tmp_path, monkeypatch):
@@ -7798,7 +7791,6 @@ class TestStreamConfPauseRestore:
 
         entry, active = self._entry(tmp_path)
         paused = stream_access.paused_path(active)
-        monkeypatch.setattr(registry, "get_user_service", lambda *a: entry)
         events = []
 
         def fake_reload(_container):
@@ -7829,7 +7821,6 @@ class TestStreamConfPauseRestore:
         original = active.read_text()
         paused = stream_access.paused_path(active)
         active.rename(paused)
-        monkeypatch.setattr(registry, "get_user_service", lambda *a: entry)
         events = []
 
         def fake_up(*a, **k):
@@ -7857,7 +7848,6 @@ class TestStreamConfPauseRestore:
         from lib import stream_access
 
         entry, _ = self._entry(tmp_path, stream=False)
-        monkeypatch.setattr(registry, "get_user_service", lambda *a: entry)
         monkeypatch.setattr(docker_ops, "compose_stop", lambda *a, **k: None)
 
         def _boom(_container):
@@ -7874,7 +7864,6 @@ class TestStreamConfPauseRestore:
 
         entry, active = self._entry(tmp_path)
         active.rename(stream_access.paused_path(active))
-        monkeypatch.setattr(registry, "get_user_service", lambda *a: entry)
         monkeypatch.setattr(docker_ops, "compose_stop", lambda *a, **k: None)
 
         def _boom(_container):
@@ -7892,7 +7881,6 @@ class TestStreamConfPauseRestore:
         entry, active = self._entry(tmp_path)
         paused = stream_access.paused_path(active)
         paused.write_text("paused copy\n")
-        monkeypatch.setattr(registry, "get_user_service", lambda *a: entry)
         monkeypatch.setattr(docker_ops, "compose_up", lambda *a, **k: None)
         monkeypatch.setattr(stream_access, "refresh_and_reload", lambda _c: None)
 
@@ -7910,14 +7898,12 @@ class TestStreamConfPauseRestore:
         paused = stream_access.paused_path(active)
         active.rename(paused)
         active.with_suffix(active.suffix + ".generated").write_text("")
-        monkeypatch.setattr(registry, "get_user_service", lambda *a: entry)
         monkeypatch.setattr(docker_ops, "network_disconnect", lambda *a, **k: None)
         monkeypatch.setattr(docker_ops, "compose_down", lambda *a, **k: None)
         monkeypatch.setattr(docker_ops, "remove_project_volumes", lambda *a, **k: [])
         monkeypatch.setattr(docker_ops, "orphan_network_cleanup", lambda *a, **k: None)
         monkeypatch.setattr(stream_access, "refresh_and_reload", lambda _c: None)
         monkeypatch.setattr(provisioner, "_purge_user_artifacts", lambda *a, **k: None)
-        monkeypatch.setattr(registry, "remove_user_service", lambda *a: None)
 
         provisioner.remove_user(
             user_name="alice", service_name="myapp", label="0", nginx_container="nginx",
@@ -8144,6 +8130,8 @@ class TestStoppedInstanceIsNotHealthy:
 
     def _entry(self):
         return {
+            "service_id": "00000000-0000-0000-0000-000000000001",
+            "owner_api_user_id": "00000000-0000-0000-0000-000000000002",
             "user_name": "alice", "service_name": "myapp", "label": "0",
             "compose_template_path": "", "compose_file_path": "",
             "nginx_conf_template_path": "", "nginx_conf_path": "",
@@ -8199,3 +8187,48 @@ class TestHasAuthAnnotation:
         second = tmp_path / "svc2.conf"
         second.write_text("server {\n    auth_basic \"y\";\n}\n")
         assert api._has_auth({"nginx_conf_paths": [str(conf), str(second)]}) is True
+
+
+class TestNginxReloadIsLoud:
+    """T4: a failed reload must surface so the caller's rollback can run."""
+
+    def test_nginx_reload_raises_when_docker_exec_fails(self, monkeypatch):
+        import subprocess
+        from lib import docker_ops
+
+        monkeypatch.setattr(
+            docker_ops, "_run",
+            lambda *a, **k: subprocess.CompletedProcess(a, 1, "", "container is not running"),
+        )
+        with pytest.raises(RuntimeError, match="nginx reload failed"):
+            docker_ops.nginx_reload("subnet-acl-nginx")
+
+    def test_a_successful_reload_does_not_raise(self, monkeypatch):
+        import subprocess
+        from lib import docker_ops
+
+        monkeypatch.setattr(
+            docker_ops, "_run",
+            lambda *a, **k: subprocess.CompletedProcess(a, 0, "", ""),
+        )
+        assert docker_ops.nginx_reload("subnet-acl-nginx") is None
+
+
+class TestNullComposePathClassification:
+    """T11 minimal shape: a seeded/legacy instance row with no rendered compose
+    path must classify as `missing`, never 500 the whole user-status read.
+
+    Regression: `entry.get("compose_file_path", "")` returns None when the
+    column is present with a NULL value, and `Path(None)` raised inside
+    `_status_for_user` (surfaced by the isolated minimal-shape trace, 2026-11-01).
+    """
+
+    def test_null_compose_path_does_not_crash(self, registry_file, sample_entry):
+        from api import _status_for_user
+        add_registry_user({**sample_entry, "compose_file_path": None})
+        # The read must complete and place the entry in exactly one bucket; the
+        # regression being guarded is the `Path(None)` 500, not the bucket.
+        result = _status_for_user("alice", {})
+        buckets = ("healthy_services", "unhealthy_services", "missing_services", "failed_services")
+        found = [b for b in buckets if any(s["service_name"] == "myapp" for s in result[b])]
+        assert len(found) == 1, (found, result)

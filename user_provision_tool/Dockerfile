@@ -1,7 +1,14 @@
 FROM python:3.13-slim
 
+# Build-time proxy support (temporary build-env adaptation)
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ENV HTTP_PROXY=${HTTP_PROXY} \
+    HTTPS_PROXY=${HTTPS_PROXY}
+
 # ---- System dependencies ----
-RUN apt-get update && apt-get install -y --no-install-recommends openssl \
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true; \
+    apt-get update && apt-get install -y --no-install-recommends openssl \
     && rm -rf /var/lib/apt/lists/*
 
 # ---- Docker CLI + Compose plugin ----
@@ -23,9 +30,13 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev
 
+ENV HTTP_PROXY= HTTPS_PROXY=
+
 # Copy source
 COPY lib/ lib/
 COPY cli/ cli/
+COPY db/ db/
+COPY migrations/ migrations/
 COPY api.py ./
 
 EXPOSE 8000

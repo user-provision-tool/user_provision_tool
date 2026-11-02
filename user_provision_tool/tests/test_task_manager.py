@@ -59,14 +59,20 @@ class TestTaskManager:
         assert task["result"] is None
 
     def test_cancel_pending_task(self):
-        """A task is cancellable in the pending window before a worker picks it up."""
-        import threading
-        import time
-        from lib.task_manager import Task, TaskManager
+        """A queued row is cancellable before a worker picks it up."""
+        import uuid
+        from lib import db, registry
+        from lib.task_manager import TaskManager
+
         tm = TaskManager(max_workers=1)
-        tm._tasks["pending01"] = Task("pending01", "test")
-        assert tm.cancel("pending01") is True
-        assert tm.get("pending01")["status"] == "cancelled"
+        task_id = "api-pending01"
+        with db.connection() as conn:
+            registry.insert_task(
+                conn, task_id=task_id, procedure_id=uuid.uuid4(),
+                service_id=None, kind="deploy", operation="register",
+            )
+        assert tm.cancel(task_id) is True
+        assert tm.get(task_id)["status"] == "cancelled"
 
     def test_submit_refuses_at_capacity(self):
         """A saturated pool must NOT accept-and-queue forever (doc §4d)."""
@@ -110,17 +116,17 @@ class TestTaskManager:
             pass
         assert len(tm.list_all()) == before
 
-    def test_task_carries_its_target(self):
-        """The card's Cancel finds the task via (user, service, label) — §4b."""
+    def test_task_carries_its_service_id(self):
+        """A task's target is the service identity (T4/R4), not a name tuple."""
         from lib.task_manager import TaskManager
-        tm = TaskManager(max_workers=2)
-        tid = tm.submit(
-            "register", lambda **kw: None,
-            user_name="alice", service_name="n8n", label="0",
+        from registry_support import add_user
+
+        service_id, _proc = add_user(
+            {"user_name": "alice", "service_name": "n8n", "label": "0"}
         )
-        assert tm.get(tid)["target"] == {
-            "user_name": "alice", "service_name": "n8n", "label": "0",
-        }
+        tm = TaskManager(max_workers=2)
+        tid = tm.submit("register", lambda **kw: None, service_id=service_id)
+        assert tm.get(tid)["target"] == {"service_id": service_id}
 
     def test_get_nonexistent_returns_none(self):
         from lib.task_manager import TaskManager
@@ -220,13 +226,15 @@ class TestTaskManager:
         log_path = tm.get_log_file(task_id)
         assert Path(log_path).exists(), f"Log should exist at {log_path}"
 
-        # Wait for TTL to expire
+        # Wait for TTL to expire, then run the sweep.
         time.sleep(0.5)
+        tm.prune()
 
-        # Trigger cleanup by polling
-        tm.get(task_id)
-        assert tm.get(task_id) is None  # task cleaned up
+        # T5: the tombstone is retained; its log is deleted and `log_ref` cleared.
+        assert tm.get(task_id)["deleted_at"] is not None
+        assert tm.get(task_id)["log_ref"] is None
         assert not Path(log_path).exists()  # log deleted
+        assert all(t["task_id"] != task_id for t in tm.list_all())
 
     def test_task_log_file_cleaned_on_max(self, tmp_path):
         """Beyond max_tasks, the oldest FINISHED task + log are evicted.
@@ -256,18 +264,18 @@ class TestTaskManager:
                 time.sleep(0.01)
 
         # All five are finished now ⇒ the cap applies on the next sweep.
-        tm._cleanup_excess()
+        tm.prune()
 
-        # Oldest 2 tasks should be evicted
-        assert tm.get(task_ids[0]) is None
-        assert tm.get(task_ids[1]) is None
+        # Oldest 2 tasks are tombstoned (retained, log gone)
+        assert tm.get(task_ids[0])["deleted_at"] is not None
+        assert tm.get(task_ids[1])["deleted_at"] is not None
         assert not Path(log_paths[0]).exists()
         assert not Path(log_paths[1]).exists()
 
-        # Newest 3 should still exist
-        assert tm.get(task_ids[2]) is not None
-        assert tm.get(task_ids[3]) is not None
-        assert tm.get(task_ids[4]) is not None
+        # Newest 3 are still live
+        assert tm.get(task_ids[2])["deleted_at"] is None
+        assert tm.get(task_ids[3])["deleted_at"] is None
+        assert tm.get(task_ids[4])["deleted_at"] is None
 
     def test_the_cleanup_defaults_are_the_contract(self):
         """G30: "one TTL number, one default, configured the same way".
@@ -295,33 +303,36 @@ class TestTaskManager:
         and its log, which the `LLM based fix` handoff needs — while its build
         carried on. The oldest task here is the live one, so eviction by age
         alone would take it."""
-        from lib.task_manager import Task, TaskManager
-        from pathlib import Path
+        import uuid
+        from datetime import datetime, timedelta, timezone
+
+        from lib import db
+        from lib.task_manager import TaskManager
+
         log_dir = tmp_path / "task_logs"
         tm = TaskManager(max_workers=4, max_tasks=2, log_dir=str(log_dir))
+        now = datetime.now(timezone.utc)
 
-        # The OLDEST task is still running; two finished ones follow.
-        running = Task("api-running", "register")
-        running.status = "running"
-        running.created_at = 1.0
-        tm._tasks[running.task_id] = running
+        rows = [("api-running", "running", now - timedelta(seconds=30))]
+        rows += [(f"api-done{i}", "completed", now - timedelta(seconds=20 - i))
+                 for i in range(3)]
+        with db.connection() as conn:
+            for task_id, status, created in rows:
+                conn.execute(
+                    "INSERT INTO registry.tasks (task_id, procedure_id, service_id, "
+                    "executor, kind, operation, status, created_at, updated_at) "
+                    "VALUES (%s,%s,NULL,'api','deploy','register',%s,%s,%s)",
+                    (task_id, uuid.uuid4(), status, created, created),
+                )
 
-        finished = []
-        for i, age in enumerate((2.0, 3.0, 4.0)):
-            t = Task(f"api-done{i}", "register")
-            t.status = "completed"
-            t.created_at = age
-            tm._tasks[t.task_id] = t
-            finished.append(t.task_id)
+        tm.prune()
 
-        tm._cleanup_excess()
-
-        assert tm.get("api-running") is not None, "a live task keeps its record"
-        assert tm.get("api-running").get("status") == "running"
+        assert tm.get("api-running")["deleted_at"] is None, "a live task keeps its record"
+        assert tm.get("api-running")["status"] == "running"
         # cap 2 against three finished ⇒ exactly the oldest finished one goes
-        assert tm.get(finished[0]) is None
-        assert tm.get(finished[1]) is not None
-        assert tm.get(finished[2]) is not None
+        assert tm.get("api-done0")["deleted_at"] is not None
+        assert tm.get("api-done1")["deleted_at"] is None
+        assert tm.get("api-done2")["deleted_at"] is None
 
     def test_get_log_file_nonexistent(self, tmp_path):
         """get_log_file returns None for nonexistent task."""
@@ -381,11 +392,13 @@ class TestTaskManager:
             time.sleep(0.01)
 
         assert set(task.keys()) == {
-            "task_id", "type", "status", "created_at", "updated_at", "result", "error",
-            # Added for §4b: a service card finds the task behind a `building`
-            # entry by its (user, service, label) target.
-            "target",
+            "task_id", "procedure_id", "service_id", "executor", "kind",
+            "operation", "type", "status", "phase", "progress", "error",
+            "log_ref", "result", "target", "deleted_at", "created_at", "updated_at",
         }
+        assert task["executor"] == "api"
+        assert task["kind"] == "deploy"
+        assert task["operation"] == "register"
         assert task["task_id"] == tid
         assert task["type"] == "register"
         assert task["status"] == "completed"

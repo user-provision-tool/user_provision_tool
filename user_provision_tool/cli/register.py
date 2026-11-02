@@ -376,12 +376,14 @@ def main() -> None:
         sys.exit(1)
 
     entry = result["entry"]
-    print(f"[1/4] Registered user '{args.user_name}' in user_registry.yml")
+    print(f"[1/4] Registered user '{args.user_name}' in the registry")
     print(f"[2/4] Generated compose file: {entry['compose_file_path']}")
     if result["copied_env"]:
         print(f"[2/4] Copied env file to: {result['copied_env']}")
     if nginx_template:
-        if entry["passwd"]:
+        # The Basic secret is stored as ciphertext in `service_basic`; the entry
+        # exposes its presence (`has_basic`), never the plaintext.
+        if entry.get("has_basic") or entry.get("basic_username"):
             print(f"[3/4] Generated htpasswd file: {entry['htpasswd_path']}")
         else:
             print("[3/4] No password set; skipping htpasswd file.")

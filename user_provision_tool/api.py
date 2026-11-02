@@ -27,6 +27,7 @@ import threading
 import time
 import os
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -37,10 +38,10 @@ from pydantic import BaseModel, Field, field_validator
 # Make lib/ importable when the file sits at the project root
 sys.path.insert(0, str(Path(__file__).parent))
 
-from lib import docker_ops, provisioner, reconciliation, registry, stream_access, subnet_manager, template_engine, validation
+from lib import db, docker_ops, provisioner, reconciliation, registry, stream_access, subnet_manager, template_engine, validation
 from lib.compose_converter import compose_file_to_template, get_compose_service_names
 from lib.nginx_converter import nginx_file_to_template
-from lib.task_manager import Task, TaskCapacityError, task_manager
+from lib.task_manager import TaskCapacityError, task_manager
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -86,7 +87,17 @@ _reg_mod.REGISTRY_FILE = Path(_reg_path)
 # ---------------------------------------------------------------------------
 
 class RegisterRequest(BaseModel):
-    user_name: str
+    # T3 — the canonical body identifies the owner in exactly one of two ways:
+    # `owner_api_user_id` (gateway deploy; must be live, never created here) or
+    # `owner_username` (direct dashboard/CLI/minimal; ensured `mode='owner'` in
+    # the services transaction). `user_name` is an optional compatibility alias
+    # for `owner_username`. A username is never an email (R5.4).
+    owner_api_user_id: str | None = None
+    owner_username: str | None = None
+    user_name: str | None = None
+    service_id: str | None = None
+    procedure_id: str | None = None
+    recipe_path: str | None = None
     service_name: str
     # Optional project root — when provided, any relative path below is resolved against it
     # (equivalent to -pr in the CLI)
@@ -148,9 +159,11 @@ class RegisterRequest(BaseModel):
     fullchain: str | None = None
     privkey: str | None = None
 
-    @field_validator("user_name", "service_name")
+    @field_validator("owner_username", "user_name", "service_name")
     @classmethod
-    def _validate_name(cls, v: str, info) -> str:
+    def _validate_name(cls, v: str | None, info) -> str | None:
+        if v is None:
+            return None
         try:
             validation.validate_name(v, info.field_name)
         except validation.ValidationError as e:
@@ -239,6 +252,13 @@ class RegisterRequest(BaseModel):
                 "certificates were supplied but tls=false — either set tls=true "
                 "or drop the certificates (they are ignored otherwise)"
             )
+
+        # Owner form: at least one; the alias must agree when both are present.
+        alias = self.owner_username or self.user_name
+        if self.owner_username and self.user_name and self.owner_username != self.user_name:
+            raise ValueError("owner_username and user_name disagree — pass one")
+        if not self.owner_api_user_id and not alias:
+            raise ValueError("one of owner_api_user_id or owner_username is required")
         return self
 
 
@@ -357,6 +377,25 @@ async def lifespan(app: FastAPI):
     nginx is services-only and the portal/ACL moved to the edge ``-nginx-acl``.
     Recovery regenerates the simple ACL-free per-service confs.
     """
+    # T1 — wait for PostgreSQL and apply the registry migrations before any
+    # registry read. The compose order is retry-based, so this blocks on a
+    # fresh stack until the database healthcheck passes and the -api schema is
+    # usable; it fails the process closed if the database never arrives.
+    from lib import db as _db
+    try:
+        _db.migrate()
+        _db.get_pool()
+        # The keyring must exist before anything is encrypted; if ciphertext
+        # exists without it, refuse rather than generate a replacement key.
+        from lib import keys as _keys
+        _keys.ensure_for_startup(registry.encrypted_basic_count())
+        # A runner does not survive a restart: live rows become `unknown`, and
+        # the recovery sweep terminalizes them `failed` (R4.2/R6.6).
+        task_manager.recover_on_startup()
+        _log.info("registry database ready")
+    except Exception:
+        _log.exception("registry database unavailable — refusing to start")
+        raise
     _log.info("provision-api starting — nginx recovery (v5 simple confs)")
     try:
         result = reconciliation.recover_on_startup()
@@ -368,6 +407,14 @@ async def lifespan(app: FastAPI):
         )
     except Exception:
         _log.exception("Startup recovery failed")
+    try:
+        terminalized = task_manager.terminalize_unknown(
+            "imported/restarted task had no surviving runner"
+        )
+        if terminalized:
+            _log.info("terminalized %d unknown task(s) as failed", terminalized)
+    except Exception:
+        _log.exception("Task recovery failed")
     # Fail-closed policy refresh even when recovery failed: write the file from
     # the current network and reload only if the content changed. With no file
     # the stream context's static `deny all;` already applies.
@@ -401,9 +448,15 @@ async def lifespan(app: FastAPI):
     # complement of R16's reloads, which stay.
     from lib import instance_events as _instance_events
     _instance_events.start_watcher(NGINX_CONTAINER)
+    threading.Thread(target=_account_reaper_loop, name="api-users-reaper",
+                     daemon=True).start()
     print(f"[provision-api] instance-container watcher started "
           f"(container={NGINX_CONTAINER})", flush=True)
     yield
+    try:
+        _db.close_pool()
+    except Exception:
+        pass
 
 
 app = FastAPI(title="User Provision Tool", version="1.0.0", lifespan=lifespan)
@@ -432,9 +485,218 @@ async def _capacity_refusal_handler(request, exc: TaskCapacityError):
 # GET /health  — liveness probe (no docker call)
 # ---------------------------------------------------------------------------
 
+def reap_pending_once(grace_minutes: int = 15) -> int:
+    """Delete service-less pending api_users rows older than the lease.
+
+    Takes the same ``account:<name>`` lock as ensure/claim and re-checks both
+    preconditions under it. A `users.api_user_id` FK rejection means a gateway
+    row exists, so the row is left for the claim. Returns the number deleted.
+    """
+    deleted = 0
+    with db.connection() as conn:
+        rows = conn.execute(
+            "SELECT id, username FROM registry.api_users "
+            "WHERE state='pending' AND deleted_at IS NULL "
+            "AND pending_since < now() - make_interval(mins => %s)",
+            (grace_minutes,),
+        ).fetchall()
+        for row in rows:
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (f"account:{row['username'].casefold()}",),
+            )
+            fresh = conn.execute(
+                "SELECT state FROM registry.api_users WHERE id=%s FOR UPDATE",
+                (row["id"],),
+            ).fetchone()
+            if not fresh or fresh["state"] != "pending":
+                continue
+            services = conn.execute(
+                "SELECT count(*) AS n FROM registry.services "
+                "WHERE owner_api_user_id=%s AND deleted_at IS NULL",
+                (row["id"],),
+            ).fetchone()["n"]
+            if services:
+                continue
+            try:
+                conn.execute("DELETE FROM registry.api_users WHERE id=%s", (row["id"],))
+                deleted += 1
+            except Exception:
+                # FK: a gateway users row owns it; the claim handles it.
+                continue
+    return deleted
+
+
+def _account_reaper_loop() -> None:
+    import time as _time
+    while True:
+        _time.sleep(300)
+        try:
+            reap_pending_once()
+        except Exception:
+            _log.exception("api_users reaper pass failed")
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok"}
+    """Readiness: the registry database must be usable (T1).
+
+    A process without its schema is not ready; reporting ok while every write
+    fails is how a broken deploy looks healthy.
+    """
+    from lib import db as _db
+    state = _db.health()
+    if state["status"] != "ok":
+        raise HTTPException(503, f"registry database unavailable: {state.get('error')}")
+    return {"status": "ok", "database": state["database"]}
+
+
+# ---------------------------------------------------------------------------
+# api_users interface (T3/T6). The -api owns the pending/live lifecycle; the
+# gateway calls ensure before its own users insert and claim after the commit.
+# ---------------------------------------------------------------------------
+
+class ApiUserEnsureRequest(BaseModel):
+    username: str
+    mode: str = Field("account", pattern="^(account|owner)$")
+
+
+def _api_user_payload(row: dict) -> dict[str, Any]:
+    return {
+        "id": str(row["id"]),
+        "username": row["username"],
+        "state": row["state"],
+        "deleted_at": row["deleted_at"].isoformat() if row.get("deleted_at") else None,
+    }
+
+
+@app.post("/api-users")
+def ensure_api_user(req: ApiUserEnsureRequest) -> dict[str, Any]:
+    try:
+        validation.validate_name(req.username, "username")
+    except validation.ValidationError as e:
+        raise HTTPException(422, str(e))
+    with db.connection() as conn:
+        try:
+            oid, created = registry.ensure_owner(conn, req.username, mode=req.mode)
+        except registry.RegistryError as e:
+            raise HTTPException(409, str(e))
+        row = conn.execute(
+            "SELECT id, username, state, deleted_at FROM registry.api_users WHERE id=%s",
+            (oid,),
+        ).fetchone()
+    payload = _api_user_payload(row)
+    payload["created"] = created
+    return payload
+
+
+@app.post("/api-users/{api_user_id}/claim")
+def claim_api_user(api_user_id: str) -> dict[str, Any]:
+    try:
+        uid = uuid.UUID(api_user_id)
+    except (ValueError, TypeError):
+        raise HTTPException(422, "api_user_id is not a UUID")
+    with db.connection() as conn:
+        row = conn.execute(
+            "SELECT id, username, state, deleted_at FROM registry.api_users WHERE id=%s",
+            (uid,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "api user not found")
+        if row["deleted_at"] is not None:
+            raise HTTPException(409, "api user is tombstoned")
+        if row["state"] == "pending":
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (f"account:{row['username'].casefold()}",),
+            )
+            conn.execute(
+                "UPDATE registry.api_users SET state='live', pending_since=%s WHERE id=%s",
+                (registry.utcnow(), uid),
+            )
+            row = dict(row)
+            row["state"] = "live"
+    return _api_user_payload(row)
+
+
+@app.get("/api-users/{api_user_id}")
+def get_api_user(api_user_id: str) -> dict[str, Any]:
+    try:
+        uid = uuid.UUID(api_user_id)
+    except (ValueError, TypeError):
+        raise HTTPException(422, "api_user_id is not a UUID")
+    row = db.fetch_one(
+        "SELECT id, username, state, deleted_at FROM registry.api_users WHERE id=%s", (uid,)
+    )
+    if not row:
+        raise HTTPException(404, "api user not found")
+    return _api_user_payload(row)
+
+
+@app.delete("/api-users/{api_user_id}")
+def delete_api_user(api_user_id: str, scope: str = Query("soft", pattern="^(soft|pending)$")):
+    try:
+        uid = uuid.UUID(api_user_id)
+    except (ValueError, TypeError):
+        raise HTTPException(422, "api_user_id is not a UUID")
+    with db.connection() as conn:
+        row = conn.execute(
+            "SELECT id, username, state, deleted_at FROM registry.api_users WHERE id=%s",
+            (uid,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "api user not found")
+        if row["deleted_at"] is not None:
+            return _api_user_payload(row)
+        if scope == "pending":
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (f"account:{row['username'].casefold()}",),
+            )
+            row = conn.execute(
+                "SELECT id, username, state, deleted_at FROM registry.api_users "
+                "WHERE id=%s FOR UPDATE", (uid,),
+            ).fetchone()
+            services = conn.execute(
+                "SELECT count(*) AS n FROM registry.services "
+                "WHERE owner_api_user_id=%s AND deleted_at IS NULL", (uid,),
+            ).fetchone()["n"]
+            if row["state"] != "pending" or services:
+                raise HTTPException(409, "row is not an unreferenced pending row")
+            try:
+                conn.execute("DELETE FROM registry.api_users WHERE id=%s", (uid,))
+            except Exception as exc:  # noqa: BLE001 — FK means a gateway row exists
+                raise HTTPException(409, f"gateway row owns this api_user: {exc}")
+            return {"id": str(uid), "deleted": True, "scope": "pending"}
+        conn.execute(
+            "UPDATE registry.api_users SET deleted_at=%s WHERE id=%s",
+            (registry.utcnow(), uid),
+        )
+        row = dict(row)
+        row["deleted_at"] = registry.utcnow()
+    return _api_user_payload(row)
+
+
+@app.post("/api-users/{api_user_id}/stop-services")
+def stop_api_user_services(api_user_id: str) -> dict[str, Any]:
+    try:
+        uid = uuid.UUID(api_user_id)
+    except (ValueError, TypeError):
+        raise HTTPException(422, "api_user_id is not a UUID")
+    entries = registry.owner_services(uid)
+    busy = [e["service_id"] for e in entries
+            if e.get("status") in ("building", "deleting")]
+    if busy:
+        raise HTTPException(409, {"reason": "busy", "services": busy})
+    results = []
+    for entry in entries:
+        try:
+            provisioner.stop_service(service_id=entry["service_id"],
+                                     nginx_container=NGINX_CONTAINER)
+            results.append({"service_id": entry["service_id"], "ok": True})
+        except Exception as exc:  # noqa: BLE001 — report every failure
+            results.append({"service_id": entry["service_id"], "ok": False, "error": str(exc)})
+    return {"api_user_id": str(uid), "ok": all(r["ok"] for r in results), "results": results}
 
 
 # ---------------------------------------------------------------------------
@@ -616,14 +878,36 @@ def register_user(
     env_file_path          = _resolve(req.env_file_path)
     env_files_resolved     = [_resolve(p) for p in (req.env_files or [])]
 
-    # --- Label allocation (GRILLING G3 / task doc §1.4 Part B) -----------------
-    # The registry owns `(user_name, service_name, label)`, so when the caller does not
-    # name a label the -api picks the next free one. The registration below re-checks for
-    # a duplicate under `registry.transaction()`, so a concurrent allocation fails loudly
-    # ("already registered") instead of silently writing a second entry under one label.
-    label = req.label if req.label is not None else registry.next_free_label(
-        req.user_name, req.service_name
-    )
+    # --- Label allocation (R2.3) ----------------------------------------------
+    # A concrete label is honoured; otherwise `prepare_registration` allocates
+    # max(label)+1 over active AND historical rows under the per-owner/service
+    # advisory lock. A concurrent loser hits the partial unique index (409).
+    label = req.label
+    owner_username = req.owner_username or req.user_name
+
+    # --- Recipe path (R2.3) ----------------------------------------------------
+    # Sent by the gateway; a direct/CLI deploy derives it from the recorded
+    # compose/env paths. More than one distinct recipe is a 422, never a guess.
+    recipe_path = req.recipe_path
+    if recipe_path is None:
+        candidates: list[str] = []
+        for p in ([compose_template_path] if compose_template_path else []) + \
+                 ([compose_file_path] if compose_file_path else []) + compose_file_paths:
+            if p:
+                candidates.append(p)
+        project = (SOURCE_PROJECTS_DIR / req.service_name).resolve()
+        found: set[str] = set()
+        for c in candidates:
+            try:
+                rel = Path(c).resolve().parent.relative_to(project)
+            except (ValueError, OSError):
+                continue
+            found.add("" if str(rel) == "." else rel.as_posix())
+        if len(found) > 1:
+            raise HTTPException(
+                422, f"ambiguous recipe path for {req.service_name}: {sorted(found)}"
+            )
+        recipe_path = next(iter(found)) if found else ""
 
     # --- Resolve compose template (convert plain file(s) if needed) ---
     compose_sources: list[str] = []
@@ -785,7 +1069,9 @@ def register_user(
 
     # --- Build kwargs for provisioner call ---
     prov_kwargs = dict(
-        user_name=req.user_name,
+        owner_api_user_id=req.owner_api_user_id,
+        owner_username=owner_username,
+        recipe_path=recipe_path,
         service_name=req.service_name,
         label=label,
         compose_template=compose_template,
@@ -815,26 +1101,82 @@ def register_user(
         ssl_base_dir=str(SSL_DIR),
     )
 
+    # --- Reserve the identity BEFORE 202 (R6.1) --------------------------------
+    task_id = task_manager.new_task_id()
+    try:
+        prepared = provisioner.prepare_registration(
+            service_id=req.service_id,
+            procedure_id=req.procedure_id,
+            task_id=task_id,
+            owner_api_user_id=req.owner_api_user_id,
+            owner_username=owner_username,
+            service_name=req.service_name,
+            label=label,
+            recipe_path=recipe_path,
+            domain=req.domain,
+        )
+    except registry.RegistryError as e:
+        raise HTTPException(409, str(e))
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    if prepared.get("replayed"):
+        return {
+            "status": "accepted",
+            "service_id": prepared["service_id"],
+            "procedure_id": prepared["procedure_id"],
+            "task_id": prepared["task_id"],
+            "message": "Identical deploy replay: the existing instance/task is current.",
+        }
+    prov_kwargs.update(
+        service_id=prepared["service_id"],
+        procedure_id=prepared["procedure_id"],
+    )
+    label = prepared["label"]
+
     if sync:
         # Backward-compatible blocking call
         try:
             result = provisioner.register_user(**prov_kwargs)
         except ValueError as e:
+            task_manager.finish(task_id, "failed", str(e))
             raise HTTPException(409, str(e))
         except RuntimeError as e:
+            task_manager.finish(task_id, "failed", str(e))
             raise HTTPException(500, f"docker compose up failed: {e}")
+        task_manager.finish(task_id, "completed")
         return {
             "status": "registered",
+            "service_id": prepared["service_id"],
+            "procedure_id": prepared["procedure_id"],
+            "task_id": task_id,
             "entry": result["entry"],
             "volume_warnings": result["volume_warnings"],
             "copied_env": result.get("copied_env"),
         }
 
-    # Async: submit task, return task_id immediately
-    task_id = task_manager.submit("register", provisioner.register_user, **prov_kwargs)
+    # Async: submit the worker under the already-inserted task row.
+    submit_kwargs = dict(prov_kwargs)
+    submit_service_id = submit_kwargs.pop("service_id")
+    submit_procedure_id = submit_kwargs.pop("procedure_id")
+    try:
+        task_manager.submit(
+            "register", provisioner.register_user,
+            task_id=task_id,
+            procedure_id=submit_procedure_id,
+            service_id=submit_service_id,
+            persist=False,
+            **submit_kwargs,
+        )
+    except TaskCapacityError:
+        provisioner.abort_new_registration(
+            prepared["service_id"], task_id, created=prepared.get("created_service", False)
+        )
+        raise
     return {
+        "service_id": prepared["service_id"],
+        "procedure_id": prepared["procedure_id"],
         "task_id": task_id,
-        "status": "pending",
+        "status": "queued",
         "type": "register",
         "message": f"Registration queued.  Poll GET /tasks/{task_id} for status.",
     }
@@ -849,32 +1191,12 @@ def remove_user(
     user_name: str, service_name: str, label: str,
     sync: bool = Query(False, description="If true, block until removal completes"),
 ) -> dict[str, Any]:
-    prov_kwargs = dict(
-        user_name=user_name,
-        service_name=service_name,
-        label=label,
-        nginx_container=NGINX_CONTAINER,
+    sid = registry.resolve_service_id(
+        None, user_name=user_name, service_name=service_name, label=label
     )
-
-    if sync:
-        try:
-            provisioner.remove_user_marked(**prov_kwargs)
-        except KeyError as e:
-            raise HTTPException(404, str(e))
-        except RuntimeError as e:
-            raise HTTPException(500, f"docker compose down failed: {e}")
-        return {"status": "removed", "user_name": user_name, "service_name": service_name, "label": label}
-
-    # remove_user_marked persists a 'deleting' status first, so the dashboard
-    # keeps showing "Deleting…" (including across page refreshes) until the
-    # registry entry disappears when the teardown completes.
-    task_id = task_manager.submit("remove", provisioner.remove_user_marked, **prov_kwargs)
-    return {
-        "task_id": task_id,
-        "status": "pending",
-        "type": "remove",
-        "message": f"Removal queued.  Poll GET /tasks/{task_id} for status.",
-    }
+    if not sid:
+        raise HTTPException(404, f"No registration found for {user_name}/{service_name}/{label}.")
+    return delete_instance_route(sid, "service", sync)
 
 
 # ---------------------------------------------------------------------------
@@ -887,33 +1209,12 @@ def rebuild_user(
     req: RebuildRequest = RebuildRequest(),
     sync: bool = Query(False, description="If true, block until rebuild completes"),
 ) -> dict[str, Any]:
-    prov_kwargs = dict(
-        user_name=user_name,
-        service_name=service_name,
-        label=label,
-        no_cache=req.no_cache,
-        build_args=req.build_args,
-        nginx_container=NGINX_CONTAINER,
+    sid = registry.resolve_service_id(
+        None, user_name=user_name, service_name=service_name, label=label
     )
-
-    if sync:
-        try:
-            provisioner.rebuild_user(**prov_kwargs)
-        except KeyError as e:
-            raise HTTPException(404, str(e))
-        except FileNotFoundError as e:
-            raise HTTPException(404, str(e))
-        except RuntimeError as e:
-            raise HTTPException(500, f"rebuild failed: {e}")
-        return {"status": "rebuilt", "user_name": user_name, "service_name": service_name, "label": label}
-
-    task_id = task_manager.submit("rebuild", provisioner.rebuild_user, **prov_kwargs)
-    return {
-        "task_id": task_id,
-        "status": "pending",
-        "type": "rebuild",
-        "message": f"Rebuild queued.  Poll GET /tasks/{task_id} for status.",
-    }
+    if not sid:
+        raise HTTPException(404, f"No registration found for {user_name}/{service_name}/{label}.")
+    return rebuild_instance_route(sid, req, sync)
 
 
 # ---------------------------------------------------------------------------
@@ -1019,6 +1320,150 @@ def stop_all_user_services(user_name: str) -> dict[str, Any]:
             for r in failed
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# Canonical ID routes (R7.7). The name routes above stay as compatibility
+# aliases that resolve exactly one active service_id before mutating.
+# ---------------------------------------------------------------------------
+
+
+class InstancePasswordChangeRequest(BaseModel):
+    passwd: str = Field(..., min_length=1)
+
+
+def _insert_sync_task(task_type: str, procedure_id: str, service_id: str,
+                      operation: str | None = None) -> str:
+    task_id = task_manager.new_task_id()
+    kind, op = {"register": ("deploy", "register"),
+                "rebuild": ("rebuild", "rebuild"),
+                "remove": ("remove", "remove"),
+                "fix_remove": ("remove", "fix_remove")}[task_type]
+    with db.connection() as conn:
+        registry.insert_task(
+            conn, task_id=task_id, procedure_id=uuid.UUID(procedure_id),
+            service_id=uuid.UUID(service_id), kind=kind, operation=operation or op,
+        )
+    return task_id
+
+
+@app.get("/instances/{service_id}")
+def get_instance_status(service_id: str) -> dict[str, Any]:
+    entry = registry.get_service_by_id(service_id)
+    if not entry:
+        raise HTTPException(404, f"Service not found: {service_id}")
+    running = {c["name"]: c["status"] for c in docker_ops.docker_ps_all()}
+    data = _status_for_user(entry["user_name"], running)
+    for bucket in ("healthy_services", "unhealthy_services", "missing_services",
+                   "failed_services"):
+        for svc in data.get(bucket, []):
+            if svc.get("service_id") == service_id:
+                return svc
+    return {
+        "service_id": service_id, "owner_api_user_id": entry["owner_api_user_id"],
+        "service_name": entry["service_name"], "label": entry["label"],
+        "status": entry.get("status") or "unknown",
+    }
+
+
+@app.delete("/instances/{service_id}")
+def delete_instance_route(
+    service_id: str,
+    scope: str = Query("service", pattern="^(instance|service)$"),
+    sync: bool = Query(False),
+) -> dict[str, Any]:
+    entry = registry.get_service_by_id(service_id)
+    if not entry:
+        raise HTTPException(404, f"Service not found: {service_id}")
+    procedure_id = str(uuid.uuid4())
+    fn = provisioner.remove_user if scope == "service" else provisioner.remove_instance_only
+    task_type = "remove" if scope == "service" else "fix_remove"
+    if sync:
+        task_id = _insert_sync_task(task_type, procedure_id, service_id)
+        try:
+            fn(service_id=service_id, procedure_id=procedure_id)
+        except KeyError as e:
+            task_manager.finish(task_id, "failed", str(e)); raise HTTPException(404, str(e))
+        except ValueError as e:
+            task_manager.finish(task_id, "failed", str(e)); raise HTTPException(409, str(e))
+        except RuntimeError as e:
+            task_manager.finish(task_id, "failed", str(e)); raise HTTPException(500, str(e))
+        task_manager.finish(task_id, "completed")
+        return {"service_id": service_id, "task_id": task_id, "scope": scope,
+                "status": "completed"}
+    task_id = task_manager.submit(
+        task_type, fn, procedure_id=procedure_id, service_id=service_id,
+    )
+    return {"service_id": service_id, "task_id": task_id, "scope": scope,
+            "status": "queued"}
+
+
+@app.post("/instances/{service_id}/stop")
+def stop_instance_route(service_id: str) -> dict[str, Any]:
+    try:
+        return {"status": "down", **provisioner.stop_service(service_id=service_id)}
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+    except (FileNotFoundError, RuntimeError) as e:
+        raise HTTPException(404 if isinstance(e, FileNotFoundError) else 500, str(e))
+
+
+@app.post("/instances/{service_id}/start")
+def start_instance_route(service_id: str) -> dict[str, Any]:
+    try:
+        return {"status": "up", **provisioner.start_service(service_id=service_id)}
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+    except (FileNotFoundError, RuntimeError) as e:
+        raise HTTPException(404 if isinstance(e, FileNotFoundError) else 500, str(e))
+
+
+@app.post("/instances/{service_id}/rebuild")
+def rebuild_instance_route(
+    service_id: str,
+    req: RebuildRequest = RebuildRequest(),
+    sync: bool = Query(False),
+) -> dict[str, Any]:
+    procedure_id = str(uuid.uuid4())
+    if sync:
+        task_id = _insert_sync_task("rebuild", procedure_id, service_id)
+        try:
+            provisioner.rebuild_user(service_id=service_id, procedure_id=procedure_id,
+                                     no_cache=req.no_cache, build_args=req.build_args)
+        except KeyError as e:
+            task_manager.finish(task_id, "failed", str(e)); raise HTTPException(404, str(e))
+        except FileNotFoundError as e:
+            task_manager.finish(task_id, "failed", str(e)); raise HTTPException(404, str(e))
+        except RuntimeError as e:
+            task_manager.finish(task_id, "failed", str(e)); raise HTTPException(500, str(e))
+        task_manager.finish(task_id, "completed")
+        return {"service_id": service_id, "task_id": task_id, "status": "rebuilt"}
+    task_id = task_manager.submit(
+        "rebuild", provisioner.rebuild_user,
+        procedure_id=procedure_id, service_id=service_id,
+        no_cache=req.no_cache, build_args=req.build_args,
+    )
+    return {"service_id": service_id, "task_id": task_id, "status": "queued"}
+
+
+@app.put("/instances/{service_id}/password")
+def change_instance_password(service_id: str, req: InstancePasswordChangeRequest) -> dict[str, Any]:
+    try:
+        return {"message": "Password updated.", **provisioner.change_password(
+            service_id=service_id, passwd=req.passwd)}
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.delete("/instances/{service_id}/password")
+def remove_instance_password(service_id: str) -> dict[str, Any]:
+    try:
+        return {"message": "Password removed.", **provisioner.remove_password(
+            service_id=service_id)}
+    except KeyError as e:
+        raise HTTPException(404, str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -1291,8 +1736,11 @@ def get_task_log_file(task_id: str) -> dict[str, Any]:
     task = task_manager.get(task_id)
     if task is None:
         raise HTTPException(404, f"Task not found: {task_id}")
+    if task.get("deleted_at"):
+        raise HTTPException(410, f"Task was pruned; its log is gone: {task_id}")
     log_file = task_manager.get_log_file(task_id)
     if not log_file or not Path(log_file).exists():
+        # A live row with a missing log is 404 — never another task's global log.
         raise HTTPException(404, f"Task log is gone: {task_id}")
     try:
         text = Path(log_file).read_text(encoding="utf-8", errors="replace")
@@ -1322,12 +1770,15 @@ async def stream_task_log(
     import asyncio
     from pathlib import Path
 
-    # Try per-task log first, fall back to global log
+    task = task_manager.get(task_id)
+    if task is None:
+        raise HTTPException(404, f"Task not found: {task_id}")
+    if task.get("deleted_at"):
+        raise HTTPException(410, f"Task was pruned; its log is gone: {task_id}")
     task_log = task_manager.get_log_file(task_id)
-    if task_log and Path(task_log).exists():
-        log_file = Path(task_log)
-    else:
-        log_file = Path(os.environ.get("DOCKER_OPS_LOG", str(GENERATED_DIR / "docker_ops.log")))
+    if not task_log or not Path(task_log).exists():
+        raise HTTPException(404, f"Task log is gone: {task_id}")
+    log_file = Path(task_log)
 
     async def log_generator():
         # Send initial tail
@@ -2197,7 +2648,11 @@ def _status_for_user(user_name: str, running: dict[str, str]) -> dict[str, Any]:
     failed_services: list[dict[str, Any]] = []
 
     for entry in entries:
-        compose_file = entry.get("compose_file_path", "")
+        # A NULL column reads back as None (dict.get's default only covers a
+        # MISSING key), and `Path(None)` raises — a seeded/legacy row without a
+        # rendered compose path must classify as `missing`, never 500 the whole
+        # user-status read (T11 minimal-shape trace).
+        compose_file = entry.get("compose_file_path") or ""
         expected_names = _expected_container_names(entry)
 
         healthy: dict[str, str] = {}
@@ -2226,6 +2681,8 @@ def _status_for_user(user_name: str, running: dict[str, str]) -> dict[str, Any]:
                 missing[cname] = "not running"
 
         svc: dict[str, Any] = {
+            "service_id": entry["service_id"],
+            "owner_api_user_id": entry["owner_api_user_id"],
             "service_name": entry["service_name"],
             "label": entry["label"],
             "compose_template_path": entry.get("compose_template_path", ""),

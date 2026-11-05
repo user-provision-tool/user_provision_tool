@@ -637,6 +637,54 @@ def network_connected_to_container(network: str, container: str) -> bool:
     return False
 
 
+def container_exec(container: str, argv: list[str], *, stdin: str | None = None,
+                   user: str | None = None, check: bool = True,
+                   timeout: float = DOCKER_TIMEOUT
+                   ) -> subprocess.CompletedProcess:
+    """Run a command inside *container*, optionally feeding *stdin*.
+
+    Used by the G83 resolv.conf manager. It deliberately goes through
+    ``docker exec`` (not ``docker cp``): a container's ``/etc/resolv.conf`` is a
+    bind mount, so it cannot be replaced by rename; it can only be rewritten in
+    place, which needs a shell in the container. ``user="0"`` is required for
+    the write: many services run as a non-root user, and ``/etc/resolv.conf`` is
+    root-owned (measured 2026-11-03 on the graphiti image). A failure is loud —
+    a silent one would leave a source resolving through the old file while the
+    registry claims the update succeeded.
+    """
+    args = ["docker", "exec", "-i"]
+    if user:
+        args += ["-u", str(user)]
+    args += [container, *argv]
+    print(f"+ {' '.join(args)}", flush=True)
+    result = subprocess.run(
+        args, input=stdin, text=True, capture_output=True, timeout=timeout,
+    )
+    if check and result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip().splitlines()
+        raise RuntimeError(
+            f"docker exec failed in {container} ({' '.join(argv)}): "
+            + (detail[-1] if detail else f"exit {result.returncode}")
+        )
+    return result
+
+
+def container_read_file(container: str, path: str) -> str:
+    """Read a file inside *container* (fails closed)."""
+    return container_exec(container, ["cat", path], user="0").stdout
+
+
+def container_write_file(container: str, path: str, content: str) -> None:
+    """Rewrite a file inside *container* in place as root.
+
+    ``cat > path`` truncates and writes. A rename-based atomic replace is
+    impossible for ``/etc/resolv.conf`` (it is a Docker bind mount: ``mv``
+    returns ``Resource busy``, measured 2026-11-03); writing through a shell
+    keeps the single inode Docker owns.
+    """
+    container_exec(container, ["sh", "-c", f"cat > {path}"], stdin=content, user="0")
+
+
 def container_logs(container: str, tail: int = 100) -> str:
     """Get the last *tail* lines of a container's logs."""
     result = subprocess.run(

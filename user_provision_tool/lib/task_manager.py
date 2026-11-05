@@ -35,7 +35,12 @@ _log = logging.getLogger("provision-api.tasks")
 KIND_BY_TYPE = {"register": ("deploy", "register"),
                 "rebuild": ("rebuild", "rebuild"),
                 "remove": ("remove", "remove"),
-                "fix_remove": ("remove", "fix_remove")}
+                "fix_remove": ("remove", "fix_remove"),
+                # G83 — the resolv.conf/membership update is a first-class task:
+                # addressed by source service, fanned out to every container, and
+                # polled by the gateway.
+                "resolv_conf_set": ("update", "resolv_conf_set"),
+                "resolv_conf_clear": ("update", "resolv_conf_clear")}
 
 
 class TaskCapacityError(RuntimeError):

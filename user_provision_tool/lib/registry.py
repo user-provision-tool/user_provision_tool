@@ -42,6 +42,10 @@ _INSTANCE_FIELDS = (
     "nginx_conf_paths", "nginx_conf_paths_by_category", "htpasswd_path",
     "ssl_certificate_path", "ssl_certificate_key_path", "env_files",
     "env_file_path", "container_names", "profiles", "volumes", "build_args", "tls",
+    # G83 — the opaque extra nameserver and network stored after a successful
+    # async resolv.conf/membership update. They are re-applied when a container
+    # restarts/redeploys and once on the -api's startup.
+    "extra_resolver", "extra_network",
 )
 
 _SELECT = """
@@ -78,6 +82,8 @@ SELECT s.id                AS service_id,
        i.volumes,
        i.build_args,
        i.tls,
+       i.extra_resolver,
+       i.extra_network,
        (SELECT t.task_id FROM registry.tasks t
          WHERE t.procedure_id = i.current_procedure_id
          ORDER BY t.created_at DESC, t.task_id DESC LIMIT 1) AS task_id

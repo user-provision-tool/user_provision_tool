@@ -38,7 +38,7 @@ from pydantic import BaseModel, Field, field_validator
 # Make lib/ importable when the file sits at the project root
 sys.path.insert(0, str(Path(__file__).parent))
 
-from lib import db, docker_ops, provisioner, reconciliation, registry, stream_access, subnet_manager, template_engine, validation
+from lib import db, docker_ops, provisioner, reconciliation, registry, resolv_conf, stream_access, subnet_manager, template_engine, validation
 from lib.compose_converter import compose_file_to_template, get_compose_service_names
 from lib.nginx_converter import nginx_file_to_template
 from lib.task_manager import TaskCapacityError, task_manager
@@ -368,6 +368,25 @@ from contextlib import asynccontextmanager
 _log = logging.getLogger("provision-api")
 
 
+def _resolv_startup_pass() -> None:
+    """One re-apply over services with ``extra_resolver`` set (G83).
+
+    Not a periodic reconcile: it runs once per process start, repairing a
+    restart burst that happened while the -api was down. Errors are logged per
+    service and never stop the pass.
+    """
+    try:
+        result = resolv_conf.startup_pass()
+        print(
+            f"[provision-api] extra-resolver startup pass: "
+            f"{result['applied']} service(s) re-applied, "
+            f"{len(result['errors'])} error(s)",
+            flush=True,
+        )
+    except Exception:
+        _log.exception("extra-resolver startup pass failed")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup: reconnect nginx to all user networks from registry.
@@ -448,10 +467,17 @@ async def lifespan(app: FastAPI):
     # complement of R16's reloads, which stay.
     from lib import instance_events as _instance_events
     _instance_events.start_watcher(NGINX_CONTAINER)
+    # G83 — the extra-resolver manager. The restart monitor repairs a container
+    # whose /etc/resolv.conf and membership Docker regenerated; the one-time
+    # startup pass repairs a burst that happened while this process was down.
+    resolv_conf.start_restart_monitor()
+    threading.Thread(target=_resolv_startup_pass, name="extra-resolver-startup",
+                     daemon=True).start()
     threading.Thread(target=_account_reaper_loop, name="api-users-reaper",
                      daemon=True).start()
     print(f"[provision-api] instance-container watcher started "
           f"(container={NGINX_CONTAINER})", flush=True)
+    print("[provision-api] extra-resolver restart monitor started", flush=True)
     yield
     try:
         _db.close_pool()
@@ -1364,6 +1390,54 @@ def get_instance_status(service_id: str) -> dict[str, Any]:
         "service_name": entry["service_name"], "label": entry["label"],
         "status": entry.get("status") or "unknown",
     }
+
+
+class ExtraResolverRequest(BaseModel):
+    resolver_ip: str = Field(..., min_length=1)
+    network: str = Field(..., min_length=1)
+
+
+@app.get("/instances/{service_id}/extra-resolver")
+def get_extra_resolver(service_id: str) -> dict[str, Any]:
+    """The opaque per-service pair the gateway supplied (G83)."""
+    entry = registry.get_service_by_id(service_id)
+    if not entry:
+        raise HTTPException(404, f"Service not found: {service_id}")
+    return {
+        "service_id": service_id,
+        "extra_resolver": entry.get("extra_resolver"),
+        "extra_network": entry.get("extra_network"),
+    }
+
+
+@app.post("/instances/{service_id}/extra-resolver", status_code=202)
+def set_extra_resolver(service_id: str, req: ExtraResolverRequest) -> dict[str, Any]:
+    """Async update: two lines + membership for **every container** (G83).
+
+    The request is addressed by source service; the ``-api`` fans it out and
+    stores the pair only when every container was updated. The caller polls the
+    returned task id.
+    """
+    entry = registry.get_service_by_id(service_id)
+    if not entry:
+        raise HTTPException(404, f"Service not found: {service_id}")
+    task_id = task_manager.submit(
+        "resolv_conf_set", resolv_conf.apply_service,
+        service_id=service_id, resolver_ip=req.resolver_ip, network=req.network,
+    )
+    return {"service_id": service_id, "task_id": task_id, "status": "queued"}
+
+
+@app.delete("/instances/{service_id}/extra-resolver", status_code=202)
+def clear_extra_resolver(service_id: str) -> dict[str, Any]:
+    """Async removal: restore the default, disconnect, clear both fields."""
+    entry = registry.get_service_by_id(service_id)
+    if not entry:
+        raise HTTPException(404, f"Service not found: {service_id}")
+    task_id = task_manager.submit(
+        "resolv_conf_clear", resolv_conf.clear_service, service_id=service_id,
+    )
+    return {"service_id": service_id, "task_id": task_id, "status": "queued"}
 
 
 @app.delete("/instances/{service_id}")

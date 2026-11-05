@@ -5872,8 +5872,10 @@ class TestOnlyAcceptedTasksAreStored:
     def test_no_record_only_kind_is_defined(self):
         from lib.task_manager import KIND_BY_TYPE
         assert "record" not in KIND_BY_TYPE
+        # `update` is G83's resolv.conf/membership task: it belongs to the
+        # registry task store rather than a new, unpersisted task family.
         assert {kind for kind, _op in KIND_BY_TYPE.values()} <= {
-            "deploy", "rebuild", "remove"}
+            "deploy", "rebuild", "remove", "update"}
 
     def test_a_submit_on_an_empty_pool_is_accepted(self):
         from lib.task_manager import TaskManager

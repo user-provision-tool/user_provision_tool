@@ -4965,10 +4965,14 @@ class TestEdgeTemplate:
         assert "${PORTAL_HOSTNAME} 127.0.0.1 localhost" in content
         assert "location = /api/auth/verify   { return 404; }" in content
         assert "location = /api/auth/exchange { return 404; }" in content
-        assert "proxy_pass http://subnet-acl-gateway:8770; proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_read_timeout 3600s;" in content
+        # G91 — the gateway and dashboard are variable upstreams (dynamic
+        # addresses, re-resolved per request instead of cached at startup).
+        assert "set $gateway_upstream subnet-acl-gateway;" in content
+        assert "set $dashboard_upstream subnet-acl-dashboard;" in content
+        assert "proxy_pass http://$gateway_upstream:8770; proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_read_timeout 3600s;" in content
         assert "rewrite ^/go/(.*) /api/auth/go/$1 break;" in content
-        assert "location /alert { proxy_pass http://subnet-acl-dashboard:80; }" in content
-        assert "location /     { proxy_pass http://subnet-acl-dashboard:80; }" in content
+        assert "location /alert { proxy_pass http://$dashboard_upstream:80; }" in content
+        assert "location /     { proxy_pass http://$dashboard_upstream:80; }" in content
         # Portal https server (mode-gated).
         assert "ssl_certificate /certs/portal/fullchain.pem;" in content
         assert "# [if PORTAL_MODE=https] return 301 https://$host$request_uri;" in content
@@ -4996,8 +5000,10 @@ class TestEdgeTemplate:
         assert "proxy_set_header Host $forwarded_host;" in content
         assert "include /etc/nginx/acl/acl-helpers.conf;" in content
         # Internal proxy mirroring the client scheme (decision 14 double TLS).
-        assert "proxy_pass http://subnet-acl-nginx;" in content
-        assert "proxy_pass https://subnet-acl-nginx;" in content
+        # G91 — variable upstream (the internal nginx is dynamically addressed).
+        assert "set $internal_upstream subnet-acl-nginx;" in content
+        assert "proxy_pass http://$internal_upstream;" in content
+        assert "proxy_pass https://$internal_upstream;" in content
         assert "proxy_ssl_server_name on;" in content
         assert "proxy_ssl_verify off;" in content
         # HTTPS termination uses the variable SNI cert.
@@ -5073,15 +5079,15 @@ class TestEdgeTemplate:
         assert start is not None and end is not None
         acl_on = "\n".join(lines[start + 1:end])
         blocks = re.findall(
-            r"location / \{\n(.*?)proxy_pass (https?://subnet-acl-nginx);",
+            r"location / \{\n(.*?)proxy_pass (https?://\$internal_upstream);",
             acl_on, flags=re.DOTALL,
         )
         assert len(blocks) == 2  # exactly the http + https service servers
         for body, _scheme in blocks:
             assert "auth_request /_auth_jwt;" in body, "gate missing before service proxy"
         # No other proxying location to the internal service exists in ACL-on.
-        assert acl_on.count("proxy_pass http://subnet-acl-nginx;") == 1
-        assert acl_on.count("proxy_pass https://subnet-acl-nginx;") == 1
+        assert acl_on.count("proxy_pass http://$internal_upstream;") == 1
+        assert acl_on.count("proxy_pass https://$internal_upstream;") == 1
         # The helpers never proxy to the internal service nginx — only the gateway.
         helpers = ACL_HELPERS_FILE.read_text()
         assert "proxy_pass http://subnet-acl-nginx" not in helpers
@@ -5096,7 +5102,9 @@ class TestAclHelpersTemplate:
         content = ACL_HELPERS_FILE.read_text()
         assert "location = /_auth_jwt {" in content
         assert "internal;" in content
-        assert "proxy_pass http://subnet-acl-gateway:8770/api/auth/verify;" in content
+        # G91 — variable upstream; the verify URI stays explicit.
+        assert "set $gateway_upstream subnet-acl-gateway;" in content
+        assert "proxy_pass http://$gateway_upstream:8770/api/auth/verify;" in content
         assert "proxy_set_header X-Original-URI $request_uri;" in content
 
     def test_auth_jwt_forwards_the_clients_credential(self):
@@ -5135,8 +5143,9 @@ class TestAclHelpersTemplate:
         content = ACL_HELPERS_FILE.read_text()
         assert "location = /_set_token {" in content
         assert "internal;" in content
-        assert "proxy_pass http://subnet-acl-gateway:8770/api/auth/exchange$is_args$args;" in content
-        assert "proxy_pass http://subnet-acl-gateway:8770/api/auth/exchange;" not in content
+        # G91 — variable upstream; the exchange URI and query string are kept.
+        assert "proxy_pass http://$gateway_upstream:8770/api/auth/exchange$is_args$args;" in content
+        assert "proxy_pass http://$gateway_upstream:8770/api/auth/exchange;" not in content
 
     def test_auth_401_challenge(self):
         """F3 (QA GAP-16): the API 401 challenge MUST carry the
@@ -5246,9 +5255,9 @@ class TestEdgeEntrypointAssembly:
         # (colon-normalized so `$host:8443` parses, never `$host8443`).
         assert "return 301 https://$host:8443$request_uri;" in conf
         assert "return 301 https://$host8443$request_uri;" not in conf
-        # ACL-off pass-through servers exist.
-        assert "proxy_pass http://subnet-acl-nginx;" in conf
-        assert "proxy_pass https://subnet-acl-nginx;" in conf
+        # ACL-off pass-through servers exist (G91 — variable upstream).
+        assert "proxy_pass http://$internal_upstream;" in conf
+        assert "proxy_pass https://$internal_upstream;" in conf
         assert "ssl_certificate $cert_pem;" in conf
         # Helpers in ACL-off: no gate blocks (they would reference the
         # undefined $client_type), but /_set_token stays for the /go/ exchange.

@@ -1415,8 +1415,9 @@ def set_extra_resolver(service_id: str, req: ExtraResolverRequest) -> dict[str, 
     """Async update: two lines + membership for **every container** (G83).
 
     The request is addressed by source service; the ``-api`` fans it out and
-    stores the pair only when every container was updated. The caller polls the
-    returned task id.
+    stores the pair after every RUNNING container was updated. G91 — a service
+    with no running container still stores the pair (the restart monitor applies
+    it on start). The caller polls the returned task id.
     """
     entry = registry.get_service_by_id(service_id)
     if not entry:

@@ -11,6 +11,11 @@ The update is addressed by **source service** and fans out to **every container
 of that service**. It is asynchronous (a ``registry.tasks`` row the gateway can
 poll) because a fan-out performs one Docker operation per container.
 
+G91 — the pair is stored even when the service has **no running container**:
+a stopped (or never-started) container gets it from the restart monitor when
+it starts. A failure while updating a running container raises **before** the
+store, so the previous pair stays in place.
+
 Docker regenerates ``/etc/resolv.conf`` on every container start, so the stored
 pair is re-applied:
 
@@ -135,7 +140,17 @@ def _clear_one(container: str, resolver_ip: str | None, network: str) -> None:
 
 
 def apply_service(service_id: str, resolver_ip: str, network: str) -> dict[str, Any]:
-    """Apply the pair to every container of *service_id*, store it on success."""
+    """Apply the pair to every container of *service_id*, then store it (G91).
+
+    The pair is persisted even when the service has **no running container**:
+    a stopped container (or a compose service whose profile never started) gets
+    the pair from the restart monitor on its next start. The stored row is the
+    durable form; the running files are the applied form.
+
+    The store happens only after every RUNNING container was updated: a failed
+    apply raises before the write, so the previous pair stays in place and the
+    next pass retries with the same values.
+    """
     resolver_ip = (resolver_ip or "").strip()
     network = (network or "").strip()
     if not resolver_ip or not network:
@@ -149,16 +164,11 @@ def apply_service(service_id: str, resolver_ip: str, network: str) -> dict[str, 
             raise KeyError(f"service {service_id} is deleted")
         containers = _containers(entry)
         # A compose service that no profile started has a recorded name but no
-        # container (measured 2026-11-03: graphiti's falkordb profiles). Such a
-        # container cannot be updated; a stopped one will be covered by the
-        # restart monitor when it starts. The task succeeds when every RUNNING
-        # container is updated and at least one exists.
+        # container (measured 2026-11-03: graphiti's falkordb profiles). It is
+        # stored-pending, not a failure: the monitor applies the pair when a
+        # container of the service first starts.
         running = [c for c in containers if _running(c)]
         skipped = [c for c in containers if c not in running]
-        if not running:
-            raise RuntimeError(
-                f"service {service_id} has no running container to update"
-            )
         for container in running:
             _apply_one(container, resolver_ip, network)
         with db.connection() as conn:
@@ -167,11 +177,12 @@ def apply_service(service_id: str, resolver_ip: str, network: str) -> dict[str, 
                 extra_resolver=resolver_ip, extra_network=network,
             )
         _log.info(
-            "extra resolver applied to %s (%d container(s), %d skipped): %s / %s",
+            "extra resolver stored for %s (%d applied, %d pending): %s / %s",
             service_id, len(running), len(skipped), resolver_ip, network,
         )
         return {"service_id": str(service_id), "containers": running,
-                "skipped": skipped,
+                "skipped": skipped, "applied": len(running),
+                "stored": True, "pending": len(skipped),
                 "extra_resolver": resolver_ip, "extra_network": network}
 
 

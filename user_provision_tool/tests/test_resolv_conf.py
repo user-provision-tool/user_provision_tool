@@ -82,16 +82,39 @@ def test_apply_writes_two_lines_every_container_and_stores(fake):
     assert out["containers"] == ["c1", "c2"]
 
 
-def test_apply_skips_non_running_and_requires_one(fake):
+def test_apply_skips_non_running_and_stores_pending(fake):
+    """G91 — a stopped container is pending, not a failure."""
     f, stored = fake(_entry("c1", "c2"), running={"c2": False})
     out = resolv_conf.apply_service("sid", "172.28.0.3", "subnet_acl_cross")
     assert out["containers"] == ["c1"]
     assert out["skipped"] == ["c2"]
+    assert out["applied"] == 1 and out["pending"] == 1 and out["stored"] is True
     assert stored["extra_resolver"] == "172.28.0.3"
 
-    f2, _ = fake(_entry("x"), running={"x": False})
+    # Zero running containers: the pair is still persisted for the monitor.
+    f2, stored2 = fake(_entry("x"), running={"x": False})
+    out2 = resolv_conf.apply_service("sid", "172.28.0.3", "subnet_acl_cross")
+    assert out2["applied"] == 0 and out2["stored"] is True
+    assert out2["containers"] == [] and out2["skipped"] == ["x"]
+    assert stored2 == {"extra_resolver": "172.28.0.3",
+                       "extra_network": "subnet_acl_cross"}
+    assert f2.writes == []
+
+
+def test_apply_failure_does_not_overwrite_the_stored_pair(fake, monkeypatch):
+    """G91 — the store happens only after every running container succeeded."""
+    f, stored = fake(_entry("c1", "c2"))
+    stored["extra_resolver"] = "old-resolver"
+    stored["extra_network"] = "subnet_acl_cross"
+
+    def _boom(container, resolver_ip, network):
+        raise RuntimeError("docker write failed")
+
+    monkeypatch.setattr(resolv_conf, "_apply_one", _boom)
     with pytest.raises(RuntimeError):
         resolv_conf.apply_service("sid", "172.28.0.3", "subnet_acl_cross")
+    assert stored == {"extra_resolver": "old-resolver",
+                      "extra_network": "subnet_acl_cross"}
 
 
 def test_clear_restores_captured_default_and_disconnects(fake):

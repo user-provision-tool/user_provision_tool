@@ -5783,8 +5783,12 @@ class TestLLMBasedFixAPISide:
 
     def test_status_payload_carries_task_id_and_availability(self, registry_file, sample_entry):
         from api import _status_for_user
+        from lib import db
         add_registry_user({**sample_entry, "status": "failed", "task_id": "t1",
                            "failure": {"stage": "build", "message": "m", "at": "t"}})
+        # The fixture inserts its task as `queued`; a failed instance's task is
+        # terminal, so the queue overlay must not turn this card into `queued`.
+        db.execute("UPDATE registry.tasks SET status='completed' WHERE task_id='t1'")
         svc = [s for s in _status_for_user("alice", {})["failed_services"]
                if s["service_name"] == "myapp"][0]
         assert svc["task_id"] == "t1"

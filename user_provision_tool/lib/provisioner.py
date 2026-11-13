@@ -580,7 +580,7 @@ def prepare_registration(
         if service_id:
             current = conn.execute(
                 "SELECT s.id, s.owner_api_user_id, s.service_name, s.label, s.recipe_path, "
-                "s.deleted_at, i.status, i.current_procedure_id "
+                "s.deleted_at, i.status, i.current_procedure_id, i.failure "
                 "FROM registry.services s LEFT JOIN registry.service_instances i "
                 "ON i.service_id=s.id WHERE s.id=%s", (str(service_id),)
             ).fetchone()
@@ -656,7 +656,11 @@ def prepare_registration(
         return {"service_id": str(sid), "procedure_id": str(new_procedure_id),
                 "task_id": task_id, "owner_api_user_id": str(owner_id),
                 "username": username, "label": str(label), "replayed": False,
-                "created_service": current is None}
+                "created_service": current is None,
+                # The cancel/abort path reverts an existing card to the status
+                # (and failure) it had before this task set it building (R6.1).
+                "previous_status": status,
+                "previous_failure": (current or {}).get("failure") if current else None}
 
 
 def abort_new_registration(service_id: str, task_id: str, *, created: bool) -> None:
@@ -672,6 +676,109 @@ def abort_new_registration(service_id: str, task_id: str, *, created: bool) -> N
             conn.execute("DELETE FROM registry.service_basic WHERE service_id=%s", (service_id,))
             conn.execute("DELETE FROM registry.service_instances WHERE service_id=%s", (service_id,))
             conn.execute("DELETE FROM registry.services WHERE id=%s", (service_id,))
+
+
+def restore_projection(
+    *, service_id: str, previous_status: str | None,
+    previous_failure: dict | None = None, reason: str = "cancelled before it started",
+) -> None:
+    """Undo a reserved identity change without touching runtime resources.
+
+    A waiting (queued/planned) deploy of an EXISTING instance changed only the
+    registry row to `building`; cancelling it must revert that row and leave the
+    running containers alone (R6.1).
+    """
+    restore = previous_status or "failed"
+    failure = previous_failure if restore == "failed" else None
+    if restore == "failed" and not failure:
+        failure = {"error": reason}
+    try:
+        with db.connection() as conn:
+            registry.update_instance(
+                conn, service_id, status=restore, failure=failure,
+                previous_status=None, previous_failure=None,
+            )
+    except Exception:  # noqa: BLE001 — the row write must not mask the cancel
+        logging.getLogger(__name__).exception(
+            "restore_projection failed for %s", service_id)
+
+
+def compensate(
+    *,
+    service_id: str,
+    operation: str = "",
+    creation: bool = False,
+    previous_status: str | None = None,
+    previous_failure: dict | None = None,
+    reason: str = "cancelled or interrupted",
+    nginx_container: str = "subnet-acl-nginx",
+) -> dict[str, Any]:
+    """Runtime-only compensating cleanup after a cancel/timeout/restart (R6.2).
+
+    Removes the containers and network the instance row names, and restores the
+    registry projection (a card-creating task loses its identity; an existing
+    instance returns to the status it had before the task). Generated files —
+    source-project and rendered — are NEVER deleted here (the house rule); the
+    one historical exception (a stale per-instance stream conf) is deliberately
+    not applied on the abort path.
+    """
+    _log_ = logging.getLogger(__name__)
+    entry = registry.get_service_by_id(service_id)
+    if not entry:
+        return {"service_id": service_id, "cleaned": False, "reason": "no instance"}
+    net = entry.get("network_name") or ""
+    compose_file = entry.get("compose_file_path") or ""
+    status = entry.get("status")
+
+    # 1. Runtime resources: containers and the instance network. Only when the
+    # task was actually changing them (a create, or an instance still building/
+    # deleting); a cancel of waiting work must never stop a running service.
+    tearing_down = creation or status in ("building", "deleting")
+    if tearing_down:
+        try:
+            if compose_file and Path(compose_file).exists():
+                docker_ops.compose_down(
+                    compose_file, project_name=net or None, remove_volumes=False,
+                    profiles=list(entry.get("profiles") or []) or None,
+                )
+            elif net:
+                docker_ops.compose_down_by_project(net, remove_volumes=False)
+        except Exception:  # noqa: BLE001 — best effort; the row records the outcome
+            _log_.exception("compensating compose down failed for %s", service_id)
+    if net and tearing_down:
+        try:
+            docker_ops.network_disconnect(nginx_container, net)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            docker_ops.orphan_network_cleanup(net, nginx_container)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # 2. Registry projection.
+    try:
+        if creation:
+            with db.connection() as conn:
+                conn.execute("DELETE FROM registry.service_endpoints WHERE service_id=%s",
+                             (service_id,))
+                conn.execute("DELETE FROM registry.service_basic WHERE service_id=%s",
+                             (service_id,))
+                conn.execute("DELETE FROM registry.service_instances WHERE service_id=%s",
+                             (service_id,))
+                conn.execute("DELETE FROM registry.services WHERE id=%s", (service_id,))
+        else:
+            restore = previous_status or "failed"
+            failure = previous_failure if restore == "failed" else None
+            if restore == "failed" and not failure:
+                failure = {"error": reason}
+            with db.connection() as conn:
+                registry.update_instance(
+                    conn, service_id, status=restore, failure=failure,
+                    previous_status=None, previous_failure=None,
+                )
+    except Exception:  # noqa: BLE001 — never let the cleanup mask the task result
+        _log_.exception("compensating registry restore failed for %s", service_id)
+    return {"service_id": service_id, "cleaned": True, "operation": operation}
 
 
 def register_user(

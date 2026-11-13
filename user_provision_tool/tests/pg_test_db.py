@@ -37,6 +37,8 @@ MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "db" / "migrations"
 
 REGISTRY_TABLES = [
     "registry.tasks",
+    "registry.queue_config",
+    "registry.queue_state",
     "registry.service_basic",
     "registry.service_endpoints",
     "registry.service_instances",
@@ -112,11 +114,23 @@ def apply_registry_migrations() -> list[str]:
 
 
 def truncate() -> None:
-    """Empty every registry table and restart identity; per-test isolation."""
+    """Empty every registry table and restart identity; per-test isolation.
+
+    The queue's singleton rows are re-seeded so every test starts with the
+    documented defaults and a fresh planner heartbeat (a missing heartbeat is
+    the real ``queue_unavailable`` condition and must not leak into a test).
+    """
     _assert_test_db(TEST_DB)
     with psycopg.connect(registry_url(), autocommit=True) as conn:
         conn.execute(
             "TRUNCATE " + ", ".join(REGISTRY_TABLES) + " RESTART IDENTITY CASCADE"
+        )
+        conn.execute(
+            "INSERT INTO registry.queue_config (id) VALUES (1) ON CONFLICT (id) DO NOTHING"
+        )
+        conn.execute(
+            "INSERT INTO registry.queue_state (id, last_dispatch_at) VALUES (1, now()) "
+            "ON CONFLICT (id) DO NOTHING"
         )
 
 

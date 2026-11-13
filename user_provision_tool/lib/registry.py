@@ -84,12 +84,22 @@ SELECT s.id                AS service_id,
        i.tls,
        i.extra_resolver,
        i.extra_network,
-       (SELECT t.task_id FROM registry.tasks t
-         WHERE t.procedure_id = i.current_procedure_id
-         ORDER BY t.created_at DESC, t.task_id DESC LIMIT 1) AS task_id
+       t.task_id,
+       t.status      AS task_status,
+       t.kind        AS task_kind,
+       t.plan_seq    AS task_plan_seq,
+       t.started_at  AS task_started_at,
+       t.finished_at AS task_finished_at
   FROM registry.services s
   JOIN registry.api_users a ON a.id = s.owner_api_user_id
   LEFT JOIN registry.service_instances i ON i.service_id = s.id
+  LEFT JOIN LATERAL (
+      SELECT tk.task_id, tk.status, tk.kind, tk.plan_seq, tk.started_at,
+             tk.finished_at
+        FROM registry.tasks tk
+       WHERE tk.procedure_id = i.current_procedure_id
+       ORDER BY tk.created_at DESC, tk.task_id DESC LIMIT 1
+  ) t ON TRUE
 """
 
 
@@ -132,6 +142,13 @@ def _entry(row: dict, endpoints: list[dict], basic: dict | None) -> dict[str, An
         "recipe_path": row.get("recipe_path") or "",
         "deleted_at": row.get("deleted_at"),
         "task_id": row.get("task_id") or "",
+        # The current procedure's latest task, projected for the queue-aware
+        # card status (R8.1). NULL when the instance predates a visible task.
+        "task_status": row.get("task_status"),
+        "task_kind": row.get("task_kind"),
+        "task_plan_seq": row.get("task_plan_seq"),
+        "task_started_at": row.get("task_started_at"),
+        "task_finished_at": row.get("task_finished_at"),
         "http_endpoints": [e["served_name"] for e in endpoints if e["kind"] == "http"],
         "stream_sub_services": [e["served_name"] for e in endpoints if e["kind"] == "stream"],
     }

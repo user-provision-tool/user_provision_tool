@@ -41,7 +41,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 from lib import db, docker_ops, provisioner, reconciliation, registry, resolv_conf, stream_access, subnet_manager, template_engine, validation
 from lib.compose_converter import compose_file_to_template, get_compose_service_names
 from lib.nginx_converter import nginx_file_to_template
-from lib.task_manager import TaskCapacityError, task_manager
+from lib.task_manager import (
+    QueueFullError, QueueUnavailableError, TaskCapacityError, task_manager,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -408,8 +410,9 @@ async def lifespan(app: FastAPI):
         # exists without it, refuse rather than generate a replacement key.
         from lib import keys as _keys
         _keys.ensure_for_startup(registry.encrypted_basic_count())
-        # A runner does not survive a restart: live rows become `unknown`, and
-        # the recovery sweep terminalizes them `failed` (R4.2/R6.6).
+        # The bounded queue survives a restart: `queued`/`planned` rows stay and
+        # only `running` rows are failed ("interrupted by restart"), with the
+        # runtime-only compensating cleanup (R2.2/R10.1).
         task_manager.recover_on_startup()
         _log.info("registry database ready")
     except Exception:
@@ -434,6 +437,10 @@ async def lifespan(app: FastAPI):
             _log.info("terminalized %d unknown task(s) as failed", terminalized)
     except Exception:
         _log.exception("Task recovery failed")
+    # T2/T3 — the serialized planner and the worker pool. Started after the
+    # recovery so no worker can claim a row the recovery sweep is rewriting.
+    task_manager.start()
+    print("[provision-api] task queue planner and workers started", flush=True)
     # Fail-closed policy refresh even when recovery failed: write the file from
     # the current network and reload only if the content changed. With no file
     # the stream context's static `deny all;` already applies.
@@ -480,6 +487,10 @@ async def lifespan(app: FastAPI):
     print("[provision-api] extra-resolver restart monitor started", flush=True)
     yield
     try:
+        task_manager.stop()
+    except Exception:
+        pass
+    try:
         _db.close_pool()
     except Exception:
         pass
@@ -488,21 +499,42 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="User Provision Tool", version="1.0.0", lifespan=lifespan)
 
 
-@app.exception_handler(TaskCapacityError)
-async def _capacity_refusal_handler(request, exc: TaskCapacityError):
-    """A saturated pool must NOT look like an accepted task (doc §4d).
-
-    Without this, every submit site would 202 a task id that waits forever.
-    A distinct non-2xx lets the gateway propagate it and the dashboard branch
-    on it and show the persistent at-capacity alert.
-    """
+@app.exception_handler(QueueFullError)
+async def _queue_full_handler(request, exc: QueueFullError):
+    """20 queued admitted, the 21st refused — and no row is written (R1.1)."""
     return JSONResponse(
         status_code=503,
         content={
             "detail": str(exc),
-            "error": "at_capacity",
-            "running": exc.running,
+            "error": "queue_full",
+            "queued": exc.queued,
             "capacity": exc.capacity,
+        },
+    )
+
+
+@app.exception_handler(QueueUnavailableError)
+async def _queue_unavailable_handler(request, exc: QueueUnavailableError):
+    """A stale planner heartbeat refuses rather than accepting dead work (R1.3)."""
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": str(exc),
+            "error": "queue_unavailable",
+            "heartbeat_age_s": exc.age_s,
+            "stale_after_s": exc.stale_after_s,
+        },
+    )
+
+
+@app.exception_handler(TaskCapacityError)
+async def _capacity_refusal_handler(request, exc: TaskCapacityError):
+    """Legacy capacity refusal (kept for callers of the pre-queue contract)."""
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": str(exc),
+            "error": getattr(exc, "reason", "at_capacity"),
         },
     )
 
@@ -1128,6 +1160,10 @@ def register_user(
     )
 
     # --- Reserve the identity BEFORE 202 (R6.1) --------------------------------
+    # Admission FIRST (R1.1/R1.3): a full queue or a stale planner refuses
+    # before any identity is created, so a refusal leaves nothing behind.
+    if not sync:
+        task_manager.admit()
     task_id = task_manager.new_task_id()
     try:
         prepared = provisioner.prepare_registration(
@@ -1160,7 +1196,9 @@ def register_user(
     label = prepared["label"]
 
     if sync:
-        # Backward-compatible blocking call
+        # Backward-compatible blocking call: claim the row immediately so the
+        # planner can never plan work this request is already executing.
+        task_manager.mark_running_now(task_id)
         try:
             result = provisioner.register_user(**prov_kwargs)
         except ValueError as e:
@@ -1191,9 +1229,14 @@ def register_user(
             procedure_id=submit_procedure_id,
             service_id=submit_service_id,
             persist=False,
+            created_service=prepared.get("created_service", False),
+            previous_status=prepared.get("previous_status"),
+            previous_failure=prepared.get("previous_failure"),
             **submit_kwargs,
         )
-    except TaskCapacityError:
+    except (QueueFullError, QueueUnavailableError):
+        # The admission pre-check passed but the queue filled in between: the
+        # reserved identity must not survive a refusal (R1.1).
         provisioner.abort_new_registration(
             prepared["service_id"], task_id, created=prepared.get("created_service", False)
         )
@@ -1370,6 +1413,8 @@ def _insert_sync_task(task_type: str, procedure_id: str, service_id: str,
             conn, task_id=task_id, procedure_id=uuid.UUID(procedure_id),
             service_id=uuid.UUID(service_id), kind=kind, operation=operation or op,
         )
+    # Blocking (sync=true) work never enters the plan.
+    task_manager.mark_running_now(task_id)
     return task_id
 
 
@@ -1466,8 +1511,15 @@ def delete_instance_route(
         task_manager.finish(task_id, "completed")
         return {"service_id": service_id, "task_id": task_id, "scope": scope,
                 "status": "completed"}
+    entry = registry.get_service_by_id(service_id) or {}
+    # Point the instance at the queued task so the card shows `queued`/`planned`
+    # (R8.1); the worker later takes the same procedure over.
+    with db.connection() as conn:
+        registry.update_instance(
+            conn, service_id, current_procedure_id=uuid.UUID(procedure_id))
     task_id = task_manager.submit(
         task_type, fn, procedure_id=procedure_id, service_id=service_id,
+        previous_status=entry.get("status"), previous_failure=entry.get("failure"),
     )
     return {"service_id": service_id, "task_id": task_id, "scope": scope,
             "status": "queued"}
@@ -1513,9 +1565,14 @@ def rebuild_instance_route(
             task_manager.finish(task_id, "failed", str(e)); raise HTTPException(500, str(e))
         task_manager.finish(task_id, "completed")
         return {"service_id": service_id, "task_id": task_id, "status": "rebuilt"}
+    entry = registry.get_service_by_id(service_id) or {}
+    with db.connection() as conn:
+        registry.update_instance(
+            conn, service_id, current_procedure_id=uuid.UUID(procedure_id))
     task_id = task_manager.submit(
         "rebuild", provisioner.rebuild_user,
         procedure_id=procedure_id, service_id=service_id,
+        previous_status=entry.get("status"), previous_failure=entry.get("failure"),
         no_cache=req.no_cache, build_args=req.build_args,
     )
     return {"service_id": service_id, "task_id": task_id, "status": "queued"}
@@ -1785,13 +1842,36 @@ def get_task_status(task_id: str) -> dict[str, Any]:
 
 @app.delete("/tasks/{task_id}")
 def cancel_task(task_id: str) -> dict[str, Any]:
-    cancelled = task_manager.cancel(task_id)
-    if not cancelled:
-        task = task_manager.get(task_id)
-        if task is None:
-            raise HTTPException(404, f"Task not found: {task_id}")
+    """Cancel and settle within the per-kind cancellation timeout (R6.3).
+
+    ``queued``/``planned`` rows end immediately; a ``running`` row takes the
+    abort path and the caller waits for it to become terminal. An unsettled
+    cancel reports ``cancellation_unconfirmed`` and leaves the row visible for
+    the reconciler.
+    """
+    task = task_manager.get(task_id)
+    if task is None:
+        raise HTTPException(404, f"Task not found: {task_id}")
+    if task["status"] in ("completed", "failed", "cancelled", "unknown"):
         raise HTTPException(409, f"Task already in terminal state: {task['status']}")
-    return {"task_id": task_id, "status": "cancelled"}
+    result = task_manager.cancel_and_wait(task_id)
+    if not result.get("confirmed"):
+        result.setdefault("error", "cancellation_unconfirmed")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# GET /queue/stats — the -api's queue telemetry (R7, R9.1)
+# ---------------------------------------------------------------------------
+
+@app.get("/queue/stats")
+def queue_stats() -> dict[str, Any]:
+    """Counts, positions, per-kind estimates and the planner heartbeat.
+
+    Read-only and dashboard-authenticated at the gateway (this service is
+    internal-only); it never reports another service's queue.
+    """
+    return task_manager.stats()
 
 
 # ---------------------------------------------------------------------------
@@ -2721,6 +2801,11 @@ def _status_for_user(user_name: str, running: dict[str, str]) -> dict[str, Any]:
     entries = registry.get_user(user_name)
     healthy_services, unhealthy_services, missing_services = [], [], []
     failed_services: list[dict[str, Any]] = []
+    # One queue snapshot for the whole user (positions/ETA/heartbeat).
+    try:
+        queue_stats = task_manager.stats()
+    except Exception:  # noqa: BLE001 — a stats failure must not break the cards
+        queue_stats = {}
 
     for entry in entries:
         # A NULL column reads back as None (dict.get's default only covers a
@@ -2831,8 +2916,26 @@ def _status_for_user(user_name: str, running: dict[str, str]) -> dict[str, Any]:
                 if discovered:
                     svc["subnet"] = discovered["subnet"]
 
-        # Check if the service is currently being built
+        # Check if the service is currently being built. The queue states are
+        # projected over the instance status (R8.1): a deploy/rebuild/remove
+        # waiting in the queue reads `queued`/`planned`, not `building`, and
+        # the card can show its position/ETA.
         svc["status"] = entry.get("status", "unknown")
+        task_status = entry.get("task_status")
+        # R8.1 — the queue overlay is independent of the instance status: a
+        # rebuild/remove waiting in the queue reads `queued`/`planned` even
+        # though the instance itself is still `running`. Only lifecycle tasks
+        # are card states — a maintenance `update` (resolv.conf sync) must not
+        # flip every card to `Queued` while the cross sync runs.
+        lifecycle = entry.get("task_kind") in ("deploy", "rebuild", "remove")
+        if task_status in ("queued", "planned") and lifecycle:
+            svc["status"] = task_status
+        if task_status in ("queued", "planned", "running") and lifecycle:
+            info = (queue_stats.get("tasks") or {}).get(entry.get("task_id") or "")
+            svc["queue"] = info or {"status": task_status,
+                                    "position": None, "eta_start_s": None,
+                                    "eta_finish_s": None}
+            svc["queue"]["planner"] = queue_stats.get("heartbeat") or {}
 
         # A recorded failure is its OWN bucket (GRILLING G10 / doc §3): the
         # status comes from the registry, never from container health, so a

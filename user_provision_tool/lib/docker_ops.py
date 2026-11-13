@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -58,13 +59,36 @@ def clear_cancel_event() -> None:
 
 
 def _terminate_on_cancel(proc, cancel_event) -> None:
-    """Terminate *proc* once *cancel_event* fires, or return when it exits."""
+    """Kill the command's PROCESS GROUP once *cancel_event* fires.
+
+    `docker compose` is a CLI front-end that spawns the real work as children;
+    terminating only the direct child left the daemon-side operation running
+    (the pinned-worker symptom G92's abort rung exists to remove). The process
+    is started in its own session (``start_new_session=True``), so its group id
+    is its pid; SIGTERM first, SIGKILL after a short grace.
+    """
     while True:
         if cancel_event.wait(0.5):
             try:
-                proc.terminate()
+                pgid = os.getpgid(proc.pid)
+                os.killpg(pgid, signal.SIGTERM)
+            except ProcessLookupError:
+                return
             except Exception:
-                pass
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
             return
         if proc.poll() is not None:
             return
@@ -189,7 +213,10 @@ def _run(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
         except (ValueError, OSError):
             pass
 
-    with subprocess.Popen(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env) as proc:
+    # Its own session/process group: the cancel path kills the whole tree.
+    with subprocess.Popen(args, text=True, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, env=env,
+                          start_new_session=True) as proc:
         t_out = threading.Thread(target=_read_stdout, args=(proc.stdout,), daemon=True)
         t_err = threading.Thread(target=_read_stderr, args=(proc.stderr,), daemon=True)
         t_out.start()

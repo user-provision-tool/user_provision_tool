@@ -93,15 +93,16 @@ class TaskCapacityError(RuntimeError):
 
 
 class QueueFullError(TaskCapacityError):
-    """The bounded queue is full (20 queued): no row is written."""
+    """The lane's bounded queue is full: no row is written (G94 R4.1)."""
 
     reason = qc.ERR_QUEUE_FULL
 
-    def __init__(self, queued: int, cap: int):
+    def __init__(self, queued: int, cap: int, lane: str = qc.OPERATOR):
         self.queued = queued
         self.capacity = cap
+        self.lane = lane
         super(TaskCapacityError, self).__init__(
-            f"queue full: {queued} task(s) queued (limit {cap}); "
+            f"queue full: {queued} {lane} task(s) queued (limit {cap}); "
             "wait for work to start, or cancel a queued task"
         )
 
@@ -118,6 +119,27 @@ class QueueUnavailableError(TaskCapacityError):
             "queue unavailable: the planner heartbeat is "
             + ("missing" if age_s is None else f"{age_s:.0f}s old")
             + f" (stale after {stale_after_s}s)"
+        )
+
+
+class DuplicateUpdateError(RuntimeError):
+    """The maintenance in-flight guard found an active update for the service.
+
+    G94/R4.2: at most one queued/planned/running ``update`` row per service.
+    The caller may poll the returned task instead of submitting a duplicate; a
+    gateway sync re-checks the stored pair after it settles, so an
+    opposite-direction request is not lost.
+    """
+
+    reason = "duplicate_update"
+
+    def __init__(self, task_id: str, status: str, operation: str | None = None):
+        self.task_id = task_id
+        self.status = status
+        self.operation = operation
+        super().__init__(
+            f"an update task is already in flight for this service: "
+            f"{task_id} ({status})"
         )
 
 
@@ -193,7 +215,12 @@ class TaskManager:
     # Lifecycle
     # ------------------------------------------------------------------
     def start(self) -> None:
-        """Start the planner, the workers and the watchdog (idempotent)."""
+        """Start the planner, both lane pools and the watchdog (idempotent).
+
+        ``_max_workers`` is the per-lane ceiling (default 4), so the default
+        deployment runs four operator + four maintenance workers = the accepted
+        bound of 8 concurrent Docker operations (G94 R3.2).
+        """
         if self._started:
             return
         self._started = True
@@ -202,9 +229,11 @@ class TaskManager:
             threading.Thread(target=self._planner_loop, name="task-planner", daemon=True),
             threading.Thread(target=self._watchdog_loop, name="task-watchdog", daemon=True),
         ]
-        for idx in range(self._max_workers):
-            threads.append(threading.Thread(
-                target=self._worker_loop, name=f"task-worker-{idx}", daemon=True))
+        for lane in qc.LANES:
+            for idx in range(self._max_workers):
+                threads.append(threading.Thread(
+                    target=self._worker_loop, args=(lane,),
+                    name=f"task-worker-{lane}-{idx}", daemon=True))
         for thread in threads:
             thread.start()
             self._loops.append(thread)
@@ -248,15 +277,21 @@ class TaskManager:
         age = (_now() - last).total_seconds()
         return last, age <= int(cfg["heartbeat_stale_s"])
 
-    def _admission_check(self, conn, cfg: dict) -> None:
-        """The exact boundary: 20 queued admitted, the 21st refused, no row."""
+    def _admission_check(self, conn, cfg: dict, lane: str = qc.OPERATOR) -> None:
+        """The exact per-lane boundary: the lane's cap admitted, the next refused.
+
+        The heartbeat is one global signal (G94 R4.3): a dead planner refuses
+        both lanes, while a full lane refuses only its own submissions.
+        """
         conn.execute("SELECT pg_advisory_xact_lock(%s)", (_ADMIT_CLAIM_LOCK,))
+        limits = qc.lane_config(cfg, lane)
         queued = conn.execute(
             "SELECT count(*) AS n FROM registry.tasks "
-            "WHERE status='queued' AND deleted_at IS NULL"
+            "WHERE status='queued' AND lane=%s AND deleted_at IS NULL",
+            (lane,),
         ).fetchone()["n"]
-        if queued >= int(cfg["queue_cap"]):
-            raise QueueFullError(queued, int(cfg["queue_cap"]))
+        if queued >= int(limits["cap"]):
+            raise QueueFullError(queued, int(limits["cap"]), lane)
         last = conn.execute(
             "SELECT last_dispatch_at FROM registry.queue_state WHERE id=1"
         ).fetchone()
@@ -268,10 +303,10 @@ class TaskManager:
         if age > stale:
             raise QueueUnavailableError(age, stale)
 
-    def admit(self) -> None:
+    def admit(self, lane: str = qc.OPERATOR) -> None:
         """Check the admission boundary without writing (register pre-check)."""
         with db.connection() as conn:
-            self._admission_check(conn, self.config())
+            self._admission_check(conn, self.config(), lane)
 
     # ------------------------------------------------------------------
     # Persistence
@@ -282,7 +317,8 @@ class TaskManager:
     def _update(self, task_id: str, **fields: Any) -> None:
         allowed = {"status", "phase", "progress", "error", "log_ref", "result",
                    "deleted_at", "updated_at", "request", "plan_seq",
-                   "started_at", "finished_at", "cancel_requested_at"}
+                   "started_at", "finished_at", "cancel_requested_at",
+                   "restart_count"}
         sets, vals = [], []
 
         from psycopg.types.json import Jsonb
@@ -306,23 +342,54 @@ class TaskManager:
         db.execute(f"UPDATE registry.tasks SET {','.join(sets)} WHERE task_id=%s", tuple(vals))
 
     def recover_on_startup(self) -> int:
-        """A restart fails ONLY ``running`` rows; the queue survives (R2.2).
+        """Recover per lane; the queue survives (G94 R6, D7).
 
-        The runtime resources those rows created are cleaned up afterwards by
-        the compensating cleanup. ``queued``/``planned`` rows are the durable
-        backlog and are left for the planner and workers.
+        Operator ``running`` rows are FAILED "interrupted by restart" with the
+        runtime-only cleanup — a half-built deploy cannot be safely resumed.
+        Maintenance ``running`` rows are requeued to ``planned`` (their
+        ``plan_seq`` kept, timestamps cleared, ``restart_count`` incremented)
+        because ``resolv_conf.apply_service``/``clear_service`` are convergent;
+        a row carrying ``cancel_requested_at`` is settled CANCELLED instead and
+        never enters a plan. After 5 requeues the row fails ("restart recovery
+        exhausted") rather than crash-looping forever (§10).
+        ``queued``/``planned`` rows in both lanes are left untouched.
         """
+        failed = 0
         rows = db.fetch_all(
-            "SELECT task_id FROM registry.tasks WHERE status='running' AND deleted_at IS NULL"
+            "SELECT task_id FROM registry.tasks "
+            "WHERE status='running' AND lane='operator' AND deleted_at IS NULL"
         )
         for row in rows:
             self._update(row["task_id"], status=qc.FAILED,
                          error="interrupted by restart", finished_at=_now())
+            failed += 1
             try:
                 self.compensating_cleanup(row["task_id"])
             except Exception:  # noqa: BLE001 — cleanup is best-effort, never fatal
                 _log.exception("restart cleanup failed for %s", row["task_id"])
-        return len(rows)
+        maintenance = db.fetch_all(
+            "SELECT task_id, restart_count, cancel_requested_at FROM registry.tasks "
+            "WHERE status='running' AND lane='maintenance' AND deleted_at IS NULL"
+        )
+        for row in maintenance:
+            if row.get("cancel_requested_at") is not None:
+                # The operator's cancel is the last word: settle it here, so the
+                # row can never enter a plan after the restart (D7).
+                self._update(row["task_id"], status=qc.CANCELLED,
+                             error="cancelled by operator (restarted)",
+                             finished_at=_now())
+                continue
+            count = int(row.get("restart_count") or 0) + 1
+            if count >= 5:
+                self._update(row["task_id"], status=qc.FAILED,
+                             error="restart recovery exhausted",
+                             restart_count=count, finished_at=_now())
+                failed += 1
+                continue
+            self._update(row["task_id"], status=qc.PLANNED, restart_count=count,
+                         started_at=None, finished_at=None, error=None,
+                         progress="requeued after restart")
+        return failed
 
     def terminalize_unknown(self, reason: str = "interrupted by restart") -> int:
         rows = db.fetch_all("SELECT task_id FROM registry.tasks WHERE status='unknown'")
@@ -374,6 +441,7 @@ class TaskManager:
         """
         task_id = task_id or new_task_id()
         kind, operation = KIND_BY_TYPE.get(task_type, ("deploy", task_type))
+        lane = qc.lane_for_kind(kind)
         log_file = str(self._log_dir / f"task-{task_id}.log")
         # Callables that take the identity get it from the submit call (the
         # register handler passes the reserved service/procedure ids here, not
@@ -399,13 +467,27 @@ class TaskManager:
 
         cfg = self.config()
         with db.connection() as conn:
-            self._admission_check(conn, cfg)
+            self._admission_check(conn, cfg, lane)
+            # The maintenance in-flight guard (G94 R4.2): one queued/planned/
+            # running `update` row per service. The caller polls the existing
+            # task; a gateway sync re-checks the stored pair after it settles.
+            if lane == qc.MAINTENANCE and service_id:
+                active = conn.execute(
+                    "SELECT task_id, status, operation FROM registry.tasks "
+                    "WHERE service_id=%s AND lane=%s AND deleted_at IS NULL "
+                    "AND status IN ('queued','planned','running') "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (str(service_id), qc.MAINTENANCE),
+                ).fetchone()
+                if active:
+                    raise DuplicateUpdateError(
+                        active["task_id"], active["status"], active.get("operation"))
             proc = uuid.UUID(str(procedure_id)) if procedure_id else uuid.uuid4()
             if persist:
                 registry.insert_task(
                     conn, task_id=task_id, procedure_id=proc,
                     service_id=uuid.UUID(str(service_id)) if service_id else None,
-                    kind=kind, operation=operation, request=descriptor,
+                    kind=kind, operation=operation, request=descriptor, lane=lane,
                 )
                 conn.execute(
                     "UPDATE registry.tasks SET log_ref=%s WHERE task_id=%s",
@@ -560,6 +642,7 @@ class TaskManager:
             "service_id": str(row["service_id"]) if row["service_id"] else None,
             "executor": row["executor"],
             "kind": row["kind"],
+            "lane": row.get("lane") or qc.lane_for_kind(row["kind"]),
             "operation": row["operation"],
             "type": row["operation"],
             "status": row["status"],
@@ -569,6 +652,7 @@ class TaskManager:
             "log_ref": row["log_ref"],
             "result": row["result"],
             "plan_seq": row.get("plan_seq"),
+            "restart_count": row.get("restart_count", 0),
             "started_at": row["started_at"].isoformat() if row.get("started_at") else None,
             "finished_at": row["finished_at"].isoformat() if row.get("finished_at") else None,
             "cancel_requested_at": (row["cancel_requested_at"].isoformat()
@@ -606,7 +690,13 @@ class TaskManager:
         )
 
     def planner_tick(self) -> None:
-        """Beat, then (under the plan lock) form a plan if the plan is empty."""
+        """Beat, then form each lane's plan independently (G94 R2).
+
+        Two plans with separate exhaustion triggers: a full operator plan is
+        not an input to the maintenance decision, and vice versa. Each lane
+        records its own last-plan time so a stuck lane is distinguishable from
+        a dead planner.
+        """
         cfg = self.config()
         planner_id = f"{os.getpid()}"
         with db.connection() as conn:
@@ -617,42 +707,72 @@ class TaskManager:
                 # Another process is planning; its heartbeat covers this tick.
                 return
             self._touch_heartbeat(conn, planner_id)
-            planned = conn.execute(
-                "SELECT count(*) AS n FROM registry.tasks "
-                "WHERE status='planned' AND deleted_at IS NULL"
-            ).fetchone()["n"]
-            if planned:
-                return  # the plan is not refilled (D2)
-            self._write_plan(conn, cfg)
+            planned = {
+                lane: conn.execute(
+                    "SELECT count(*) AS n FROM registry.tasks "
+                    "WHERE status='planned' AND lane=%s AND deleted_at IS NULL",
+                    (lane,),
+                ).fetchone()["n"]
+                for lane in qc.LANES
+            }
+            for lane in qc.LANES:
+                if planned[lane]:
+                    continue  # this lane's plan is not refilled (D2)
+                self._write_plan(conn, cfg, lane)
+                # Fresh while the lane is exhausted; a lane with planned rows
+                # stops advancing — that is what makes a stuck lane visible.
+                self._touch_lane_plan(conn, lane)
 
-    def _write_plan(self, conn, cfg: dict) -> int:
-        rows = conn.execute(
-            "SELECT t.task_id, t.created_at, "
-            "       COALESCE(u.username, '') AS user_key "
-            "FROM registry.tasks t "
-            "LEFT JOIN registry.services s ON s.id = t.service_id "
-            "LEFT JOIN registry.api_users u ON u.id = s.owner_api_user_id "
-            "WHERE t.status='queued' AND t.deleted_at IS NULL "
-            # The register path reserves its row before the request descriptor
-            # is written; a row without one is not yet executable and must not
-            # enter a plan (its submit() follows in the same request).
-            "AND t.request IS NOT NULL "
-            "ORDER BY t.created_at, t.task_id"
-        ).fetchall()
+    def _touch_lane_plan(self, conn, lane: str) -> None:
+        column = ("last_plan_maintenance_at" if lane == qc.MAINTENANCE
+                  else "last_plan_operator_at")
+        conn.execute(
+            f"UPDATE registry.queue_state SET {column}=now(), updated_at=now() WHERE id=1"
+        )
+
+    def _write_plan(self, conn, cfg: dict, lane: str = qc.OPERATOR) -> int:
+        limits = qc.lane_config(cfg, lane)
+        plan_size = int(limits["plan_size"])
+        if lane == qc.MAINTENANCE:
+            # FIFO by enqueue time: no window, no per-user fairness (D1).
+            rows = conn.execute(
+                "SELECT task_id, created_at, '' AS user_key FROM registry.tasks "
+                "WHERE status='queued' AND lane=%s AND deleted_at IS NULL "
+                "AND request IS NOT NULL AND cancel_requested_at IS NULL "
+                "ORDER BY created_at, task_id LIMIT %s",
+                (lane, plan_size),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT t.task_id, t.created_at, "
+                "       COALESCE(u.username, '') AS user_key "
+                "FROM registry.tasks t "
+                "LEFT JOIN registry.services s ON s.id = t.service_id "
+                "LEFT JOIN registry.api_users u ON u.id = s.owner_api_user_id "
+                "WHERE t.status='queued' AND t.lane=%s AND t.deleted_at IS NULL "
+                # The register path reserves its row before the request
+                # descriptor is written; a row without one is not yet
+                # executable and must not enter a plan (its submit follows in
+                # the same request).
+                "AND t.request IS NOT NULL AND t.cancel_requested_at IS NULL "
+                "ORDER BY t.created_at, t.task_id",
+                (lane,),
+            ).fetchall()
         if not rows:
             return 0
-        plan_size = int(cfg["plan_size"])
-        span = int(cfg["span_s"])
-        anchor = rows[0]["created_at"]
-        candidates = rows
-        extended = 0
-        while True:
-            horizon = anchor + _seconds(span * (extended + 1))
-            candidates = [r for r in rows if r["created_at"] < horizon]
-            if len(candidates) >= plan_size or len(candidates) >= len(rows):
-                break
-            extended += 1
-        selected = _fair_select(candidates, plan_size)
+        if lane == qc.MAINTENANCE:
+            selected = rows
+        else:
+            span = int(limits["span_s"])
+            anchor = rows[0]["created_at"]
+            extended = 0
+            while True:
+                horizon = anchor + _seconds(span * (extended + 1))
+                candidates = [r for r in rows if r["created_at"] < horizon]
+                if len(candidates) >= plan_size or len(candidates) >= len(rows):
+                    break
+                extended += 1
+            selected = _fair_select(candidates, plan_size)
         for seq, row in enumerate(selected, start=1):
             conn.execute(
                 "UPDATE registry.tasks SET status='planned', plan_seq=%s, updated_at=now() "
@@ -660,18 +780,19 @@ class TaskManager:
                 (seq, row["task_id"]),
             )
         if selected:
-            _log.info("planned %d task(s) (plan_seq 1..%d)", len(selected), len(selected))
+            _log.info("planned %d %s task(s) (plan_seq 1..%d)",
+                      len(selected), lane, len(selected))
         return len(selected)
 
     # ------------------------------------------------------------------
     # Workers (consumer-only; T3/R4)
     # ------------------------------------------------------------------
-    def _worker_loop(self) -> None:
+    def _worker_loop(self, lane: str = qc.OPERATOR) -> None:
         while not self._stop.is_set():
             try:
-                row = self._claim_next()
+                row = self._claim_next(lane)
             except Exception:  # noqa: BLE001
-                _log.exception("claim failed")
+                _log.exception("claim failed for lane %s", lane)
                 row = None
             if row is None:
                 self._wake.wait(self._worker_poll_s)
@@ -684,21 +805,25 @@ class TaskManager:
             except Exception:  # noqa: BLE001 — a worker must not die
                 _log.exception("worker execution failed for %s", row["task_id"])
 
-    def _claim_next(self) -> dict | None:
+    def _claim_next(self, lane: str = qc.OPERATOR) -> dict | None:
+        """Claim the lowest ``plan_seq`` of ONE lane; lanes never mix (R3.1)."""
         cfg = self.config()
+        limits = qc.lane_config(cfg, lane)
         with db.connection() as conn:
             conn.execute("SELECT pg_advisory_xact_lock(%s)", (_ADMIT_CLAIM_LOCK,))
             running = conn.execute(
                 "SELECT count(*) AS n FROM registry.tasks "
-                "WHERE status='running' AND deleted_at IS NULL"
+                "WHERE status='running' AND lane=%s AND deleted_at IS NULL",
+                (lane,),
             ).fetchone()["n"]
-            if running >= min(int(cfg["workers"]), self._max_workers):
+            if running >= min(int(limits["workers"]), self._max_workers):
                 return None
             row = conn.execute(
                 "SELECT * FROM registry.tasks "
-                "WHERE status='planned' AND deleted_at IS NULL "
+                "WHERE status='planned' AND lane=%s AND deleted_at IS NULL "
                 "ORDER BY plan_seq NULLS LAST, created_at, task_id "
-                "LIMIT 1 FOR UPDATE SKIP LOCKED"
+                "LIMIT 1 FOR UPDATE SKIP LOCKED",
+                (lane,),
             ).fetchone()
             if not row:
                 return None
@@ -913,14 +1038,23 @@ class TaskManager:
     # Telemetry / stats (T6/R7)
     # ------------------------------------------------------------------
     def stats(self) -> dict[str, Any]:
+        """Per-lane counts, positions, ETA, pinned workers and plan times.
+
+        The top-level fields stay the OPERATOR lane (R8): the per-card
+        position/ETA is operator-only (R5.3), and a maintenance update never
+        flips a card. Both lanes' numbers are under ``lanes`` (R5.1/R5.2).
+        """
         cfg = self.config()
 
-        counts = {state: 0 for state in qc.STATES}
+        lane_counts = {
+            lane: {state: 0 for state in qc.STATES} for lane in qc.LANES
+        }
         for row in db.fetch_all(
-            "SELECT status, count(*) AS n FROM registry.tasks "
-            "WHERE deleted_at IS NULL GROUP BY status"
+            "SELECT lane, status, count(*) AS n FROM registry.tasks "
+            "WHERE deleted_at IS NULL GROUP BY lane, status"
         ):
-            counts[row["status"]] = row["n"]
+            lane = row["lane"] if row.get("lane") in lane_counts else qc.OPERATOR
+            lane_counts[lane][row["status"]] = row["n"]
 
         last, alive = self._heartbeat()
         stale_after = int(cfg["heartbeat_stale_s"])
@@ -929,20 +1063,28 @@ class TaskManager:
         medians, samples, global_median = self._kind_medians()
 
         active = db.fetch_all(
-            "SELECT task_id, kind, status, plan_seq, created_at, started_at, finished_at "
+            "SELECT task_id, kind, lane, status, plan_seq, created_at, "
+            "       started_at, finished_at "
             "FROM registry.tasks WHERE status IN ('queued','planned','running') "
             "AND deleted_at IS NULL ORDER BY created_at, task_id"
         )
-        queued_by_order = [r for r in active if r["status"] == qc.QUEUED]
-        positions = {r["task_id"]: idx for idx, r in enumerate(queued_by_order)}
-        workers = max(1, min(int(cfg["workers"]), self._max_workers))
-        tasks: dict[str, Any] = {}
+        queued_by_lane: dict[str, list[dict]] = {lane: [] for lane in qc.LANES}
+        for row in active:
+            if row["status"] == qc.QUEUED:
+                lane = row.get("lane") or qc.OPERATOR
+                queued_by_lane.setdefault(lane, []).append(row)
+        lane_tasks: dict[str, dict[str, Any]] = {lane: {} for lane in qc.LANES}
         now = _now()
         for row in active:
+            lane = row.get("lane") or qc.OPERATOR
             kind = row.get("kind") or "deploy"
             estimate = medians.get(kind, global_median) or 0.0
-            position = positions.get(row["task_id"])
+            workers = max(1, min(
+                int(qc.lane_config(cfg, lane)["workers"]), self._max_workers))
+            position = None
             if row["status"] == qc.QUEUED:
+                order = [r["task_id"] for r in queued_by_lane.get(lane, [])]
+                position = order.index(row["task_id"]) if row["task_id"] in order else None
                 start = (position or 0) / workers * estimate
                 finish = start + estimate
             elif row["status"] == qc.PLANNED:
@@ -954,9 +1096,10 @@ class TaskManager:
                     elapsed = max(0.0, (now - row["started_at"]).total_seconds())
                 start = 0.0
                 finish = max(0.0, estimate - elapsed)
-            tasks[row["task_id"]] = {
+            lane_tasks.setdefault(lane, {})[row["task_id"]] = {
                 "status": row["status"],
                 "kind": kind,
+                "lane": lane,
                 "plan_seq": row.get("plan_seq"),
                 "position": position,
                 "eta_start_s": round(start, 1),
@@ -965,26 +1108,46 @@ class TaskManager:
                 "finished_at": row["finished_at"].isoformat() if row.get("finished_at") else None,
             }
 
-        pinned = 0
+        pinned_by_lane = {lane: 0 for lane in qc.LANES}
         for row in db.fetch_all(
-            "SELECT kind, cancel_requested_at FROM registry.tasks "
+            "SELECT lane, kind, cancel_requested_at FROM registry.tasks "
             "WHERE status='running' AND cancel_requested_at IS NOT NULL "
             "AND deleted_at IS NULL"
         ):
             kind = row.get("kind") or "deploy"
+            lane = row.get("lane") or qc.OPERATOR
             limit = int(cfg.get(f"cancel_timeout_{kind}",
                                 qc.CANCEL_TIMEOUTS.get(kind, 300)))
             if (now - row["cancel_requested_at"]).total_seconds() > limit:
-                pinned += 1
+                pinned_by_lane[lane] = pinned_by_lane.get(lane, 0) + 1
 
+        state = db.fetch_one(
+            "SELECT last_plan_operator_at, last_plan_maintenance_at "
+            "FROM registry.queue_state WHERE id=1") or {}
+        lanes: dict[str, Any] = {}
+        for lane in qc.LANES:
+            limits = qc.lane_config(cfg, lane)
+            plan_at = state.get(f"last_plan_{lane}_at") or last
+            lanes[lane] = {
+                "counts": lane_counts[lane],
+                "workers": int(limits["workers"]),
+                "cap": int(limits["cap"]),
+                "plan_size": int(limits["plan_size"]),
+                "span_s": limits["span_s"],
+                "pinned_workers": pinned_by_lane.get(lane, 0),
+                "last_plan_at": plan_at.isoformat() if plan_at else None,
+                "tasks": lane_tasks.get(lane, {}),
+            }
+
+        operator = lanes[qc.OPERATOR]
         return {
             "queue": "registry",
-            "counts": counts,
-            "workers": int(cfg["workers"]),
-            "pinned_workers": pinned,
-            "cap": int(cfg["queue_cap"]),
-            "span_s": int(cfg["span_s"]),
-            "plan_size": int(cfg["plan_size"]),
+            "counts": operator["counts"],
+            "workers": operator["workers"],
+            "pinned_workers": operator["pinned_workers"],
+            "cap": operator["cap"],
+            "span_s": operator["span_s"],
+            "plan_size": operator["plan_size"],
             "heartbeat": {
                 "last_dispatch_at": last.isoformat() if last else None,
                 "age_s": None if age is None else round(age, 1),
@@ -992,12 +1155,13 @@ class TaskManager:
                 "stale_after_s": stale_after,
             },
             "planner_interval_s": int(cfg["planner_interval_s"]),
-            "tasks": tasks,
+            "tasks": operator["tasks"],
             "kinds": {
                 kind: {"median_s": round(value, 1), "samples": samples.get(kind, 0)}
                 for kind, value in medians.items()
             },
             "config": cfg,
+            "lanes": lanes,
         }
 
     def _kind_medians(self) -> tuple[dict[str, float], dict[str, int], float | None]:

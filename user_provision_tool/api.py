@@ -42,7 +42,8 @@ from lib import db, docker_ops, provisioner, reconciliation, registry, resolv_co
 from lib.compose_converter import compose_file_to_template, get_compose_service_names
 from lib.nginx_converter import nginx_file_to_template
 from lib.task_manager import (
-    QueueFullError, QueueUnavailableError, TaskCapacityError, task_manager,
+    DuplicateUpdateError, QueueFullError, QueueUnavailableError,
+    TaskCapacityError, task_manager,
 )
 
 # ---------------------------------------------------------------------------
@@ -507,6 +508,7 @@ async def _queue_full_handler(request, exc: QueueFullError):
         content={
             "detail": str(exc),
             "error": "queue_full",
+            "lane": getattr(exc, "lane", "operator"),
             "queued": exc.queued,
             "capacity": exc.capacity,
         },
@@ -1467,10 +1469,16 @@ def set_extra_resolver(service_id: str, req: ExtraResolverRequest) -> dict[str, 
     entry = registry.get_service_by_id(service_id)
     if not entry:
         raise HTTPException(404, f"Service not found: {service_id}")
-    task_id = task_manager.submit(
-        "resolv_conf_set", resolv_conf.apply_service,
-        service_id=service_id, resolver_ip=req.resolver_ip, network=req.network,
-    )
+    try:
+        task_id = task_manager.submit(
+            "resolv_conf_set", resolv_conf.apply_service,
+            service_id=service_id, resolver_ip=req.resolver_ip, network=req.network,
+        )
+    except DuplicateUpdateError as exc:
+        # G94 R4.2 — the in-flight guard deduplicates; the caller polls the
+        # existing task and re-checks the stored pair after it settles.
+        return {"service_id": service_id, "task_id": exc.task_id,
+                "status": exc.status, "deduplicated": True}
     return {"service_id": service_id, "task_id": task_id, "status": "queued"}
 
 
@@ -1480,9 +1488,13 @@ def clear_extra_resolver(service_id: str) -> dict[str, Any]:
     entry = registry.get_service_by_id(service_id)
     if not entry:
         raise HTTPException(404, f"Service not found: {service_id}")
-    task_id = task_manager.submit(
-        "resolv_conf_clear", resolv_conf.clear_service, service_id=service_id,
-    )
+    try:
+        task_id = task_manager.submit(
+            "resolv_conf_clear", resolv_conf.clear_service, service_id=service_id,
+        )
+    except DuplicateUpdateError as exc:
+        return {"service_id": service_id, "task_id": exc.task_id,
+                "status": exc.status, "deduplicated": True}
     return {"service_id": service_id, "task_id": task_id, "status": "queued"}
 
 

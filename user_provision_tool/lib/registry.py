@@ -380,12 +380,18 @@ def next_free_label(user_name: str, service_name: str) -> str:
 
 
 def insert_task(conn, *, task_id: str, procedure_id: uuid.UUID, service_id: uuid.UUID | None,
-                kind: str, operation: str, request: Any = None) -> None:
+                kind: str, operation: str, request: Any = None,
+                lane: str | None = None) -> None:
+    # The lane is derived once at insert (G94): `update` is maintenance,
+    # everything else operator. A caller may pass it explicitly, but the
+    # kind-derived value is the default and never changes afterwards.
+    if lane is None:
+        lane = "maintenance" if kind == "update" else "operator"
     conn.execute(
         "INSERT INTO registry.tasks (task_id, procedure_id, service_id, executor, kind, "
-        "operation, request, status, created_at, updated_at) "
-        "VALUES (%s,%s,%s,'api',%s,%s,%s,'queued',%s,%s)",
-        (task_id, procedure_id, service_id, kind, operation,
+        "lane, operation, request, status, created_at, updated_at) "
+        "VALUES (%s,%s,%s,'api',%s,%s,%s,%s,'queued',%s,%s)",
+        (task_id, procedure_id, service_id, kind, lane, operation,
          _jsonb(request), utcnow(), utcnow()),
     )
 

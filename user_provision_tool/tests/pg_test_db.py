@@ -129,8 +129,9 @@ def truncate() -> None:
             "INSERT INTO registry.queue_config (id) VALUES (1) ON CONFLICT (id) DO NOTHING"
         )
         conn.execute(
-            "INSERT INTO registry.queue_state (id, last_dispatch_at) VALUES (1, now()) "
-            "ON CONFLICT (id) DO NOTHING"
+            "INSERT INTO registry.queue_state (id, last_dispatch_at, "
+            "last_plan_operator_at, last_plan_maintenance_at) "
+            "VALUES (1, now(), now(), now()) ON CONFLICT (id) DO NOTHING"
         )
 
 

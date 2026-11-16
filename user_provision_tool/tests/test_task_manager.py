@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
@@ -540,13 +543,14 @@ class TestTaskManager:
             task = wait_state(tm, tid)
             assert set(task.keys()) == {
                 "task_id", "procedure_id", "service_id", "executor", "kind",
-                "operation", "type", "status", "phase", "progress", "error",
-                "log_ref", "result", "plan_seq", "started_at", "finished_at",
-                "cancel_requested_at", "target", "deleted_at", "created_at",
-                "updated_at",
+                "lane", "restart_count", "operation", "type", "status", "phase",
+                "progress", "error", "log_ref", "result", "plan_seq", "started_at",
+                "finished_at", "cancel_requested_at", "target", "deleted_at",
+                "created_at", "updated_at",
             }
             assert task["executor"] == "api"
             assert task["kind"] == "deploy"
+            assert task["lane"] == "operator"
             assert task["operation"] == "register"
             assert task["task_id"] == tid
             assert task["type"] == "register"
@@ -577,3 +581,189 @@ class TestTaskManager:
         log_dir = tmp_path / "task_logs"
         tm = TaskManager(log_dir=str(log_dir))
         assert tm.list_all() == []
+
+
+class TestTwoLanes:
+    """G94: one durable table, two independent scheduling classes."""
+
+    def test_lane_is_derived_from_kind(self):
+        from lib.task_manager import TaskManager
+
+        tm = TaskManager(max_workers=1)
+        operator = tm.submit("register", lambda **kw: None)
+        maintenance = tm.submit("resolv_conf_set", lambda **kw: None)
+        assert tm.get(operator)["lane"] == "operator"
+        assert tm.get(maintenance)["lane"] == "maintenance"
+        # Both live in the same durable table and the same state space.
+        assert tm.get(operator)["status"] == "queued"
+        assert tm.get(maintenance)["status"] == "queued"
+
+    def test_full_operator_lane_admits_maintenance(self):
+        from lib.task_manager import QueueFullError, TaskManager
+
+        set_config(queue_cap=1)
+        tm = TaskManager(max_workers=1)
+        tm.submit("test", lambda: None)
+        tid = tm.submit("resolv_conf_set", lambda: None)
+        assert tm.get(tid)["status"] == "queued"
+        with pytest.raises(QueueFullError) as caught:
+            tm.submit("test", lambda: None)
+        assert caught.value.lane == "operator"
+        assert caught.value.capacity == 1
+
+    def test_full_maintenance_lane_admits_operator(self):
+        from lib.task_manager import QueueFullError, TaskManager
+
+        set_config(queue_cap_maintenance=1)
+        tm = TaskManager(max_workers=1)
+        tm.submit("resolv_conf_set", lambda: None)
+        with pytest.raises(QueueFullError) as caught:
+            tm.submit("resolv_conf_set", lambda: None)
+        assert caught.value.lane == "maintenance"
+        assert caught.value.capacity == 1
+        tid = tm.submit("test", lambda: None)
+        assert tm.get(tid)["status"] == "queued"
+
+    def test_in_flight_guard_deduplicates_one_update_per_service(self):
+        from lib.task_manager import DuplicateUpdateError, TaskManager
+        from registry_support import add_user
+
+        service_id, _proc = add_user(
+            {"user_name": "alice", "service_name": "myapp", "label": "0"})
+        tm = TaskManager(max_workers=1)
+        first = tm.submit("resolv_conf_set", lambda **kw: None,
+                          service_id=service_id)
+        with pytest.raises(DuplicateUpdateError) as caught:
+            tm.submit("resolv_conf_clear", lambda **kw: None,
+                      service_id=service_id)
+        assert caught.value.task_id == first
+        # Once the in-flight row is terminal the next update is admitted.
+        assert tm.cancel(first) is True
+        second = tm.submit("resolv_conf_clear", lambda **kw: None,
+                           service_id=service_id)
+        assert second != first
+        assert tm.get(second)["lane"] == "maintenance"
+
+    def test_plans_are_independent_and_maintenance_is_fifo(self):
+        from lib import db
+        from lib.task_manager import TaskManager
+
+        set_config(plan_size=2, plan_size_maintenance=3)
+        tm = TaskManager(max_workers=1)  # not started: rows stay queued/planned
+        o1 = tm.submit("test", lambda: None)
+        m1 = tm.submit("resolv_conf_set", lambda: None)
+        o2 = tm.submit("test", lambda: None)
+        m2 = tm.submit("resolv_conf_set", lambda: None)
+        m3 = tm.submit("resolv_conf_set", lambda: None)
+        o3 = tm.submit("test", lambda: None)
+        tm.planner_tick()
+        rows = db.fetch_all(
+            "SELECT task_id, lane, plan_seq FROM registry.tasks "
+            "WHERE status='planned' ORDER BY lane, plan_seq")
+        operator = [r for r in rows if r["lane"] == "operator"]
+        maintenance = [r for r in rows if r["lane"] == "maintenance"]
+        # Operator keeps the G92 4-deep/fair plan at its own depth.
+        assert [r["task_id"] for r in operator] == [o1, o2]
+        assert [r["plan_seq"] for r in operator] == [1, 2]
+        # Maintenance is FIFO by enqueue time at its own depth; o3 waits for
+        # the operator plan to be exhausted, m1..m3 never wait for it.
+        assert [r["task_id"] for r in maintenance] == [m1, m2, m3]
+        assert [r["plan_seq"] for r in maintenance] == [1, 2, 3]
+
+    def test_claims_are_lane_filtered(self):
+        from lib.task_manager import TaskManager
+
+        set_config(plan_size=1, plan_size_maintenance=1)
+        tm = TaskManager(max_workers=1)
+        operator = tm.submit("test", lambda: None)
+        maintenance = tm.submit("resolv_conf_set", lambda: None)
+        tm.planner_tick()
+        claimed = tm._claim_next("maintenance")
+        assert claimed["task_id"] == maintenance
+        assert tm._claim_next("maintenance") is None  # per-lane bound
+        claimed = tm._claim_next("operator")
+        assert claimed["task_id"] == operator
+
+    def test_restart_fails_operator_and_requeues_maintenance(self):
+        import uuid
+
+        from lib import db
+        from lib.task_manager import TaskManager
+
+        tm = TaskManager(max_workers=1)
+        now = datetime.now(timezone.utc)
+        rows = [
+            ("api-op-run", "operator", "register", None, 2),
+            ("api-mt-run", "maintenance", "resolv_conf_set", None, 1),
+            ("api-mt-cancel", "maintenance", "resolv_conf_set", now, 1),
+        ]
+        with db.connection() as conn:
+            for task_id, lane, operation, cancel_at, plan_seq in rows:
+                conn.execute(
+                    "INSERT INTO registry.tasks (task_id, procedure_id, service_id, "
+                    "executor, kind, lane, operation, status, plan_seq, created_at, "
+                    "updated_at, started_at, cancel_requested_at) "
+                    "VALUES (%s,%s,NULL,'api',%s,%s,%s,'running',%s,%s,%s,%s,%s)",
+                    (task_id, uuid.uuid4(),
+                     "update" if lane == "maintenance" else "deploy",
+                     lane, operation, plan_seq, now, now, now, cancel_at),
+                )
+        failed = tm.recover_on_startup()
+        assert failed == 1
+        operator = tm.get("api-op-run")
+        assert operator["status"] == "failed"
+        assert "interrupted by restart" in operator["error"]
+        requeued = tm.get("api-mt-run")
+        assert requeued["status"] == "planned"
+        assert requeued["plan_seq"] == 1
+        assert requeued["started_at"] is None and requeued["finished_at"] is None
+        assert requeued["progress"] == "requeued after restart"
+        assert requeued["restart_count"] == 1
+        cancelled = tm.get("api-mt-cancel")
+        assert cancelled["status"] == "cancelled"
+        assert "restarted" in cancelled["error"]
+
+    def test_maintenance_requeue_is_bounded(self):
+        import uuid
+
+        from lib import db
+        from lib.task_manager import TaskManager
+
+        tm = TaskManager(max_workers=1)
+        now = datetime.now(timezone.utc)
+        with db.connection() as conn:
+            conn.execute(
+                "INSERT INTO registry.tasks (task_id, procedure_id, service_id, "
+                "executor, kind, lane, operation, status, restart_count, created_at, "
+                "updated_at, started_at) "
+                "VALUES ('api-mt-loop',%s,NULL,'api','update','maintenance',"
+                "'resolv_conf_set','running',4,%s,%s,%s)",
+                (uuid.uuid4(), now, now, now),
+            )
+        assert tm.recover_on_startup() == 1
+        row = tm.get("api-mt-loop")
+        assert row["status"] == "failed"
+        assert "restart recovery exhausted" in row["error"]
+        assert row["restart_count"] == 5
+
+    def test_stats_are_per_lane(self):
+        from lib.task_manager import TaskManager
+
+        set_config(workers=2, workers_maintenance=1,
+                   plan_size=1, plan_size_maintenance=1)
+        tm = TaskManager(max_workers=4)  # not started: nothing is claimed
+        operator_ids = [tm.submit("test", lambda: None) for _ in range(2)]
+        maintenance_ids = [tm.submit("resolv_conf_set", lambda: None) for _ in range(3)]
+        stats = tm.stats()
+        # The top-level fields stay the operator lane (R8/R5.3).
+        assert set(stats["tasks"]) == set(operator_ids)
+        assert stats["counts"]["queued"] == 2
+        assert stats["workers"] == 2
+        lane = stats["lanes"]["maintenance"]
+        assert lane["counts"]["queued"] == 3
+        assert lane["workers"] == 1 and lane["cap"] == 20
+        assert lane["span_s"] is None
+        assert sorted(lane["tasks"][tid]["position"] for tid in maintenance_ids) == [0, 1, 2]
+        assert all(lane["tasks"][tid]["lane"] == "maintenance"
+                   for tid in maintenance_ids)
+        assert stats["lanes"]["operator"]["last_plan_at"] is not None

@@ -1281,15 +1281,25 @@ def _purge_user_artifacts(
         _sh.rmtree(tree, ignore_errors=True)
 
 
-def _teardown_instance(entry: dict[str, Any], nginx_container: str) -> None:
-    """Stop the instance's containers and remove ONLY its stream conf(s).
+def _teardown_instance(entry: dict[str, Any], nginx_container: str) -> dict[str, Any]:
+    """Hold the stream conf(s), then stop the instance's containers.
 
-    The no-auto-delete rule (R2.6/B27): generated files, user data and named
-    volumes are preserved on both delete scopes. The one exception is the
-    per-instance stream conf — a leftover `proxy_pass` names a container that
-    no longer exists, which makes the next nginx restart fail for every service.
+    S8/G95 — the hold is the FIRST step: the active conf is renamed out of the
+    served `*.stream.conf` glob before the shared nginx is disconnected and
+    before any container stops, so no concurrent task's whole-directory reload
+    can see an upstream that is allowed to be absent.  The normal destination is
+    `.paused`; a collision takes the next `.paused.<n>` and records an alert for
+    the task.  A rename failure stops the teardown BEFORE the disconnect and the
+    stop, so the containers are untouched.  No `unlink` is part of the hold —
+    the held copy is retained as context (the no-auto-delete rule).
     """
     _log_ = logging.getLogger(__name__)
+    hold = stream_access.pause_stream_confs(entry)
+    if hold["failed"]:
+        raise RuntimeError(
+            "stream-conf hold failed before the teardown; the containers are "
+            f"untouched: {', '.join(hold['failed'])}"
+        )
     compose_file = entry.get("compose_file_path") or ""
     net = entry.get("network_name") or ""
     project_name = entry.get("network_name")
@@ -1303,23 +1313,40 @@ def _teardown_instance(entry: dict[str, Any], nginx_container: str) -> None:
     elif project_name:
         _log_.warning("Compose file %s missing — down by project %s", compose_file, project_name)
         docker_ops.compose_down_by_project(project_name, remove_volumes=False)
-    # Stream confs only.
-    by_cat = entry.get("nginx_conf_paths_by_category") or {}
-    paths = [by_cat.get("stream")] if isinstance(by_cat, dict) and by_cat.get("stream") else []
-    for fpath in (entry.get("nginx_conf_paths") or []):
-        if isinstance(fpath, str) and fpath.endswith(".stream.conf"):
-            paths.append(fpath)
-    for fpath in {p for p in paths if p}:
-        for candidate in (fpath, fpath + ".generated", fpath + stream_access.PAUSED_SUFFIX):
-            try:
-                Path(candidate).unlink(missing_ok=True)
-            except OSError:
-                pass
     if net:
         try:
             docker_ops.orphan_network_cleanup(net, nginx_container)
         except Exception:
             pass
+    return hold
+
+
+def _hold_result_fields(hold: dict[str, Any]) -> dict[str, Any]:
+    """The task-carried hold record: `hold` + `comment` when an index was used.
+
+    The shape is the contract the gateway queue stats + the Services page read:
+    ``{"index": n, "previous_paused_present": true, "alert": "<message>",
+    "existing": [{path, mtime, size}], "held_as": "<held path>",
+    "active": "<active path>"}``.  ``existing`` is the held copy (or copies)
+    that made the index necessary; ``held_as`` is the destination the active
+    conf was renamed to.  A normal hold (index 0) records nothing here.
+    """
+    alerts = list(hold.get("alerts") or [])
+    if not alerts:
+        return {}
+    first = alerts[0]
+    message = str(first.get("message") or stream_access.HOLD_ALERT_MESSAGE)
+    return {
+        "hold": {
+            "index": first.get("index"),
+            "previous_paused_present": True,
+            "alert": message,
+            "existing": list(first.get("existing") or []),
+            "held_as": first.get("held_as") or first.get("paused"),
+            "active": first.get("active"),
+        },
+        "comment": f"stream-conf hold used index {first.get('index')}: {message}",
+    }
 
 
 def remove_user(
@@ -1331,7 +1358,7 @@ def remove_user(
     procedure_id: str | None = None,
     nginx_container: str = "subnet-acl-nginx",
     recovery: bool = False,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Full service delete: `deleting` -> tombstone (R6.3).
 
     With an instance row the status moves `deleting -> gone`, remembering the
@@ -1375,7 +1402,7 @@ def remove_user(
             previous_failure=previous_failure, current_procedure_id=proc,
         )
     try:
-        _teardown_instance(entry, nginx_container)
+        hold = _teardown_instance(entry, nginx_container)
         with db.connection() as conn:
             registry.tombstone(conn, uuid.UUID(sid))
         stream_access.refresh_and_reload(nginx_container)
@@ -1387,7 +1414,8 @@ def remove_user(
             )
         raise
     return {"service_id": sid, "user_name": entry["user_name"],
-            "service_name": entry["service_name"], "label": entry["label"]}
+            "service_name": entry["service_name"], "label": entry["label"],
+            "stream_hold": hold, **_hold_result_fields(hold)}
 
 
 def remove_instance_only(
@@ -1398,7 +1426,7 @@ def remove_instance_only(
     label: str | None = None,
     procedure_id: str | None = None,
     nginx_container: str = "subnet-acl-nginx",
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Fix / instance-only delete: instance + endpoints, `services` and Basic stay.
 
     Used by the paused-fix handoff. It creates no `deleting` card state and
@@ -1415,14 +1443,15 @@ def remove_instance_only(
         raise KeyError("No deployed instance for this service.")
     if entry["status"] in ("building", "deleting"):
         raise ValueError(f"service is {entry['status']}; cannot remove its instance")
-    _teardown_instance(entry, nginx_container)
+    hold = _teardown_instance(entry, nginx_container)
     with db.connection() as conn:
         if procedure_id:
             registry.set_current_procedure(conn, uuid.UUID(sid), uuid.UUID(str(procedure_id)))
         registry.delete_instance(conn, uuid.UUID(sid))
     stream_access.refresh_and_reload(nginx_container)
     return {"service_id": sid, "user_name": entry["user_name"],
-            "service_name": entry["service_name"], "label": entry["label"]}
+            "service_name": entry["service_name"], "label": entry["label"],
+            "stream_hold": hold, **_hold_result_fields(hold)}
 
 
 def remove_user_marked(**kwargs) -> dict[str, str]:
@@ -1440,7 +1469,7 @@ def rebuild_user(
     no_cache: bool = False,
     build_args: dict[str, str] | None = None,
     nginx_container: str = "subnet-acl-nginx",
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Rebuild and restart a user's service containers.
 
     Steps
@@ -1504,10 +1533,46 @@ def rebuild_user(
         registry.update_instance(conn, sid, **fields)
     try:
         docker_ops.compose_build(compose_file, no_cache=no_cache, env_file=env_files, project_name=project_name, build_args=build_args, profiles=profiles)
-        docker_ops.compose_up(compose_file, env_file=env_files, project_name=project_name, profiles=profiles)
     except Exception as exc:
         _mark_failed(sid, "rebuild", str(exc))
         raise
+    # S8/G95 — hold the stream conf(s) immediately before `compose_up`: the
+    # containers are about to be recreated, and a concurrent whole-directory
+    # reload must not see a conf whose upstream may be absent.  A failed hold
+    # stops the rebuild before `up`, so the running containers are untouched.
+    hold = stream_access.pause_stream_confs(entry)
+    if hold["failed"]:
+        message = (
+            "stream-conf hold failed before compose up; the running containers "
+            f"are untouched: {', '.join(hold['failed'])}"
+        )
+        _mark_failed(sid, "rebuild", message)
+        raise RuntimeError(message)
+    try:
+        docker_ops.compose_up(compose_file, env_file=env_files, project_name=project_name, profiles=profiles)
+    except Exception as exc:
+        # S8 — restore the held conf BEFORE the error propagates; a failed
+        # restore is itself loud (the route stays absent, the task fails).
+        restored_on_failure = stream_access.restore_stream_confs(entry)
+        if restored_on_failure["failed"]:
+            message = (
+                f"{exc}; additionally the stream-conf restore failed, so the "
+                f"route stays absent: {', '.join(restored_on_failure['failed'])}"
+            )
+            _mark_failed(sid, "rebuild", message)
+            raise RuntimeError(message) from exc
+        _mark_failed(sid, "rebuild", str(exc))
+        raise
+    # The highest paused index comes back only when the active conf is absent;
+    # an active re-render (a concurrent deploy) wins and the held copies stay.
+    restored = stream_access.restore_stream_confs(entry)
+    if restored["failed"]:
+        message = (
+            "stream-conf restore failed after compose up; the route stays "
+            f"absent: {', '.join(restored['failed'])}"
+        )
+        _mark_failed(sid, "rebuild", message)
+        raise RuntimeError(message)
     _after_successful_transition(sid, "running")
 
     # G: a rebuild recreates the containers, and Docker may hand the same
@@ -1518,7 +1583,10 @@ def rebuild_user(
     # endpoints are registered.
     stream_access.refresh_and_reload(nginx_container)
 
-    return {"user_name": user_name, "service_name": service_name, "label": label}
+    return {"user_name": user_name, "service_name": service_name, "label": label,
+            "stream_confs_restored": len(restored["restored"]),
+            "stream_conf_conflicts": restored["conflicts"],
+            "stream_hold": hold, **_hold_result_fields(hold)}
 
 
 # ---------------------------------------------------------------------------
@@ -1670,6 +1738,9 @@ def stop_service(
         "stream_confs_already_paused": len(paused["already"]),
         "stream_conf_conflicts": paused["conflicts"],
         "stream_conf_failures": paused["failed"],
+        # S8 — an indexed hold is unexpected; the task carries it.
+        "stream_conf_alerts": paused.get("alerts", []),
+        **_hold_result_fields(paused),
     }
 
 

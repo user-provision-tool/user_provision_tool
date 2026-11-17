@@ -22,6 +22,7 @@ from __future__ import annotations
 import fcntl
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import docker_ops
@@ -36,12 +37,24 @@ LOCK_FILENAME = ".stream-access.lock"
 
 FAIL_CLOSED = "deny all;\n"
 
-# R13 — a stopped instance's stream conf leaves the served set.  The suffix is
-# outside the internal nginx's `*.stream.conf` include and outside the deploy
+# R13/S8 — a stopped instance's stream conf leaves the served set.  The suffix
+# is outside the internal nginx's `*.stream.conf` include and outside the deploy
 # panel's candidate predicate, so a paused file can neither be loaded nor
 # re-selected by accident.  It is a PAUSE, not a deletion: the registry entry
 # and the file stay, and `start_service` renames it back.
+#
+# S8 (GRILLING G95) — the hold is COLLISION-FREE.  The normal destination is
+# `<name>.stream.conf.paused`; when that name already exists (an interrupted
+# restore), the hold takes the next `<name>.stream.conf.paused.<n>` and raises
+# an alert carried by the task.  Restore takes the HIGHEST paused index only
+# when the active conf is absent; the active file wins when it exists.  No
+# `unlink` is part of the hold, and the held copies are retained as context
+# (`.paused.*` cleanup is a future feature, not part of this change).
 PAUSED_SUFFIX = ".paused"
+# The alert text a hold records when it had to use an index.  It is the signal
+# that a previous restore was lost, so it travels to the task result and (via
+# the gateway queue stats) to the Services-page notification.
+HOLD_ALERT_MESSAGE = "previous paused conf was not restored"
 
 
 def stream_conf_paths(entry: dict) -> list[Path]:
@@ -70,27 +83,124 @@ def paused_path(active: str | Path) -> Path:
     return Path(str(active) + PAUSED_SUFFIX)
 
 
-def pause_stream_confs(entry: dict) -> dict[str, object]:
-    """Rename every active stream conf to `<name>.stream.conf.paused`.
+def paused_index_path(active: str | Path, index: int) -> Path:
+    """The indexed held name: `<active>.paused.<index>` (index >= 1)."""
+    return Path(f"{active}{PAUSED_SUFFIX}.{index}")
 
-    Returns ``{"changed": [paths], "already": [paths], "failed": [paths],
-    "conflicts": [paths]}``.  A path whose paused name already exists is not
-    overwritten (the active file keeps its route and the conflict is reported);
-    a path whose active name is already absent is ``already`` — a second stop
-    is a no-op.
+
+def paused_copies(active: str | Path) -> list[tuple[int, Path]]:
+    """Every held copy of *active*, lowest index first.
+
+    Index 0 is the base `<name>.stream.conf.paused`; an explicit numeric suffix
+    sorts above it.  Only names whose suffix is a positive integer count — a
+    foreign file that merely shares the prefix is left alone.
+    """
+    active = Path(active)
+    base = paused_path(active)
+    found: list[tuple[int, Path]] = []
+    if base.exists():
+        found.append((0, base))
+    prefix = f"{active.name}{PAUSED_SUFFIX}."
+    try:
+        siblings = list(active.parent.iterdir())
+    except OSError:
+        siblings = []
+    for sibling in siblings:
+        if not sibling.name.startswith(prefix):
+            continue
+        suffix = sibling.name[len(prefix):]
+        if suffix.isdigit() and int(suffix) > 0:
+            found.append((int(suffix), sibling))
+    found.sort(key=lambda pair: pair[0])
+    return found
+
+
+def _held_copy_facts(path: Path) -> dict[str, object]:
+    """`mtime` (ISO-8601, UTC, seconds) and `size` bytes for a held copy.
+
+    The path is the fact the alert needs; the stat details are evidence for the
+    Services page.  A stat race or permission error omits them rather than
+    failing the hold.
+    """
+    try:
+        st = path.stat()
+    except OSError:
+        return {}
+    return {
+        "mtime": datetime.fromtimestamp(
+            st.st_mtime, tz=timezone.utc,
+        ).isoformat(timespec="seconds"),
+        "size": st.st_size,
+    }
+
+
+def next_paused_path(active: str | Path) -> tuple[int, Path]:
+    """The collision-free hold destination for *active* and its index.
+
+    The base `.paused` name is the normal hold (index 0).  An existing base
+    means a previous restore was lost, so the hold takes the next free
+    `.paused.<n>` (index >= 1) and the caller raises the hold alert.
+    """
+    active = Path(active)
+    base = paused_path(active)
+    if not base.exists():
+        return 0, base
+    index = 1
+    while paused_index_path(active, index).exists():
+        index += 1
+    return index, paused_index_path(active, index)
+
+
+def pause_stream_confs(entry: dict) -> dict[str, object]:
+    """Rename every active stream conf out of the served glob.
+
+    The normal destination is `<name>.stream.conf.paused` (index 0).  When a
+    paused copy already exists the hold uses the next `.paused.<n>` and records
+    an alert; the active conf is ALWAYS renamed (the collision is resolved, not
+    reported as a conflict), so no reload can see a conf whose container is
+    about to disappear.  A rename failure is ``failed`` and the caller aborts
+    before the destructive step.
+
+    Returns ``{"changed": [dest paths], "already": [active paths],
+    "failed": [active paths], "conflicts": [], "details": [{active, paused,
+    index}], "alerts": [{index, previous_paused_present, message, active,
+    paused, held_as, existing}]}``.  ``conflicts`` is kept (always empty) for
+    callers written against the fixed-suffix hold.
+
+    Only an indexed hold (index >= 1) produces an alert: it names the held
+    copy (or copies) that forced the index, each with its ``path``, ``mtime``
+    (ISO-8601, UTC, seconds) and ``size`` bytes, plus the active path and the
+    indexed destination (``paused`` and its alias ``held_as``).
     """
     changed: list[str] = []
     already: list[str] = []
     failed: list[str] = []
     conflicts: list[str] = []
+    details: list[dict[str, object]] = []
+    alerts: list[dict[str, object]] = []
     for active in stream_conf_paths(entry):
-        paused = paused_path(active)
         if not active.exists():
             already.append(str(active))
             continue
-        if paused.exists():
-            conflicts.append(str(active))
-            continue
+        index, paused = next_paused_path(active)
+        if index > 0:
+            existing = [
+                {"path": str(path), **_held_copy_facts(path)}
+                for _existing_index, path in paused_copies(active)
+            ]
+            alerts.append({
+                "index": index,
+                "previous_paused_present": True,
+                "message": HOLD_ALERT_MESSAGE,
+                "active": str(active),
+                "paused": str(paused),
+                "held_as": str(paused),
+                "existing": existing,
+            })
+            _log.warning(
+                "stream-conf hold used index %d for %s: %s",
+                index, active, HOLD_ALERT_MESSAGE,
+            )
         try:
             os.replace(active, paused)
         except OSError as exc:
@@ -98,45 +208,54 @@ def pause_stream_confs(entry: dict) -> dict[str, object]:
             failed.append(str(active))
             continue
         changed.append(str(paused))
+        details.append({"active": str(active), "paused": str(paused), "index": index})
     return {
         "changed": changed,
         "already": already,
         "failed": failed,
         "conflicts": conflicts,
+        "details": details,
+        "alerts": alerts,
     }
 
 
 def restore_stream_confs(entry: dict) -> dict[str, object]:
-    """Restore `<name>.stream.conf.paused` → `<name>.stream.conf`.
+    """Restore the HIGHEST held copy → the active name.
 
-    The ACTIVE file wins when both names exist: the paused file is neither
-    overwritten nor deleted, and the conflict is reported.  A missing paused
-    file is not an error (the instance may have had no stream conf).
+    The ACTIVE file wins when it exists: every held copy stays and the active
+    path is reported as a conflict.  Otherwise the highest paused index (the
+    base `.paused` is index 0, an explicit `.paused.<n>` sorts above it) is
+    renamed back; the older held copies stay as context.  A missing paused copy
+    is not an error (the instance may have had no stream conf).
     """
     restored: list[str] = []
     conflicts: list[str] = []
     failed: list[str] = []
     missing: list[str] = []
+    details: list[dict[str, object]] = []
     for active in stream_conf_paths(entry):
-        paused = paused_path(active)
-        if not paused.exists():
-            missing.append(str(paused))
-            continue
         if active.exists():
             conflicts.append(str(active))
             continue
+        copies = paused_copies(active)
+        if not copies:
+            missing.append(str(paused_path(active)))
+            continue
+        index, source = copies[-1]
         try:
-            os.replace(paused, active)
+            os.replace(source, active)
         except OSError as exc:
-            _log.warning("stream restore: cannot rename %s → %s: %s", paused, active, exc)
+            _log.warning("stream restore: cannot rename %s → %s: %s", source, active, exc)
             failed.append(str(active))
             continue
         restored.append(str(active))
+        details.append({"active": str(active), "paused": str(source), "index": index})
     return {
         "restored": restored,
         "conflicts": conflicts,
         "failed": failed,
         "missing": missing,
+        "details": details,
     }
 
 

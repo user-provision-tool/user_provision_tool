@@ -5534,8 +5534,9 @@ class TestVolumePurgeOnDelete:
     def test_delete_path_never_removes_volumes(self, monkeypatch):
         """R2.6/B27: generated files and named volumes are never auto-deleted.
 
-        The one exception is the per-instance stream conf, removed in
-        ``_teardown_instance`` so nginx cannot keep a dangling upstream.
+        S8/G95: the stream conf is not deleted either — ``_teardown_instance``
+        HOLDS it by rename before the disconnect/stop, and the held copy is
+        retained as context.
         """
         import inspect
         from lib import provisioner
@@ -7906,12 +7907,12 @@ class TestStreamConfPauseRestore:
         assert paused.read_text() == "paused copy\n", "the paused file is never silently deleted"
         assert result["stream_conf_conflicts"], result
 
-    def test_delete_removes_the_paused_file(self, tmp_path, monkeypatch):
+    def test_delete_holds_and_retains_the_stream_conf(self, tmp_path, monkeypatch):
+        """S8/G95 — a delete HOLDS the conf; it does not remove the held copy."""
         from lib import stream_access
 
         entry, active = self._entry(tmp_path)
         paused = stream_access.paused_path(active)
-        active.rename(paused)
         active.with_suffix(active.suffix + ".generated").write_text("")
         monkeypatch.setattr(docker_ops, "network_disconnect", lambda *a, **k: None)
         monkeypatch.setattr(docker_ops, "compose_down", lambda *a, **k: None)
@@ -7920,10 +7921,263 @@ class TestStreamConfPauseRestore:
         monkeypatch.setattr(stream_access, "refresh_and_reload", lambda _c: None)
         monkeypatch.setattr(provisioner, "_purge_user_artifacts", lambda *a, **k: None)
 
-        provisioner.remove_user(
+        result = provisioner.remove_user(
             user_name="alice", service_name="myapp", label="0", nginx_container="nginx",
         )
-        assert not paused.exists(), "a delete removes the paused copy with the instance"
+        assert not active.exists(), "the served name must leave the glob"
+        assert paused.exists(), "the held copy is retained as context"
+        assert result["stream_hold"]["changed"] == [str(paused)]
+
+
+class TestIndexedStreamConfHold:
+    """S8/G95 — the hold is collision-free and its index is an alert."""
+
+    def _entry(self, tmp_path):
+        compose = tmp_path / "docker-compose.yml"
+        compose.write_text("services: {}\n")
+        active = tmp_path / "myapp.user-alice.0.stream.conf"
+        active.write_text("server {\n    listen 7687 ssl;\n}\n")
+        entry = {
+            "user_name": "alice", "service_name": "myapp", "label": "0",
+            "compose_file_path": str(compose),
+            "network_name": "myapp-user_alice-0",
+            "env_file_path": "", "env_files": [], "profiles": [],
+            "nginx_conf_paths": [str(active)],
+            "nginx_conf_paths_by_category": {"stream": str(active)},
+        }
+        add_registry_user(entry)
+        return entry, active
+
+    def test_a_prior_paused_copy_uses_the_next_index_and_alerts(self, tmp_path, monkeypatch):
+        from lib import stream_access
+
+        entry, active = self._entry(tmp_path)
+        base = stream_access.paused_path(active)
+        base.write_text("stale hold\n")
+        # A fixed mtime makes the alert's ISO-8601 evidence deterministic.
+        os.utime(base, (1_700_000_000, 1_700_000_000))
+        monkeypatch.setattr(docker_ops, "network_disconnect", lambda *a, **k: None)
+        monkeypatch.setattr(docker_ops, "compose_down", lambda *a, **k: None)
+        monkeypatch.setattr(docker_ops, "orphan_network_cleanup", lambda *a, **k: None)
+        monkeypatch.setattr(stream_access, "refresh_and_reload", lambda _c: None)
+        monkeypatch.setattr(provisioner, "_purge_user_artifacts", lambda *a, **k: None)
+
+        result = provisioner.remove_user(
+            user_name="alice", service_name="myapp", label="0", nginx_container="nginx",
+        )
+        indexed = stream_access.paused_index_path(active, 1)
+        assert not active.exists()
+        assert base.exists() and indexed.exists(), "the active conf is renamed, never left served"
+        assert base.read_text() == "stale hold\n"
+        assert result["hold"] == {
+            "index": 1,
+            "previous_paused_present": True,
+            "alert": stream_access.HOLD_ALERT_MESSAGE,
+            "existing": [{
+                "path": str(base),
+                "mtime": "2023-11-14T22:13:20+00:00",
+                "size": len(b"stale hold\n"),
+            }],
+            "held_as": str(indexed),
+            "active": str(active),
+        }
+        assert "index 1" in result["comment"]
+
+    def test_an_indexed_alert_names_the_existing_copies_and_the_destination(self, tmp_path):
+        from lib import stream_access
+
+        entry, active = self._entry(tmp_path)
+        base = stream_access.paused_path(active)
+        first = stream_access.paused_index_path(active, 1)
+        base.write_text("stale hold\n")
+        first.write_text("older indexed hold\n")
+        os.utime(base, (1_700_000_000, 1_700_000_000))
+        os.utime(first, (1_700_000_100, 1_700_000_100))
+
+        result = stream_access.pause_stream_confs(entry)
+        held_as = stream_access.paused_index_path(active, 2)
+        assert result["details"] == [{"active": str(active), "paused": str(held_as), "index": 2}]
+        assert result["changed"] == [str(held_as)]
+        assert result["alerts"] == [{
+            "index": 2,
+            "previous_paused_present": True,
+            "message": stream_access.HOLD_ALERT_MESSAGE,
+            "active": str(active),
+            "paused": str(held_as),
+            "held_as": str(held_as),
+            "existing": [
+                {
+                    "path": str(base),
+                    "mtime": "2023-11-14T22:13:20+00:00",
+                    "size": len(b"stale hold\n"),
+                },
+                {
+                    "path": str(first),
+                    "mtime": "2023-11-14T22:15:00+00:00",
+                    "size": len(b"older indexed hold\n"),
+                },
+            ],
+        }]
+
+    def test_a_normal_hold_records_no_alert_or_hold_record(self, tmp_path):
+        from lib import stream_access
+
+        entry, active = self._entry(tmp_path)
+        result = stream_access.pause_stream_confs(entry)
+        assert result["alerts"] == []
+        assert provisioner._hold_result_fields(result) == {}
+        assert stream_access.paused_path(active).exists()
+
+    def test_the_hold_reuses_the_next_free_index(self, tmp_path):
+        from lib import stream_access
+
+        _entry, active = self._entry(tmp_path)
+        stream_access.paused_path(active).write_text("a\n")
+        stream_access.paused_index_path(active, 1).write_text("b\n")
+        result = stream_access.pause_stream_confs(_entry)
+        assert result["alerts"][0]["index"] == 2
+        assert stream_access.paused_index_path(active, 2).exists()
+
+    def test_a_rename_failure_stops_before_the_disconnect_and_the_stop(self, tmp_path, monkeypatch):
+        from lib import stream_access
+
+        entry, active = self._entry(tmp_path)
+        calls = []
+        monkeypatch.setattr(docker_ops, "network_disconnect",
+                            lambda *a, **k: calls.append("disconnect"))
+        monkeypatch.setattr(docker_ops, "compose_down",
+                            lambda *a, **k: calls.append("down"))
+        monkeypatch.setattr(stream_access.os, "replace",
+                            lambda *a, **k: (_ for _ in ()).throw(OSError("rename failed")))
+        monkeypatch.setattr(stream_access, "refresh_and_reload", lambda _c: None)
+        monkeypatch.setattr(provisioner, "_purge_user_artifacts", lambda *a, **k: None)
+
+        with pytest.raises(RuntimeError, match="hold failed"):
+            provisioner.remove_user(
+                user_name="alice", service_name="myapp", label="0",
+                nginx_container="nginx",
+            )
+        assert active.exists(), "the rename failed, so the active conf stays"
+        assert calls == [], "a failed hold must not disconnect or stop anything"
+
+    def test_restore_takes_the_highest_index_and_leaves_the_older_copy(self, tmp_path):
+        from lib import stream_access
+
+        entry, active = self._entry(tmp_path)
+        base = stream_access.paused_path(active)
+        indexed = stream_access.paused_index_path(active, 1)
+        active.rename(base)
+        indexed.write_text("newer\n")
+        result = stream_access.restore_stream_confs(entry)
+        assert result["details"][0]["index"] == 1
+        assert active.exists() and active.read_text() == "newer\n"
+        assert base.exists(), "the older held copy stays as context"
+
+    def test_restore_does_nothing_when_the_active_conf_exists(self, tmp_path):
+        from lib import stream_access
+
+        entry, active = self._entry(tmp_path)
+        stream_access.paused_path(active).write_text("held\n")
+        result = stream_access.restore_stream_confs(entry)
+        assert result["restored"] == []
+        assert result["conflicts"] == [str(active)]
+        assert active.read_text() == "server {\n    listen 7687 ssl;\n}\n"
+
+    def test_rebuild_holds_before_up_and_restores_before_the_reload(self, tmp_path, monkeypatch):
+        from lib import stream_access
+
+        entry, active = self._entry(tmp_path)
+        paused = stream_access.paused_path(active)
+        events = []
+
+        def fake_up(*a, **k):
+            events.append(("up", active.exists(), paused.exists()))
+
+        def fake_reload(_c):
+            events.append(("reload", active.exists(), paused.exists()))
+
+        monkeypatch.setattr(docker_ops, "compose_build", lambda *a, **k: None)
+        monkeypatch.setattr(docker_ops, "compose_up", fake_up)
+        monkeypatch.setattr(stream_access, "refresh_and_reload", fake_reload)
+
+        result = provisioner.rebuild_user(
+            user_name="alice", service_name="myapp", label="0", nginx_container="nginx",
+        )
+        # hold -> compose_up -> restore -> reload
+        assert [e[0] for e in events] == ["up", "reload"]
+        assert events[0][1:] == (False, True), "the conf is out of the glob during up"
+        assert events[1][1:] == (True, False), "the active name is back before the reload"
+        assert result["stream_confs_restored"] == 1
+
+    def test_failed_compose_up_restores_the_held_conf(self, tmp_path, monkeypatch):
+        from lib import stream_access
+
+        entry, active = self._entry(tmp_path)
+        paused = stream_access.paused_path(active)
+
+        def failing_up(*a, **k):
+            raise RuntimeError("compose up exploded")
+
+        monkeypatch.setattr(docker_ops, "compose_build", lambda *a, **k: None)
+        monkeypatch.setattr(docker_ops, "compose_up", failing_up)
+        monkeypatch.setattr(stream_access, "refresh_and_reload", lambda _c: None)
+
+        with pytest.raises(RuntimeError, match="compose up exploded"):
+            provisioner.rebuild_user(
+                user_name="alice", service_name="myapp", label="0",
+                nginx_container="nginx",
+            )
+        assert active.exists() and not paused.exists(), "the held conf is restored before the error"
+        assert registry.get_user("alice")[0]["status"] == "failed"
+
+    def test_a_failed_restore_fails_the_rebuild_with_the_route_absent(self, tmp_path, monkeypatch):
+        from lib import stream_access
+
+        entry, active = self._entry(tmp_path)
+        paused = stream_access.paused_path(active)
+        state = {"restore": False}
+
+        def fake_up(*a, **k):
+            state["restore"] = True  # the next os.replace is the restore
+
+        real_replace = stream_access.os.replace
+
+        def flaky_replace(src, dst):
+            if state["restore"]:
+                raise OSError("restore failed")
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(docker_ops, "compose_build", lambda *a, **k: None)
+        monkeypatch.setattr(docker_ops, "compose_up", fake_up)
+        monkeypatch.setattr(stream_access, "refresh_and_reload", lambda _c: None)
+        monkeypatch.setattr(stream_access.os, "replace", flaky_replace)
+
+        with pytest.raises(RuntimeError, match="restore failed"):
+            provisioner.rebuild_user(
+                user_name="alice", service_name="myapp", label="0",
+                nginx_container="nginx",
+            )
+        assert not active.exists() and paused.exists(), "the route stays absent"
+        assert registry.get_user("alice")[0]["status"] == "failed"
+
+    def test_a_hold_failure_stops_the_rebuild_before_compose_up(self, tmp_path, monkeypatch):
+        from lib import stream_access
+
+        entry, active = self._entry(tmp_path)
+        ups = []
+        monkeypatch.setattr(docker_ops, "compose_build", lambda *a, **k: None)
+        monkeypatch.setattr(docker_ops, "compose_up", lambda *a, **k: ups.append("up"))
+        monkeypatch.setattr(stream_access, "refresh_and_reload", lambda _c: None)
+        monkeypatch.setattr(stream_access.os, "replace",
+                            lambda *a, **k: (_ for _ in ()).throw(OSError("rename failed")))
+
+        with pytest.raises(RuntimeError, match="hold failed"):
+            provisioner.rebuild_user(
+                user_name="alice", service_name="myapp", label="0",
+                nginx_container="nginx",
+            )
+        assert ups == [], "a failed hold must not recreate the containers"
+        assert active.exists()
 
 
 # ---------------------------------------------------------------------------

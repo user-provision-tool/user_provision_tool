@@ -76,6 +76,8 @@ services:
       - SSL_DIR=${PROVISION_DIR:-/srv/provision_subnet_acl}/ssl
       - SUBNET_POOLS=${SUBNET_POOLS:-}
       - SUBNET_HEADROOM=${SUBNET_HEADROOM:-2}
+      # G101 — the injected per-instance DNS proxy reuses this image.
+      - DNS_PROXY_IMAGE=${DNS_PROXY_IMAGE:-users_provision-subnet-acl-provision-api:latest}
       # v5 (decision 1): -api does NOT read ENABLE_ACL / PORTAL_MODE — they touch
       # only the gateway and the edge -nginx-acl. The internal confs are simple.
     dns:

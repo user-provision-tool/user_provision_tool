@@ -297,6 +297,32 @@ def compose_up(
     _run(_compose_base(compose_file, env_file, project_name, profiles) + ["up", "-d"])
 
 
+def compose_create(
+    compose_file: str,
+    env_file: str | list[str] | None = None,
+    project_name: str | None = None,
+    profiles: str | list[str] | None = None,
+) -> None:
+    """``docker compose create`` — create the containers without starting them.
+
+    G102's prepare step uses this so the gateway can write the pre-start grant
+    rows before the app containers start.
+    """
+    _run(_compose_base(compose_file, env_file, project_name, profiles) + ["create"])
+
+
+def compose_up_service(
+    compose_file: str,
+    service: str,
+    env_file: str | list[str] | None = None,
+    project_name: str | None = None,
+    profiles: str | list[str] | None = None,
+) -> None:
+    """``docker compose up -d <service>`` — start one service only."""
+    _run(_compose_base(compose_file, env_file, project_name, profiles)
+         + ["up", "-d", service])
+
+
 def compose_down(
     compose_file: str,
     env_file: str | list[str] | None = None,

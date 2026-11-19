@@ -4541,7 +4541,7 @@ class TestProvisionerRegistryFields:
         assert keys.decrypt(bytes(row["secret_enc"]).decode()) == "secret123"
 
     def test_register_user_stores_subnet_field_in_registry(self):
-        """Registry entry should have subnet field (empty when SUBNET_POOLS is not set)."""
+        """Registry entry carries the tenant subnet (the default pool when none is set)."""
         provisioner.register_user(
             user_name="subnetuser",
             service_name="myapp",
@@ -4556,8 +4556,10 @@ class TestProvisionerRegistryFields:
         assert len(entries) == 1
         entry = entries[0]
         assert "subnet" in entry
-        # subnet is empty when SUBNET_POOLS is not configured
-        assert entry["subnet"] == ""
+        # G101 — no configured pool: the deterministic default tenant pool
+        # (DEFAULT_TENANT_SUBNET_POOL, 10.77.0.0/16) provides the subnet and
+        # the reserved proxy slot.
+        assert entry["subnet"].startswith("10.77.")
 
     def test_register_user_stores_hostname_with_custom_domain(self):
         """hostname should use the domain parameter."""

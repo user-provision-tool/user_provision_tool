@@ -573,8 +573,9 @@ class TestE2ESubnetAllocation:
         entry = registered_with_subnet
         assert entry["subnet"], "subnet should be allocated when SUBNET_POOLS is set"
         assert entry["gateway"].endswith(".1")
-        # 2 containers + 2 headroom + 1 gateway = 5 usable → /29 (8 addresses)
-        assert entry["subnet"].endswith("/29")
+        # 2 containers + the reserved DNS proxy + gateway + an aligned dynamic
+        # block → /28 (16 addresses, the proxy sits outside the ip_range).
+        assert entry["subnet"].endswith("/28")
 
     def test_rendered_compose_has_ipam_block(self, registered_with_subnet):
         compose_path = Path(registered_with_subnet["compose_file_path"])
@@ -716,6 +717,7 @@ class TestE2EStatus:
         monkeypatch.setattr(docker_ops, "docker_ps", lambda: [
             {"name": "myapp-user_alice-0-web", "status": "Up 2 minutes", "image": "nginx:alpine"},
             {"name": "myapp-user_alice-0-db", "status": "Up 2 minutes", "image": "postgres:16-alpine"},
+            {"name": "myapp-user_alice-0-dns-proxy", "status": "Up 2 minutes", "image": "api"},
         ])
         with patch.object(sys, "argv", ["cli/status.py", "-u", "alice"]):
             st_script.main()
@@ -870,6 +872,7 @@ class TestE2EFullLifecycle:
         monkeypatch.setattr(docker_ops, "docker_ps", lambda: [
             {"name": "myapp-user_lifecycle_user-5-web", "status": "Up", "image": ""},
             {"name": "myapp-user_lifecycle_user-5-db", "status": "Up", "image": ""},
+            {"name": "myapp-user_lifecycle_user-5-dns-proxy", "status": "Up", "image": ""},
         ])
         with patch.object(sys, "argv", ["cli/status.py", "-u", "lifecycle_user"]):
             st_script.main()

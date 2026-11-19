@@ -206,6 +206,10 @@ def render_compose(
     env_files_all: list[str] | None = None,
     subnet: str | None = None,
     gateway: str | None = None,
+    ip_range: str | None = None,
+    proxy_ip: str | None = None,
+    proxy_config_dir: str | None = None,
+    proxy_image: str | None = None,
 ) -> str | None:
     """Render a docker-compose template and write the output file.
 
@@ -338,6 +342,25 @@ def render_compose(
         # compose interpolates from.
         rendered = _rewrite_env_file_in_dict(
             rendered, env_ref_targets, Path(template_path).parent
+        )
+
+    # G101 — inject the per-instance DNS proxy and the tenant-network
+    # ip_range AFTER Jinja resolution: every value (network, prefix, proxy IP,
+    # config directory) is per-user, and the reserved address must be outside
+    # the dynamic range.  Without a subnet there is no reserved address, so the
+    # injection is skipped (the provisioner fails closed for the feature).
+    if subnet and gateway and ip_range and proxy_ip and proxy_config_dir:
+        from . import dns_proxy_config as _dpc
+        rendered = _dpc.inject_compose(
+            rendered,
+            network_name=ctx["network_name"],
+            container_prefix=prefix,
+            subnet=subnet,
+            gateway=gateway,
+            proxy_ip=proxy_ip,
+            ip_range=ip_range,
+            config_dir=proxy_config_dir,
+            image=proxy_image,
         )
 
     with open(output_path, "w") as f:

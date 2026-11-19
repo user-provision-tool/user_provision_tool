@@ -33,12 +33,12 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # Make lib/ importable when the file sits at the project root
 sys.path.insert(0, str(Path(__file__).parent))
 
-from lib import db, docker_ops, provisioner, reconciliation, registry, resolv_conf, stream_access, subnet_manager, template_engine, validation
+from lib import db, dns_proxy_config, docker_ops, provisioner, reconciliation, registry, stream_access, subnet_manager, template_engine, validation
 from lib.compose_converter import compose_file_to_template, get_compose_service_names
 from lib.nginx_converter import nginx_file_to_template
 from lib.task_manager import (
@@ -161,6 +161,15 @@ class RegisterRequest(BaseModel):
     https: bool | None = None
     fullchain: str | None = None
     privkey: str | None = None
+    # G102 — the prepare step creates the containers without starting the app,
+    # so the deploy workflow can write the pre-start grants and start after the
+    # resolver sync.  Default false: direct/CLI callers start immediately.
+    prepare: bool = False
+    # G101 — the gateway's new-deploy payload carries the cross resolver's
+    # container NAME and the cross network, so the -api configures the proxy
+    # before the app starts.
+    extra_resolver: str | None = None
+    extra_network: str | None = None
 
     @field_validator("owner_username", "user_name", "service_name")
     @classmethod
@@ -371,15 +380,15 @@ from contextlib import asynccontextmanager
 _log = logging.getLogger("provision-api")
 
 
-def _resolv_startup_pass() -> None:
-    """One re-apply over services with ``extra_resolver`` set (G83).
+def _dns_proxy_startup_pass() -> None:
+    """One re-apply over services with ``extra_resolver`` set (G101).
 
     Not a periodic reconcile: it runs once per process start, repairing a
     restart burst that happened while the -api was down. Errors are logged per
     service and never stop the pass.
     """
     try:
-        result = resolv_conf.startup_pass()
+        result = dns_proxy_config.startup_pass()
         print(
             f"[provision-api] extra-resolver startup pass: "
             f"{result['applied']} service(s) re-applied, "
@@ -475,17 +484,17 @@ async def lifespan(app: FastAPI):
     # complement of R16's reloads, which stay.
     from lib import instance_events as _instance_events
     _instance_events.start_watcher(NGINX_CONTAINER)
-    # G83 — the extra-resolver manager. The restart monitor repairs a container
-    # whose /etc/resolv.conf and membership Docker regenerated; the one-time
+    # G101 — the DNS-proxy manager.  The start-event watcher re-ensures the
+    # cross-network membership only (no /etc/resolv.conf edit); the one-time
     # startup pass repairs a burst that happened while this process was down.
-    resolv_conf.start_restart_monitor()
-    threading.Thread(target=_resolv_startup_pass, name="extra-resolver-startup",
+    dns_proxy_config.start_membership_monitor()
+    threading.Thread(target=_dns_proxy_startup_pass, name="dns-proxy-startup",
                      daemon=True).start()
     threading.Thread(target=_account_reaper_loop, name="api-users-reaper",
                      daemon=True).start()
     print(f"[provision-api] instance-container watcher started "
           f"(container={NGINX_CONTAINER})", flush=True)
-    print("[provision-api] extra-resolver restart monitor started", flush=True)
+    print("[provision-api] dns-proxy membership monitor started", flush=True)
     yield
     try:
         task_manager.stop()
@@ -1159,6 +1168,9 @@ def register_user(
         fullchain=req.fullchain,
         privkey=req.privkey,
         ssl_base_dir=str(SSL_DIR),
+        prepare=req.prepare,
+        extra_resolver=req.extra_resolver,
+        extra_network=req.extra_network,
     )
 
     # --- Reserve the identity BEFORE 202 (R6.1) --------------------------------
@@ -1440,39 +1452,49 @@ def get_instance_status(service_id: str) -> dict[str, Any]:
 
 
 class ExtraResolverRequest(BaseModel):
-    resolver_ip: str = Field(..., min_length=1)
+    # G101 — the stored value is the cross resolver's container NAME.  The
+    # legacy `resolver_ip` field is accepted as an alias for compatibility; an
+    # IP resolves to itself, so the name-based proxy path still works.
+    resolver_name: str | None = None
+    resolver_ip: str | None = None
     network: str = Field(..., min_length=1)
+
+    @model_validator(mode="after")
+    def _resolver_required(self):
+        if not (self.resolver_name or self.resolver_ip):
+            raise ValueError("resolver_name is required")
+        return self
+
+    @property
+    def name(self) -> str:
+        return (self.resolver_name or self.resolver_ip or "").strip()
 
 
 @app.get("/instances/{service_id}/extra-resolver")
 def get_extra_resolver(service_id: str) -> dict[str, Any]:
-    """The opaque per-service pair the gateway supplied (G83)."""
-    entry = registry.get_service_by_id(service_id)
-    if not entry:
+    """The proxy's stored state and its runtime projection (G101)."""
+    try:
+        return dns_proxy_config.get_state(service_id)
+    except KeyError:
         raise HTTPException(404, f"Service not found: {service_id}")
-    return {
-        "service_id": service_id,
-        "extra_resolver": entry.get("extra_resolver"),
-        "extra_network": entry.get("extra_network"),
-    }
 
 
 @app.post("/instances/{service_id}/extra-resolver", status_code=202)
 def set_extra_resolver(service_id: str, req: ExtraResolverRequest) -> dict[str, Any]:
-    """Async update: two lines + membership for **every container** (G83).
+    """Async update: write the proxy config and connect the membership (G101).
 
-    The request is addressed by source service; the ``-api`` fans it out and
-    stores the pair after every RUNNING container was updated. G91 — a service
-    with no running container still stores the pair (the restart monitor applies
-    it on start). The caller polls the returned task id.
+    The request is addressed by source service; the ``-api`` writes
+    ``dns-proxy.json`` atomically and connects the proxy and its app containers
+    to the cross network.  No ``/etc/resolv.conf`` is edited.  The caller polls
+    the returned task id.
     """
     entry = registry.get_service_by_id(service_id)
     if not entry:
         raise HTTPException(404, f"Service not found: {service_id}")
     try:
         task_id = task_manager.submit(
-            "resolv_conf_set", resolv_conf.apply_service,
-            service_id=service_id, resolver_ip=req.resolver_ip, network=req.network,
+            "dns_proxy_set", dns_proxy_config.apply_service,
+            service_id=service_id, resolver_name=req.name, network=req.network,
         )
     except DuplicateUpdateError as exc:
         # G94 R4.2 — the in-flight guard deduplicates; the caller polls the
@@ -1484,13 +1506,14 @@ def set_extra_resolver(service_id: str, req: ExtraResolverRequest) -> dict[str, 
 
 @app.delete("/instances/{service_id}/extra-resolver", status_code=202)
 def clear_extra_resolver(service_id: str) -> dict[str, Any]:
-    """Async removal: restore the default, disconnect, clear both fields."""
+    """Async removal: disable the proxy config, disconnect, clear both fields."""
     entry = registry.get_service_by_id(service_id)
     if not entry:
         raise HTTPException(404, f"Service not found: {service_id}")
     try:
         task_id = task_manager.submit(
-            "resolv_conf_clear", resolv_conf.clear_service, service_id=service_id,
+            "dns_proxy_clear", dns_proxy_config.clear_service,
+            service_id=service_id,
         )
     except DuplicateUpdateError as exc:
         return {"service_id": service_id, "task_id": exc.task_id,

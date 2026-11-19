@@ -38,6 +38,8 @@ COPY cli/ cli/
 COPY db/ db/
 COPY migrations/ migrations/
 COPY api.py ./
+# G101 R6.1 — the operator-run per-instance rollout runs inside this image.
+COPY migrate_dns_proxy.py ./
 
 EXPOSE 8000
 

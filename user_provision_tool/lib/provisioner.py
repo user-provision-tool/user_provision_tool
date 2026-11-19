@@ -8,6 +8,7 @@ duplicating it.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import uuid
 from pathlib import Path
@@ -247,6 +248,12 @@ def _register_render_and_start(
     profiles: list[str] | None,
     _subnet: str,
     _gateway: str,
+    _ip_range: str | None = None,
+    _proxy_ip: str | None = None,
+    _proxy_config_dir: str | None = None,
+    prepare: bool = False,
+    extra_resolver: str | None = None,
+    extra_network: str | None = None,
 ) -> str | None:
     """Render the per-user compose/nginx files and start the containers.
 
@@ -270,6 +277,9 @@ def _register_render_and_start(
             env_files=service_env_files or None,
             subnet=_subnet,
             gateway=_gateway,
+            ip_range=_ip_range,
+            proxy_ip=_proxy_ip,
+            proxy_config_dir=_proxy_config_dir,
         )
     except Exception as exc:
         raise DeployFailure("render", str(exc)) from exc
@@ -390,10 +400,39 @@ def _register_render_and_start(
             docker_ops.compose_build(compose_out, env_file=_env_files_used, project_name=entry["network_name"], build_args=build_args, profiles=profiles)
         except Exception as exc:
             raise DeployFailure(_stage_for(exc, "build"), str(exc)) from exc
+
+    from . import dns_proxy_config as _dpc
+
+    if prepare:
+        # G102/G101 — create the containers WITHOUT starting the app, connect
+        # the proxy/app containers to the cross network, then start the proxy
+        # alone.  The deploy workflow writes the pre-start grants and starts
+        # the app only after the resolver config has landed.
+        try:
+            docker_ops.compose_create(compose_out, env_file=_env_files_used,
+                                      project_name=entry["network_name"],
+                                      profiles=profiles)
+        except Exception as exc:
+            raise DeployFailure(_stage_for(exc, "up"), str(exc)) from exc
+        if extra_resolver and extra_network:
+            _dpc.apply_service(service_id, resolver_name=extra_resolver,
+                               network=extra_network)
+        try:
+            docker_ops.compose_up_service(
+                compose_out, _dpc.PROXY_SERVICE, env_file=_env_files_used,
+                project_name=entry["network_name"], profiles=profiles)
+        except Exception as exc:
+            raise DeployFailure(_stage_for(exc, "up"), str(exc)) from exc
+        # The instance stays `building` until the start call.
+        return copied_env
+
     try:
         docker_ops.compose_up(compose_out, env_file=_env_files_used, project_name=entry["network_name"], profiles=profiles)
     except Exception as exc:
         raise DeployFailure(_stage_for(exc, "up"), str(exc)) from exc
+    if extra_resolver and extra_network:
+        _dpc.apply_service(service_id, resolver_name=extra_resolver,
+                           network=extra_network)
     return copied_env
 
 
@@ -812,6 +851,9 @@ def register_user(
     fullchain: str | None = None,
     privkey: str | None = None,
     ssl_base_dir: str = "/provision/ssl",
+    prepare: bool = False,
+    extra_resolver: str | None = None,
+    extra_network: str | None = None,
     _task_id: str | None = None,
 ) -> dict[str, Any]:
     """Register a user and start their service containers.
@@ -1067,12 +1109,48 @@ def register_user(
     allocated = subnet_manager.allocate_subnet(
         container_count,
         allocated_subnets,
+        reserve_proxy=True,
     )
+    if allocated is None:
+        # G101 / DNS-doc §10 item 2 — with no configured pool the -api still
+        # creates a deterministic private tenant subnet; only a real allocation
+        # failure (no free block) fails closed.
+        default_pool = os.environ.get(
+            "DEFAULT_TENANT_SUBNET_POOL", "10.77.0.0/16").strip()
+        if default_pool:
+            allocated = subnet_manager.allocate_subnet(
+                container_count, allocated_subnets, reserve_proxy=True,
+                pools=[default_pool],
+            )
+    if allocated is None:
+        raise RuntimeError(
+            "tenant-network IPAM is required for the DNS proxy: no subnet "
+            "could be allocated (set SUBNET_POOLS or DEFAULT_TENANT_SUBNET_POOL)"
+        )
     # No pool => NULL, not "" (T4/R2.4): the partial UNIQUE index on subnet is
     # `WHERE subnet IS NOT NULL`, so an empty string would collide across every
     # service on a pool-less install.
     _subnet = allocated["subnet"] if allocated else None
     _gateway = allocated["gateway"] if allocated else None
+    _ip_range = allocated.get("ip_range") if allocated else None
+    _proxy_ip = allocated.get("proxy_ip") if allocated else None
+
+    # The proxy's per-instance config directory.  It is the compose mount
+    # source and lives beside the label's volume keys.
+    if _proxy_ip:
+        from . import dns_proxy_config as _dpc
+        if user_data_dir:
+            _proxy_config_dir = str(_dpc.config_dir_for(
+                user_name, service_name, label, user_data_dir))
+        else:
+            _proxy_config_dir = str(
+                Path(output_dir) / f".dns-proxy.{user_name}.{label}")
+        _dpc.write_config(
+            _proxy_config_dir, resolver_name=extra_resolver,
+            network=extra_network, proxy_ip=_proxy_ip,
+        )
+    else:
+        _proxy_config_dir = None
 
     # --- Persist the rendered-file metadata on the instance projection -------
     nginx_conf_paths = [o for _t, o in nginx_out_by_category.values()] or ([nginx_out] if nginx_out else [])
@@ -1161,6 +1239,10 @@ def register_user(
             ssl_certificate_key_path=ssl_certificate_key_path,
             build_args=build_args, profiles=profiles,
             _subnet=_subnet, _gateway=_gateway,
+            _ip_range=_ip_range, _proxy_ip=_proxy_ip,
+            _proxy_config_dir=_proxy_config_dir,
+            prepare=prepare, extra_resolver=extra_resolver,
+            extra_network=extra_network,
         )
     except RuntimeError as exc:
         # Rollback: tear down any partially-created Docker resources
@@ -1192,7 +1274,11 @@ def register_user(
         raise
 
     # --- Mark as running (containers started successfully) ---
-    _after_successful_transition(service_id, "running")
+    # A prepare deploy stays `building`: the deploy workflow writes the
+    # pre-start grants and then calls the start endpoint, which marks it
+    # running.
+    if not prepare:
+        _after_successful_transition(service_id, "running")
 
     # --- Connect provision-nginx to user network + reload ---
     net = entry["network_name"]
@@ -1598,6 +1684,157 @@ def rebuild_user(
 # Start / Stop service
 # ---------------------------------------------------------------------------
 
+def rerender_instance(
+    *,
+    service_id: str | None = None,
+    user_name: str | None = None,
+    service_name: str | None = None,
+    label: str | None = None,
+    dry_run: bool = False,
+    nginx_container: str = "subnet-acl-nginx",
+) -> dict[str, Any]:
+    """G101 R6.1 — re-render one pre-feature instance with the DNS proxy.
+
+    The operator-run rollout: allocate a tenant subnet that fits the reserved
+    proxy address and the dynamic ``ip_range``, write the proxy config, render
+    the per-user compose again, then recreate the instance (down + rebuild).
+    Idempotent: a rendered compose that already carries ``dns-proxy`` is
+    skipped.  A failure leaves the previous compose on disk (render is atomic
+    enough; the rebuild is the last step) and is reported per instance.
+    """
+    from . import dns_proxy_config as _dpc
+
+    sid = registry.resolve_service_id(
+        service_id, user_name=user_name, service_name=service_name, label=label
+    )
+    entry = registry.get_service_by_id(sid) if sid else None
+    if not entry:
+        raise KeyError("No registration found for this service.")
+    template = entry.get("compose_template_path") or ""
+    compose_file = entry.get("compose_file_path") or ""
+    if compose_file:
+        pass
+    elif template:
+        compose_file = str(
+            Path(template).parent
+            / f"docker-compose.user-{entry['user_name']}.{entry['label']}.yml")
+    if not template or not Path(template).is_file():
+        raise FileNotFoundError(f"Compose template not found: {template}")
+
+    user_name, service_name, label = (
+        entry["user_name"], entry["service_name"], str(entry["label"]))
+    env_file = entry.get("env_file_path") or None
+    env_files = list(entry.get("env_files") or [])
+    if not env_files and env_file:
+        env_files = [env_file]
+    net = entry.get("network_name")
+    profiles = list(entry.get("profiles") or []) or None
+
+    def _up_and_finish() -> None:
+        # The internal nginx is attached to every tenant network; a compose up
+        # that must recreate the network is refused while that endpoint is
+        # active.  Detach it, recreate, then reconnect and reload.
+        if net:
+            docker_ops.network_disconnect(nginx_container, str(net))
+        docker_ops.compose_up(
+            compose_file, env_file=env_files or None,
+            project_name=net or None, profiles=profiles,
+        )
+        _after_successful_transition(sid, "running")
+        if net:
+            docker_ops.network_connect(nginx_container, str(net))
+            stream_access.refresh_and_reload(nginx_container)
+        if entry.get("extra_resolver") and entry.get("extra_network"):
+            _dpc.apply_service(
+                str(sid), resolver_name=str(entry["extra_resolver"]),
+                network=str(entry["extra_network"]),
+            )
+
+    has_proxy = False
+    if compose_file and Path(compose_file).is_file():
+        try:
+            has_proxy = "dns-proxy:" in Path(compose_file).read_text()
+        except OSError:
+            has_proxy = False
+    if has_proxy:
+        # Already rendered (a previous run reached the render): this pass
+        # repairs/starts it without a rebuild — an interrupted rollout must
+        # not leave the instance down, and the image is unchanged by the
+        # migration.
+        if dry_run:
+            return {"service_id": str(sid), "skipped": False, "repair": True,
+                    "dry_run": True}
+        config_dir = _dpc.config_dir_for(user_name, service_name, label)
+        cfg = _dpc.read_config(config_dir)
+        if not cfg.get("proxy_ip"):
+            proxy_ip = _proxy_ip_from_compose(compose_file)
+            _dpc.write_config(
+                config_dir, resolver_name=entry.get("extra_resolver"),
+                network=entry.get("extra_network"), proxy_ip=proxy_ip)
+        _up_and_finish()
+        return {"service_id": str(sid), "skipped": False, "repaired": True}
+    if dry_run:
+        return {"service_id": str(sid), "skipped": False, "dry_run": True}
+
+    container_count = len(get_compose_service_names(template))
+    allocated_subnets = subnet_manager.get_allocated_subnets(registry.get_all_users())
+    allocated_subnets += subnet_manager.get_host_allocated_subnets()
+    allocated = subnet_manager.allocate_subnet(
+        container_count, allocated_subnets, reserve_proxy=True)
+    if allocated is None:
+        raise RuntimeError("tenant-network IPAM is required for the DNS proxy")
+
+    config_dir = _dpc.config_dir_for(user_name, service_name, label)
+    _dpc.write_config(config_dir, resolver_name=entry.get("extra_resolver"),
+                      network=entry.get("extra_network"),
+                      proxy_ip=allocated["proxy_ip"])
+    template_engine.render_compose(
+        template, compose_file, user_name, service_name, label,
+        dict(entry.get("volumes") or {}),
+        env_file=env_file,
+        env_files_all=env_files or None,
+        subnet=allocated["subnet"], gateway=allocated["gateway"],
+        ip_range=allocated["ip_range"], proxy_ip=allocated["proxy_ip"],
+        proxy_config_dir=str(config_dir),
+    )
+    prefix = template_engine.container_prefix(service_name, user_name, label)
+    names = [f"{prefix}{svc}" for svc in get_compose_service_names(compose_file)]
+    with db.connection() as conn:
+        registry.update_instance(
+            conn, sid, subnet=allocated["subnet"], gateway=allocated["gateway"],
+            container_names=names,
+        )
+    # Recreate the network with the new IPAM (down + up; no image rebuild —
+    # the migration changes the network, not the image).  Detach nginx first:
+    # an attached endpoint makes the network removal fail.
+    if net:
+        docker_ops.network_disconnect(nginx_container, str(net))
+    docker_ops.compose_down(
+        compose_file, env_file=env_files or None,
+        project_name=net or None, profiles=profiles,
+    )
+    _up_and_finish()
+    return {"service_id": str(sid), "skipped": False,
+            "subnet": allocated["subnet"], "proxy_ip": allocated["proxy_ip"],
+            "ip_range": allocated["ip_range"]}
+
+
+def _proxy_ip_from_compose(compose_file: str) -> str | None:
+    """The injected proxy's reserved address, read back from a rendered compose."""
+    try:
+        import yaml as _yaml
+        data = _yaml.safe_load(Path(compose_file).read_text())
+        proxy = ((data or {}).get("services") or {}).get("dns-proxy") or {}
+        nets = proxy.get("networks") or {}
+        if isinstance(nets, dict):
+            for cfg in nets.values():
+                if isinstance(cfg, dict) and cfg.get("ipv4_address"):
+                    return str(cfg["ipv4_address"])
+    except Exception:  # noqa: BLE001 — a missing value is reported by the config
+        return None
+    return None
+
+
 def start_service(
     *,
     service_id: str | None = None,
@@ -1638,6 +1875,17 @@ def start_service(
         env_files = [str(empty_env)]
     project_name = entry.get("network_name")
     docker_ops.compose_up(compose_file, env_file=env_files, project_name=project_name, profiles=profiles)
+    # The prepare deploy left the instance `building`; the start call is the
+    # transition to running.  Re-ensure the proxy's stored config/membership
+    # (idempotent) in case the containers were recreated.
+    with db.connection() as conn:
+        registry.update_instance(conn, sid, status="running", failure=None)
+    if entry.get("extra_resolver") and entry.get("extra_network"):
+        from . import dns_proxy_config as _dpc
+        _dpc.apply_service(
+            sid, resolver_name=str(entry["extra_resolver"]),
+            network=str(entry["extra_network"]),
+        )
 
     # R13 — the stream conf was renamed to `.stream.conf.paused` by
     # `stop_service`, because its static upstream would otherwise be a load-time

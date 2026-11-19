@@ -136,24 +136,61 @@ def _aligned_block_size(prefix_len: int) -> int:
     return subnet_addr_count(prefix_len) // 4
 
 
+def proxy_subnet_plan(container_count: int) -> tuple[int, int, int]:
+    """Return ``(subnet_prefix, ip_range_prefix, dynamic_offset)``.
+
+    G101 reserves ONE address per instance for the DNS proxy.  The tenant
+    network therefore reserves the first eight addresses (network, gateway,
+    proxy at ``.2``, spare), then starts an aligned dynamic block whose
+    ``ip_range`` excludes the proxy.  The block must be aligned to its own
+    size, so the offset is rounded up to the block size.
+
+    ``container_count`` is the number of app services (the injected proxy is
+    not part of the caller's count); the dynamic block must fit the app
+    containers plus provision-nginx (one more address).
+    """
+    dynamic_needed = container_count + 1
+    ip_range_prefix = 30
+    while (2 ** (32 - ip_range_prefix) - 2) < dynamic_needed:
+        ip_range_prefix -= 1
+        if ip_range_prefix < 24:  # the allocator's floor
+            raise RuntimeError(
+                f"cannot size a tenant network for {container_count} containers"
+            )
+    block_size = 2 ** (32 - ip_range_prefix)
+    dynamic_offset = ((8 + block_size - 1) // block_size) * block_size
+    total = dynamic_offset + block_size
+    subnet_prefix = 32 - (total - 1).bit_length()
+    return subnet_prefix, ip_range_prefix, dynamic_offset
+
+
 def allocate_subnet(
     container_count: int,
     allocated_subnets: list[str],
+    *,
+    reserve_proxy: bool = False,
+    pools: list[str] | None = None,
 ) -> dict[str, str] | None:
     """Allocate a subnet from the pool.
 
     Parameters
     ----------
     container_count : int
-        Number of containers in the compose file.
+        Number of containers in the compose file (app services).
     allocated_subnets : list[str]
         Subnets already allocated (from registry), e.g. ["10.0.0.0/29", ...].
+    reserve_proxy : bool
+        When true, use the G101 layout: the subnet carries a reserved proxy
+        address and an ``ip_range`` that excludes it.  The dict then also has
+        ``proxy_ip`` and ``ip_range``.  When false, the historical /30-based
+        sizing is kept for callers that do not inject the proxy.
 
     Returns
     -------
     dict | None
-        {"subnet": "10.0.0.0/29", "gateway": "10.0.0.1"}; None if subnet
-        management is disabled (SUBNET_POOLS empty).
+        ``{"subnet": ..., "gateway": ...}`` (plus ``proxy_ip``/``ip_range``
+        when *reserve_proxy*); None if subnet management is disabled
+        (SUBNET_POOLS empty).
 
     Raises
     ------
@@ -163,14 +200,20 @@ def allocate_subnet(
         falling back to Docker auto-assign).
     """
     _load_env()
-    if not SUBNET_POOLS:
+    use_pools = [p for p in (pools if pools is not None else SUBNET_POOLS) if p]
+    if not use_pools:
         return None
 
-    prefix_len = subnet_size_for_containers(container_count)
+    if reserve_proxy:
+        prefix_len, ip_range_prefix, dynamic_offset = proxy_subnet_plan(container_count)
+    else:
+        prefix_len = subnet_size_for_containers(container_count)
+        ip_range_prefix = None
+        dynamic_offset = None
     block_slots = _aligned_block_size(prefix_len)
 
     with _lock:
-        for pool_cidr in SUBNET_POOLS:
+        for pool_cidr in use_pools:
             try:
                 pool_net = ipaddress.IPv4Network(pool_cidr, strict=False)
             except ValueError:
@@ -194,11 +237,18 @@ def allocate_subnet(
                 # Allocate
                 subnet_addr = pool_start + slot_idx * 4
                 subnet = ipaddress.IPv4Network((subnet_addr, prefix_len))
-                gateway = str(subnet.network_address + 1)
-                return {"subnet": str(subnet), "gateway": gateway}
+                result = {
+                    "subnet": str(subnet),
+                    "gateway": str(subnet.network_address + 1),
+                }
+                if reserve_proxy:
+                    dynamic_start = subnet.network_address + dynamic_offset
+                    result["proxy_ip"] = str(subnet.network_address + 2)
+                    result["ip_range"] = f"{dynamic_start}/{ip_range_prefix}"
+                return result
 
     raise RuntimeError(
-        f"No free /{prefix_len} subnet block in any pool: {','.join(SUBNET_POOLS)}"
+        f"No free /{prefix_len} subnet block in any pool: {','.join(use_pools)}"
     )
 
 

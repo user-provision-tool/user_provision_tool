@@ -45,11 +45,11 @@ KIND_BY_TYPE = {"register": ("deploy", "register"),
                 "rebuild": ("rebuild", "rebuild"),
                 "remove": ("remove", "remove"),
                 "fix_remove": ("remove", "fix_remove"),
-                # G83 — the resolv.conf/membership update is a first-class task:
-                # addressed by source service, fanned out to every container, and
-                # polled by the gateway.
-                "resolv_conf_set": ("update", "resolv_conf_set"),
-                "resolv_conf_clear": ("update", "resolv_conf_clear")}
+                # G101 — the proxy config/membership update is a first-class
+                # task: addressed by source service, fanned out to the proxy and
+                # its app containers, and polled by the gateway.
+                "dns_proxy_set": ("update", "dns_proxy_set"),
+                "dns_proxy_clear": ("update", "dns_proxy_clear")}
 
 # Advisory-lock keys (registry-owned). The planner and the admission/claim
 # critical sections are separate so a slow plan selection never blocks a
@@ -69,14 +69,14 @@ _RUNNERS: dict[str, Callable[..., Any]] = {}
 
 def _runners() -> dict[str, Callable[..., Any]]:
     if not _RUNNERS:
-        from . import provisioner, resolv_conf
+        from . import dns_proxy_config, provisioner
         _RUNNERS.update({
             "register": provisioner.register_user,
             "rebuild": provisioner.rebuild_user,
             "remove": provisioner.remove_user,
             "fix_remove": provisioner.remove_instance_only,
-            "resolv_conf_set": resolv_conf.apply_service,
-            "resolv_conf_clear": resolv_conf.clear_service,
+            "dns_proxy_set": dns_proxy_config.apply_service,
+            "dns_proxy_clear": dns_proxy_config.clear_service,
         })
     return _RUNNERS
 

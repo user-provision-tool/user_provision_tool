@@ -591,7 +591,7 @@ class TestTwoLanes:
 
         tm = TaskManager(max_workers=1)
         operator = tm.submit("register", lambda **kw: None)
-        maintenance = tm.submit("resolv_conf_set", lambda **kw: None)
+        maintenance = tm.submit("dns_proxy_set", lambda **kw: None)
         assert tm.get(operator)["lane"] == "operator"
         assert tm.get(maintenance)["lane"] == "maintenance"
         # Both live in the same durable table and the same state space.
@@ -604,7 +604,7 @@ class TestTwoLanes:
         set_config(queue_cap=1)
         tm = TaskManager(max_workers=1)
         tm.submit("test", lambda: None)
-        tid = tm.submit("resolv_conf_set", lambda: None)
+        tid = tm.submit("dns_proxy_set", lambda: None)
         assert tm.get(tid)["status"] == "queued"
         with pytest.raises(QueueFullError) as caught:
             tm.submit("test", lambda: None)
@@ -616,9 +616,9 @@ class TestTwoLanes:
 
         set_config(queue_cap_maintenance=1)
         tm = TaskManager(max_workers=1)
-        tm.submit("resolv_conf_set", lambda: None)
+        tm.submit("dns_proxy_set", lambda: None)
         with pytest.raises(QueueFullError) as caught:
-            tm.submit("resolv_conf_set", lambda: None)
+            tm.submit("dns_proxy_set", lambda: None)
         assert caught.value.lane == "maintenance"
         assert caught.value.capacity == 1
         tid = tm.submit("test", lambda: None)
@@ -631,15 +631,15 @@ class TestTwoLanes:
         service_id, _proc = add_user(
             {"user_name": "alice", "service_name": "myapp", "label": "0"})
         tm = TaskManager(max_workers=1)
-        first = tm.submit("resolv_conf_set", lambda **kw: None,
+        first = tm.submit("dns_proxy_set", lambda **kw: None,
                           service_id=service_id)
         with pytest.raises(DuplicateUpdateError) as caught:
-            tm.submit("resolv_conf_clear", lambda **kw: None,
+            tm.submit("dns_proxy_clear", lambda **kw: None,
                       service_id=service_id)
         assert caught.value.task_id == first
         # Once the in-flight row is terminal the next update is admitted.
         assert tm.cancel(first) is True
-        second = tm.submit("resolv_conf_clear", lambda **kw: None,
+        second = tm.submit("dns_proxy_clear", lambda **kw: None,
                            service_id=service_id)
         assert second != first
         assert tm.get(second)["lane"] == "maintenance"
@@ -651,10 +651,10 @@ class TestTwoLanes:
         set_config(plan_size=2, plan_size_maintenance=3)
         tm = TaskManager(max_workers=1)  # not started: rows stay queued/planned
         o1 = tm.submit("test", lambda: None)
-        m1 = tm.submit("resolv_conf_set", lambda: None)
+        m1 = tm.submit("dns_proxy_set", lambda: None)
         o2 = tm.submit("test", lambda: None)
-        m2 = tm.submit("resolv_conf_set", lambda: None)
-        m3 = tm.submit("resolv_conf_set", lambda: None)
+        m2 = tm.submit("dns_proxy_set", lambda: None)
+        m3 = tm.submit("dns_proxy_set", lambda: None)
         o3 = tm.submit("test", lambda: None)
         tm.planner_tick()
         rows = db.fetch_all(
@@ -676,7 +676,7 @@ class TestTwoLanes:
         set_config(plan_size=1, plan_size_maintenance=1)
         tm = TaskManager(max_workers=1)
         operator = tm.submit("test", lambda: None)
-        maintenance = tm.submit("resolv_conf_set", lambda: None)
+        maintenance = tm.submit("dns_proxy_set", lambda: None)
         tm.planner_tick()
         claimed = tm._claim_next("maintenance")
         assert claimed["task_id"] == maintenance
@@ -694,8 +694,8 @@ class TestTwoLanes:
         now = datetime.now(timezone.utc)
         rows = [
             ("api-op-run", "operator", "register", None, 2),
-            ("api-mt-run", "maintenance", "resolv_conf_set", None, 1),
-            ("api-mt-cancel", "maintenance", "resolv_conf_set", now, 1),
+            ("api-mt-run", "maintenance", "dns_proxy_set", None, 1),
+            ("api-mt-cancel", "maintenance", "dns_proxy_set", now, 1),
         ]
         with db.connection() as conn:
             for task_id, lane, operation, cancel_at, plan_seq in rows:
@@ -737,7 +737,7 @@ class TestTwoLanes:
                 "executor, kind, lane, operation, status, restart_count, created_at, "
                 "updated_at, started_at) "
                 "VALUES ('api-mt-loop',%s,NULL,'api','update','maintenance',"
-                "'resolv_conf_set','running',4,%s,%s,%s)",
+                "'dns_proxy_set','running',4,%s,%s,%s)",
                 (uuid.uuid4(), now, now, now),
             )
         assert tm.recover_on_startup() == 1
@@ -753,7 +753,7 @@ class TestTwoLanes:
                    plan_size=1, plan_size_maintenance=1)
         tm = TaskManager(max_workers=4)  # not started: nothing is claimed
         operator_ids = [tm.submit("test", lambda: None) for _ in range(2)]
-        maintenance_ids = [tm.submit("resolv_conf_set", lambda: None) for _ in range(3)]
+        maintenance_ids = [tm.submit("dns_proxy_set", lambda: None) for _ in range(3)]
         stats = tm.stats()
         # The top-level fields stay the operator lane (R8/R5.3).
         assert set(stats["tasks"]) == set(operator_ids)

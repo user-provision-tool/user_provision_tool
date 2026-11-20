@@ -146,7 +146,9 @@ class RegisterRequest(BaseModel):
     # computing its hint, and what every existing caller (CLI, tests, rebuild) sends.
     label: str | None = None
     domain: str = "localhost"
-    passwd: str = "123456"
+    # G93/B2.1 — an empty password means NO auth. The legacy `123456` default
+    # is gone: an omitted key is an empty password, never a silent credential.
+    passwd: str = ""
     volumes: dict[str, str] = {}
     build_args: dict[str, str] | None = None
     # The TLS toggle (task-doc R9.1 / GRILLING G41). Its meaning is "TLS is in
@@ -1059,6 +1061,10 @@ def register_user(
                 )
             except Exception as e:
                 raise HTTPException(422, f"could not convert stream conf: {e}")
+            # G93/A1.4 — the stream branch writes its `.j2` AND its marker, as
+            # every other converter does. Without it the stream file is
+            # indistinguishable from a repo-authored template.
+            Path(str(template_out) + ".generated").write_text("")
         else:
             # --- Validate: every proxy_pass host must reference a compose service ---
             if _compose_svc_names:
@@ -1155,6 +1161,21 @@ def register_user(
         domain=req.domain,
         env_file=env_file_path,
         env_files=env_files_resolved or None,
+        # G93/C3.1 — the SELECTED sources, recorded on the instance so the
+        # card can list the deploy's own fix artifacts and show the selected
+        # nginx source instead of the internal converted `.j2`.
+        selected_compose_paths=(
+            list(compose_file_paths or [])
+            or ([compose_file_path] if compose_file_path else [])
+            or ([compose_template_path] if compose_template_path else [])
+        ),
+        selected_nginx_paths={
+            **{cat: p for cat, p in (nginx_conf_files_by_cat or {}).items()},
+            **{cat: p for cat, p in (nginx_conf_templates_by_cat or {}).items()
+               if cat not in (nginx_conf_files_by_cat or {})},
+        },
+        selected_env_paths=[p for p in ([env_file_path] if env_file_path else [])
+                            + list(env_files_resolved or []) if p],
         profiles=req.profiles or None,
         service_env_files=req.service_env_files or None,
         compose_sources=compose_sources or None,
@@ -2926,6 +2947,11 @@ def _status_for_user(user_name: str, running: dict[str, str]) -> dict[str, Any]:
             # resolve inside the recipe dir, not the project root.
             "recipe_path": _recipe_path_for_entry(entry),
             "env_file_path": entry.get("env_file_path", ""),
+            # G93/C3.1 — the deploy selection, for the card's fix list and
+            # selected-source lines (the gateway projects these to the stage).
+            "selected_compose_paths": entry.get("selected_compose_paths") or [],
+            "selected_nginx_paths": entry.get("selected_nginx_paths") or {},
+            "selected_env_paths": entry.get("selected_env_paths") or [],
             "container_names": expected_names,
             "healthy_containers": healthy,
             "unhealthy_containers": unhealthy,

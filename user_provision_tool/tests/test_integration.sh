@@ -637,10 +637,12 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Test 16: Default passwd (123456) → htpasswd generated, nginx conf has auth_basic
+# Test 16: Omitted passwd → NO auth (G93/B2.1)
+# The legacy `123456` default is gone: an omitted key is an empty password,
+# so no htpasswd file is written and the nginx conf has no auth_basic.
 # ---------------------------------------------------------------------------
 echo ""
-echo "--- Test 16: Default passwd → htpasswd generated + nginx conf has auth_basic ---"
+echo "--- Test 16: Omitted passwd → no htpasswd + no auth_basic ---"
 mkdir -p "${PROVISION_DIR}/user-data/nginxuser/app" "${PROVISION_DIR}/user-data/nginxuser/db"
 REGISTER_BODY_NX=$(cat <<EOF
 {
@@ -667,36 +669,29 @@ else
     fail "Default passwd registration failed: $nx_resp"
 fi
 
-# htpasswd_path must be non-null in response
+# htpasswd_path must be null/empty in the response
 nx_htpasswd=$(echo "$nx_resp" | python3 -c "import sys,json; print(json.load(sys.stdin)['entry'].get('htpasswd_path') or 'null')" 2>/dev/null || echo "null")
-if [ "$nx_htpasswd" != "null" ] && [ "$nx_htpasswd" != "" ]; then
-    pass "Default passwd → htpasswd_path is set in registry: $nx_htpasswd"
+if [ "$nx_htpasswd" = "null" ] || [ "$nx_htpasswd" = "" ]; then
+    pass "Omitted passwd → no htpasswd_path recorded"
 else
-    fail "Expected htpasswd_path to be set, got: $nx_htpasswd"
+    fail "Expected no htpasswd_path, got: $nx_htpasswd"
 fi
 
-# .htpasswd file must exist on disk
+# .htpasswd file must NOT exist on disk
 NX_HTPASSWD_FILE="${PROVISION_DIR}/generated/myapp.user-nginxuser.0.htpasswd"
-if [ -f "$NX_HTPASSWD_FILE" ]; then
-    pass "Default passwd → .htpasswd file created on disk"
-    # First line must look like a bcrypt hash (nginxuser:$2...)
-    first_line=$(head -1 "$NX_HTPASSWD_FILE")
-    if echo "$first_line" | grep -qE "^nginxuser:\\\$2"; then
-        pass "Default passwd → .htpasswd contains bcrypt hash for nginxuser"
-    else
-        fail "Unexpected .htpasswd content: $first_line"
-    fi
+if [ ! -f "$NX_HTPASSWD_FILE" ]; then
+    pass "Omitted passwd → no .htpasswd file written"
 else
-    fail ".htpasswd file not found at: $NX_HTPASSWD_FILE"
+    fail "Unexpected .htpasswd file at: $NX_HTPASSWD_FILE"
 fi
 
-# Rendered nginx conf must contain auth_basic directives
+# Rendered nginx conf must NOT contain auth_basic directives
 NX_NGINX_CONF="${PROVISION_DIR}/generated/myapp.user-nginxuser.0.nginx.conf"
 if [ -f "$NX_NGINX_CONF" ]; then
-    if grep -q "auth_basic" "$NX_NGINX_CONF" && grep -q "auth_basic_user_file" "$NX_NGINX_CONF"; then
-        pass "Default passwd → nginx conf has auth_basic directives"
+    if grep -q "auth_basic" "$NX_NGINX_CONF"; then
+        fail "Omitted passwd → nginx conf still has auth_basic"
     else
-        fail "Default passwd → nginx conf missing auth_basic (got: $(cat "$NX_NGINX_CONF"))"
+        pass "Omitted passwd → nginx conf has no auth_basic"
     fi
 else
     fail "Nginx conf not found at: $NX_NGINX_CONF"
@@ -704,6 +699,101 @@ fi
 
 # Clean up
 curl -sf -X DELETE "$API_URL/users/nginxuser/services/myapp/0" >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
+# Test 16b: Explicit passwd → auth (G93/B2.2 — non-empty still guards)
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- Test 16b: Explicit passwd → htpasswd + auth_basic ---"
+mkdir -p "${PROVISION_DIR}/user-data/authuser/app" "${PROVISION_DIR}/user-data/authuser/db"
+REGISTER_BODY_AU=$(cat <<EOF
+{
+  "user_name": "authuser",
+  "service_name": "myapp",
+  "compose_template_path": "${PROVISION_DIR}/templates/docker-compose.template.yml.j2",
+  "nginx_conf_template_path": "${PROVISION_DIR}/templates/myapp.template.nginx.conf.j2",
+  "label": "0",
+  "domain": "localhost",
+  "passwd": "secret",
+  "volumes": {
+    "app_data": "${PROVISION_DIR}/user-data/authuser/app",
+    "db_data":  "${PROVISION_DIR}/user-data/authuser/db"
+  }
+}
+EOF
+)
+au_resp=$(curl -sf -X POST "$API_URL/users?sync=true" \
+    -H "Content-Type: application/json" \
+    -d "$REGISTER_BODY_AU")
+AU_HTPASSWD_FILE="${PROVISION_DIR}/generated/myapp.user-authuser.0.htpasswd"
+AU_NGINX_CONF="${PROVISION_DIR}/generated/myapp.user-authuser.0.nginx.conf"
+if [ -f "$AU_HTPASSWD_FILE" ]; then
+    pass "Explicit passwd → .htpasswd file written"
+else
+    fail "Explicit passwd → .htpasswd file missing at: $AU_HTPASSWD_FILE (resp: $au_resp)"
+fi
+if [ -f "$AU_NGINX_CONF" ] && grep -q "auth_basic" "$AU_NGINX_CONF"; then
+    pass "Explicit passwd → nginx conf has auth_basic"
+else
+    fail "Explicit passwd → nginx conf missing auth_basic"
+fi
+curl -sf -X DELETE "$API_URL/users/authuser/services/myapp/0" >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
+# Test 16c: Stream branch writes the .j2 AND its marker (A1.4) and the
+# selection is recorded on the instance (C3.1).
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- Test 16c: Stream marker + recorded selection ---"
+mkdir -p "${PROVISION_DIR}/source_projects/streampr"
+cp "$PROVISION_DIR/templates/docker-compose.template.yml.j2" \
+   "${PROVISION_DIR}/source_projects/streampr/docker-compose.yml.j2"
+cat > "${PROVISION_DIR}/source_projects/streampr/nginx.stream.base.0.conf" <<'EOF'
+server {
+    listen 9000;
+    proxy_pass web:9000;
+}
+EOF
+STREAM_SRC="${PROVISION_DIR}/source_projects/streampr/nginx.stream.base.0.conf"
+STREAM_J2="${STREAM_SRC}.j2"
+REGISTER_BODY_ST=$(cat <<EOF
+{
+  "user_name": "streamuser",
+  "service_name": "myapp",
+  "project_root": "streampr",
+  "compose_template_path": "docker-compose.yml.j2",
+  "nginx_confs": {"stream": "nginx.stream.base.0.conf"},
+  "label": "0",
+  "domain": "localhost"
+}
+EOF
+)
+st_resp=$(curl -sf -X POST "$API_URL/users?sync=true" \
+    -H "Content-Type: application/json" -d "$REGISTER_BODY_ST" || true)
+st_status=$(echo "$st_resp" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])" 2>/dev/null || echo "")
+if [ "$st_status" = "registered" ]; then
+    pass "Stream registration succeeded"
+    if [ -f "$STREAM_J2" ] && [ -f "${STREAM_J2}.generated" ]; then
+        pass "Stream branch wrote the .j2 and its .generated marker"
+    else
+        fail "Stream marker missing: j2=$([ -f "$STREAM_J2" ] && echo yes || echo no) marker=$([ -f "${STREAM_J2}.generated" ] && echo yes || echo no)"
+    fi
+    st_sel_nginx=$(echo "$st_resp" | python3 -c "import sys,json; e=json.load(sys.stdin)['entry']; print(json.dumps(e.get('selected_nginx_paths')))" 2>/dev/null || echo "null")
+    st_sel_compose=$(echo "$st_resp" | python3 -c "import sys,json; e=json.load(sys.stdin)['entry']; print(json.dumps(e.get('selected_compose_paths')))" 2>/dev/null || echo "null")
+    if echo "$st_sel_nginx" | grep -q "stream"; then
+        pass "Selection records the stream nginx source: $st_sel_nginx"
+    else
+        fail "selected_nginx_paths missing the stream source: $st_sel_nginx"
+    fi
+    if echo "$st_sel_compose" | grep -q "docker-compose"; then
+        pass "Selection records the compose source: $st_sel_compose"
+    else
+        fail "selected_compose_paths missing the compose source: $st_sel_compose"
+    fi
+else
+    fail "Stream registration failed: $st_resp"
+fi
+curl -sf -X DELETE "$API_URL/users/streamuser/services/myapp/0" >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
 # Test 17: project_root bare name resolves to SOURCE_PROJECTS_DIR/{name}

@@ -841,6 +841,12 @@ def register_user(
     profiles: list[str] | None = None,
     service_env_files: dict[str, str] | None = None,
     compose_sources: list[str] | None = None,
+    # G93/C3.1 — the deploy selection as the operator made it (the plain
+    # sources, not the converted `.j2`). Recorded on the instance so the card
+    # lists the deploy's own fix artifacts and its selected nginx source.
+    selected_compose_paths: list[str] | None = None,
+    selected_nginx_paths: dict[str, str] | None = None,
+    selected_env_paths: list[str] | None = None,
     nginx_container: str = "subnet-acl-nginx",
     nginx_output_dir: str | Path | None = None,
     nginx_conf_templates: list[str] | None = None,
@@ -1171,6 +1177,9 @@ def register_user(
         "ssl_certificate_key_path": ssl_certificate_key_path,
         "env_file_path": env_file or "",
         "env_files": [],
+        "selected_compose_paths": list(selected_compose_paths or []),
+        "selected_nginx_paths": dict(selected_nginx_paths or {}),
+        "selected_env_paths": list(selected_env_paths or []),
         "profiles": list(profiles or []),
         "volumes": volumes,
         "build_args": build_args or {},

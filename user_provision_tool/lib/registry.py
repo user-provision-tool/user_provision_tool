@@ -41,7 +41,8 @@ _INSTANCE_FIELDS = (
     "compose_file_path", "nginx_conf_template_path", "nginx_conf_path",
     "nginx_conf_paths", "nginx_conf_paths_by_category", "htpasswd_path",
     "ssl_certificate_path", "ssl_certificate_key_path", "env_files",
-    "env_file_path", "container_names", "profiles", "volumes", "build_args", "tls",
+    "env_file_path", "selected_compose_paths", "selected_nginx_paths",
+    "selected_env_paths", "container_names", "profiles", "volumes", "build_args", "tls",
     # G83 — the opaque extra nameserver and network stored after a successful
     # async resolv.conf/membership update. They are re-applied when a container
     # restarts/redeploys and once on the -api's startup.
@@ -77,6 +78,9 @@ SELECT s.id                AS service_id,
        i.ssl_certificate_key_path,
        i.env_files,
        i.env_file_path,
+       i.selected_compose_paths,
+       i.selected_nginx_paths,
+       i.selected_env_paths,
        i.container_names,
        i.profiles,
        i.volumes,
@@ -416,7 +420,8 @@ def insert_instance(conn, service_id: uuid.UUID, *, procedure_id: uuid.UUID,
         cols.append(key)
         vals.append(_jsonb(value) if key in (
             "failure", "previous_failure", "nginx_conf_paths", "nginx_conf_paths_by_category",
-            "env_files", "volumes", "build_args") else value)
+            "env_files", "selected_compose_paths", "selected_nginx_paths",
+            "selected_env_paths", "volumes", "build_args") else value)
     placeholders = ",".join(["%s"] * len(cols))
     conn.execute(
         f"INSERT INTO registry.service_instances ({','.join(cols)}) VALUES ({placeholders})",
@@ -434,7 +439,8 @@ def update_instance(conn, service_id: str | uuid.UUID, **fields: Any) -> None:
         sets.append(f"{key}=%s")
         vals.append(_jsonb(value) if key in (
             "failure", "previous_failure", "nginx_conf_paths", "nginx_conf_paths_by_category",
-            "env_files", "volumes", "build_args") else value)
+            "env_files", "selected_compose_paths", "selected_nginx_paths",
+            "selected_env_paths", "volumes", "build_args") else value)
     if not sets:
         return
     sets.append("updated_at=%s")

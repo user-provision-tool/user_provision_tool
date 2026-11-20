@@ -35,6 +35,7 @@ ENV HTTP_PROXY= HTTPS_PROXY=
 # Copy source
 COPY lib/ lib/
 COPY cli/ cli/
+COPY scripts/ scripts/
 COPY db/ db/
 COPY migrations/ migrations/
 COPY api.py ./
